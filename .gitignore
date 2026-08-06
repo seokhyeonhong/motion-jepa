@@ -7,6 +7,6 @@ dataset/*
 dataset-bvh/
 output/
 
-.codex/
+# .codex/
 .vscode/
 ijepa/

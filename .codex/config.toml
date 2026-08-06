@@ -1,0 +1,22 @@
+approvals_reviewer = "user"
+model = "gpt-5.6-sol"
+model_reasoning_effort = "medium"
+[projects."/root"]
+trust_level = "trusted"
+
+[projects."/source/seokhyeon/motion-jepa/motion-jepa"]
+trust_level = "trusted"
+
+[projects."/source/seokhyeon/tmp"]
+trust_level = "trusted"
+
+[marketplaces.openai-bundled]
+last_updated = "2026-08-06T06:50:46Z"
+source_type = "local"
+source = "/root/.codex/.tmp/bundled-marketplaces/openai-bundled"
+
+[plugins."sites@openai-bundled"]
+enabled = true
+
+[plugins."visualize@openai-bundled"]
+enabled = true
