@@ -9576,7 +9576,7 @@
       "server_origin": null,
       "tool_name": "_get_app_permissions",
       "tool_namespace": "codex_apps__plugin_management",
-      "namespace_description": "Manage plugins in ChatGPT.",
+      "namespace_description": "Control plane for plugins, skills, settings, permissions, dependencies, and connections. When search_plugins is available, use it to discover relevant plugins when an external service is required or would meaningfully help complete the user's request. When suggest_plugins is available, use it to recommend relevant missing plugins; infer plugin intent from the task even if the user does not explicitly ask for a plugin. Use get_app_permissions and update_app_permissions to inspect or change plugin permissions, get_plugin_dependencies to inspect dependencies. Use uninstall_app only when the user explicitly requests removal. Ask for clarification before ambiguous, broad, or risky changes, and never claim an unverified plugin is installed or connected. Suggestions do not block the turn; continue independent work and use only plugins with confirmed connections.",
       "tool": {
         "name": "plugin_management.get_app_permissions",
         "title": "get_app_permissions",
@@ -10294,7 +10294,7 @@
           },
           "connector_id": "connector_openai_plugin_management",
           "connector_name": "Plugin Management",
-          "connector_description": "Manage plugins in ChatGPT.",
+          "connector_description": "Control plane for plugins, skills, settings, permissions, dependencies, and connections. When search_plugins is available, use it to discover relevant plugins when an external service is required or would meaningfully help complete the user's request. When suggest_plugins is available, use it to recommend relevant missing plugins; infer plugin intent from the task even if the user does not explicitly ask for a plugin. Use get_app_permissions and update_app_permissions to inspect or change plugin permissions, get_plugin_dependencies to inspect dependencies. Use uninstall_app only when the user explicitly requests removal. Ask for clarification before ambiguous, broad, or risky changes, and never claim an unverified plugin is installed or connected. Suggestions do not block the turn; continue independent work and use only plugins with confirmed connections.",
           "link_id": "implicit_link::connector_openai_plugin_management"
         }
       },
@@ -10308,7 +10308,7 @@
       "server_origin": null,
       "tool_name": "_get_plugin_dependencies",
       "tool_namespace": "codex_apps__plugin_management",
-      "namespace_description": "Manage plugins in ChatGPT.",
+      "namespace_description": "Control plane for plugins, skills, settings, permissions, dependencies, and connections. When search_plugins is available, use it to discover relevant plugins when an external service is required or would meaningfully help complete the user's request. When suggest_plugins is available, use it to recommend relevant missing plugins; infer plugin intent from the task even if the user does not explicitly ask for a plugin. Use get_app_permissions and update_app_permissions to inspect or change plugin permissions, get_plugin_dependencies to inspect dependencies. Use uninstall_app only when the user explicitly requests removal. Ask for clarification before ambiguous, broad, or risky changes, and never claim an unverified plugin is installed or connected. Suggestions do not block the turn; continue independent work and use only plugins with confirmed connections.",
       "tool": {
         "name": "plugin_management.get_plugin_dependencies",
         "title": "get_plugin_dependencies",
@@ -11026,7 +11026,7 @@
           },
           "connector_id": "connector_openai_plugin_management",
           "connector_name": "Plugin Management",
-          "connector_description": "Manage plugins in ChatGPT.",
+          "connector_description": "Control plane for plugins, skills, settings, permissions, dependencies, and connections. When search_plugins is available, use it to discover relevant plugins when an external service is required or would meaningfully help complete the user's request. When suggest_plugins is available, use it to recommend relevant missing plugins; infer plugin intent from the task even if the user does not explicitly ask for a plugin. Use get_app_permissions and update_app_permissions to inspect or change plugin permissions, get_plugin_dependencies to inspect dependencies. Use uninstall_app only when the user explicitly requests removal. Ask for clarification before ambiguous, broad, or risky changes, and never claim an unverified plugin is installed or connected. Suggestions do not block the turn; continue independent work and use only plugins with confirmed connections.",
           "link_id": "implicit_link::connector_openai_plugin_management"
         }
       },
@@ -11040,7 +11040,7 @@
       "server_origin": null,
       "tool_name": "_uninstall_app",
       "tool_namespace": "codex_apps__plugin_management",
-      "namespace_description": "Manage plugins in ChatGPT.",
+      "namespace_description": "Control plane for plugins, skills, settings, permissions, dependencies, and connections. When search_plugins is available, use it to discover relevant plugins when an external service is required or would meaningfully help complete the user's request. When suggest_plugins is available, use it to recommend relevant missing plugins; infer plugin intent from the task even if the user does not explicitly ask for a plugin. Use get_app_permissions and update_app_permissions to inspect or change plugin permissions, get_plugin_dependencies to inspect dependencies. Use uninstall_app only when the user explicitly requests removal. Ask for clarification before ambiguous, broad, or risky changes, and never claim an unverified plugin is installed or connected. Suggestions do not block the turn; continue independent work and use only plugins with confirmed connections.",
       "tool": {
         "name": "plugin_management.uninstall_app",
         "title": "uninstall_app",
@@ -11775,7 +11775,7 @@
           },
           "connector_id": "connector_openai_plugin_management",
           "connector_name": "Plugin Management",
-          "connector_description": "Manage plugins in ChatGPT.",
+          "connector_description": "Control plane for plugins, skills, settings, permissions, dependencies, and connections. When search_plugins is available, use it to discover relevant plugins when an external service is required or would meaningfully help complete the user's request. When suggest_plugins is available, use it to recommend relevant missing plugins; infer plugin intent from the task even if the user does not explicitly ask for a plugin. Use get_app_permissions and update_app_permissions to inspect or change plugin permissions, get_plugin_dependencies to inspect dependencies. Use uninstall_app only when the user explicitly requests removal. Ask for clarification before ambiguous, broad, or risky changes, and never claim an unverified plugin is installed or connected. Suggestions do not block the turn; continue independent work and use only plugins with confirmed connections.",
           "link_id": "implicit_link::connector_openai_plugin_management"
         }
       },
@@ -11789,7 +11789,7 @@
       "server_origin": null,
       "tool_name": "_update_app_permissions",
       "tool_namespace": "codex_apps__plugin_management",
-      "namespace_description": "Manage plugins in ChatGPT.",
+      "namespace_description": "Control plane for plugins, skills, settings, permissions, dependencies, and connections. When search_plugins is available, use it to discover relevant plugins when an external service is required or would meaningfully help complete the user's request. When suggest_plugins is available, use it to recommend relevant missing plugins; infer plugin intent from the task even if the user does not explicitly ask for a plugin. Use get_app_permissions and update_app_permissions to inspect or change plugin permissions, get_plugin_dependencies to inspect dependencies. Use uninstall_app only when the user explicitly requests removal. Ask for clarification before ambiguous, broad, or risky changes, and never claim an unverified plugin is installed or connected. Suggestions do not block the turn; continue independent work and use only plugins with confirmed connections.",
       "tool": {
         "name": "plugin_management.update_app_permissions",
         "title": "update_app_permissions",
@@ -12619,7 +12619,7 @@
           },
           "connector_id": "connector_openai_plugin_management",
           "connector_name": "Plugin Management",
-          "connector_description": "Manage plugins in ChatGPT.",
+          "connector_description": "Control plane for plugins, skills, settings, permissions, dependencies, and connections. When search_plugins is available, use it to discover relevant plugins when an external service is required or would meaningfully help complete the user's request. When suggest_plugins is available, use it to recommend relevant missing plugins; infer plugin intent from the task even if the user does not explicitly ask for a plugin. Use get_app_permissions and update_app_permissions to inspect or change plugin permissions, get_plugin_dependencies to inspect dependencies. Use uninstall_app only when the user explicitly requests removal. Ask for clarification before ambiguous, broad, or risky changes, and never claim an unverified plugin is installed or connected. Suggestions do not block the turn; continue independent work and use only plugins with confirmed connections.",
           "link_id": "implicit_link::connector_openai_plugin_management"
         }
       },

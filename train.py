@@ -6,6 +6,7 @@ import copy
 import logging
 import os
 import random
+import shutil
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -122,6 +123,13 @@ def _atomic_torch_save(payload: dict, path: Path) -> None:
     os.replace(temporary, path)
 
 
+def _atomic_copy(source: Path, destination: Path) -> None:
+    """Copy an already-complete checkpoint without deserializing it."""
+    temporary = destination.with_name(destination.name + ".tmp")
+    shutil.copyfile(source, temporary)
+    os.replace(temporary, destination)
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -182,7 +190,10 @@ def _load_checkpoint(
     rank: int,
     world_size: int,
 ) -> tuple[int, int]:
-    checkpoint = torch.load(path, map_location="cpu")
+    # Full training checkpoints contain trusted local Python/NumPy RNG state,
+    # optimizer state, and scheduler state in addition to tensor weights.
+    # PyTorch 2.6 defaults weights_only=True, which cannot restore that payload.
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if checkpoint.get("format_version") != 1:
         raise ValueError(f"Unsupported Motion-JEPA checkpoint format: {path}")
     if int(checkpoint["world_size"]) != world_size:
@@ -542,9 +553,10 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         )
         if distributed.is_main and (epoch + 1) % checkpoint_frequency == 0:
             checkpoint_path = output / f"{log_args['write_tag']}-ep{epoch + 1}.pth.tar"
-            # The latest checkpoint is complete and atomically written; copy through torch
-            # serialization to keep each named checkpoint independently loadable.
-            _atomic_torch_save(torch.load(latest_path, map_location="cpu"), checkpoint_path)
+            # The latest checkpoint is already complete and atomically written.
+            # Copy its bytes instead of loading arbitrary pickle content merely
+            # to create the named epoch snapshot.
+            _atomic_copy(latest_path, checkpoint_path)
         barrier()
         logger.info("epoch=%d average_loss=%.6f", epoch + 1, loss_meter.avg)
 

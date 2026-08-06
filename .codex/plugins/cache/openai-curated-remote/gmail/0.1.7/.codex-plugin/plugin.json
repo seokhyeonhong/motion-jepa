@@ -1,6 +1,6 @@
 {
   "name": "gmail",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Work with Gmail using the configured Gmail app connector.",
   "author": {
     "name": "OpenAI",
@@ -39,7 +39,7 @@
       "Summarize inbox, draft replies, or process email threads"
     ],
     "brandColor": "#EA4335",
-    "composerIcon": "./assets/gmail-small.svg",
+    "composerIcon": "./assets/gmail.png",
     "logo": "./assets/gmail.png",
     "screenshots": []
   }
