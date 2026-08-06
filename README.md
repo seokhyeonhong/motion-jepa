@@ -159,6 +159,19 @@ BF16 autocast is controlled by `meta.use_bfloat16`. BF16 does not use a
 gradient scaler; optional FP16 training uses `meta.use_float16` and restores
 its scaler state.
 
+TensorBoard logging is enabled in the standard configs. Install TensorBoard
+and launch it against the training output:
+
+```bash
+pip install tensorboard
+tensorboard --logdir output
+```
+
+Events are written under `<logging.folder>/tensorboard` at `logging.log_freq`.
+Loss, iteration time, learning rate, and weight decay are interval averages
+accumulated since the previous log event. The CSV continues to store raw values
+for every optimization step.
+
 ## Tests
 
 ```bash

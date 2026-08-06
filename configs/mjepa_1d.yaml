@@ -18,6 +18,8 @@ logging:
   folder: ./output/mot_base_1d-bs.512-ep.300
   write_tag: motion-jepa-1d
   log_freq: 100
+  tensorboard: true
+  tensorboard_folder: tensorboard
   checkpoint_freq: 100
 
 mask:

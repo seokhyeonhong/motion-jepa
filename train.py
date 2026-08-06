@@ -42,6 +42,51 @@ def _unwrapped(module):
     return module.module if isinstance(module, DistributedDataParallel) else module
 
 
+def _make_tensorboard_writer(log_args: dict, output: Path, purge_step: int):
+    if not bool(log_args.get("tensorboard", False)):
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ModuleNotFoundError as error:
+        raise ModuleNotFoundError(
+            "TensorBoard logging is enabled; install it with `pip install tensorboard`."
+        ) from error
+    log_dir = output / str(log_args.get("tensorboard_folder", "tensorboard"))
+    return SummaryWriter(log_dir=str(log_dir), purge_step=purge_step)
+
+
+def _write_tensorboard_interval(
+    writer,
+    *,
+    global_step: int,
+    epoch: int,
+    loss: float,
+    learning_rate: float,
+    weight_decay: float,
+    time_ms: float,
+    memory_mib: float,
+    grad_first: float,
+    grad_last: float,
+    grad_average: float,
+) -> None:
+    if writer is None:
+        return
+    scalars = {
+        "train/loss": loss,
+        "train/learning_rate": learning_rate,
+        "train/weight_decay": weight_decay,
+        "train/iteration_time_ms": time_ms,
+        "train/gpu_memory_mib": memory_mib,
+        "train/gradient_first_layer": grad_first,
+        "train/gradient_last_layer": grad_last,
+        "train/gradient_average": grad_average,
+        "train/epoch": float(epoch),
+    }
+    for name, value in scalars.items():
+        writer.add_scalar(name, value, global_step)
+    writer.flush()
+
+
 @torch.no_grad()
 def update_ema(online, target, momentum: float) -> None:
     for online_parameter, target_parameter in zip(
@@ -334,6 +379,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     )
 
     csv_logger = None
+    tensorboard_writer = None
     if distributed.is_main:
         csv_logger = CSVLogger(
             str(output / f"{log_args['write_tag']}.csv"),
@@ -345,6 +391,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             ("%.7e", "weight_decay"),
             ("%.3f", "time_ms"),
         )
+        tensorboard_writer = _make_tensorboard_writer(log_args, output, global_step)
 
     use_bfloat16 = bool(meta_args.get("use_bfloat16", False))
     use_float16 = bool(meta_args.get("use_float16", False))
@@ -356,7 +403,15 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     epochs = int(opt_args["epochs"])
     checkpoint_frequency = int(log_args.get("checkpoint_freq", 50))
     log_frequency = int(log_args.get("log_freq", 10))
+    if log_frequency <= 0:
+        raise ValueError("logging.log_freq must be positive")
 
+    # These meters span epoch boundaries and reset only after a log event, so
+    # every TensorBoard point summarizes exactly the steps since the prior one.
+    interval_loss_meter = AverageMeter()
+    interval_time_meter = AverageMeter()
+    interval_lr_meter = AverageMeter()
+    interval_wd_meter = AverageMeter()
     for epoch in range(start_epoch, epochs):
         sampler.set_epoch(epoch)
         encoder.train()
@@ -411,6 +466,10 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             loss_meter.update(reported_loss)
             time_meter.update(elapsed_ms)
+            interval_loss_meter.update(reported_loss)
+            interval_time_meter.update(elapsed_ms)
+            interval_lr_meter.update(learning_rate)
+            interval_wd_meter.update(weight_decay)
             if distributed.is_main:
                 csv_logger.log(
                     epoch + 1,
@@ -421,7 +480,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                     weight_decay,
                     elapsed_ms,
                 )
-                if iteration % log_frequency == 0:
+                if global_step % log_frequency == 0:
                     stats = grad_logger(_unwrapped(encoder).named_parameters())
                     memory = (
                         torch.cuda.max_memory_allocated(device) / 1024.0**2
@@ -433,14 +492,33 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                         "time=%.1fms memory=%.0fMiB grad=[%.2e, %.2e]",
                         epoch + 1,
                         iteration,
-                        loss_meter.avg,
-                        learning_rate,
-                        weight_decay,
-                        time_meter.avg,
+                        interval_loss_meter.avg,
+                        interval_lr_meter.avg,
+                        interval_wd_meter.avg,
+                        interval_time_meter.avg,
                         memory,
                         stats.first_layer,
                         stats.last_layer,
                     )
+                    _write_tensorboard_interval(
+                        tensorboard_writer,
+                        global_step=global_step,
+                        epoch=epoch + 1,
+                        loss=interval_loss_meter.avg,
+                        learning_rate=interval_lr_meter.avg,
+                        weight_decay=interval_wd_meter.avg,
+                        time_ms=interval_time_meter.avg,
+                        memory_mib=memory,
+                        grad_first=stats.first_layer,
+                        grad_last=stats.last_layer,
+                        grad_average=stats.avg,
+                    )
+                    interval_loss_meter.reset()
+                    interval_time_meter.reset()
+                    interval_lr_meter.reset()
+                    interval_wd_meter.reset()
+                    if device.type == "cuda":
+                        torch.cuda.reset_peak_memory_stats(device)
             if not np.isfinite(reported_loss):
                 raise FloatingPointError(f"Non-finite loss at step {global_step}: {reported_loss}")
 
@@ -470,6 +548,8 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         barrier()
         logger.info("epoch=%d average_loss=%.6f", epoch + 1, loss_meter.avg)
 
+    if tensorboard_writer is not None:
+        tensorboard_writer.close()
     return {
         "next_epoch": epochs,
         "global_step": global_step,
@@ -477,4 +557,9 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     }
 
 
-__all__ = ["capture_rng_state", "main", "restore_rng_state", "update_ema"]
+__all__ = [
+    "capture_rng_state",
+    "main",
+    "restore_rng_state",
+    "update_ema",
+]

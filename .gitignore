@@ -6,3 +6,7 @@ dataset/*
 !dataset/*.py
 dataset-bvh/
 output/
+
+.codex/
+.vscode/
+ijepa/
