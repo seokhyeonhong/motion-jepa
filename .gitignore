@@ -1,0 +1,8 @@
+*.swp
+*.swo
+__pycache__
+
+dataset/*
+!dataset/*.py
+dataset-bvh/
+output/

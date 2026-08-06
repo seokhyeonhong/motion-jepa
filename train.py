@@ -1,0 +1,480 @@
+"""Motion-JEPA pretraining loop shared by the 1D and 2D variants."""
+
+from __future__ import annotations
+
+import copy
+import logging
+import os
+import random
+import time
+from contextlib import nullcontext
+from pathlib import Path
+from tqdm import tqdm
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import yaml
+from torch.nn.parallel import DistributedDataParallel
+
+from dataset import make_motion_dataset
+from helper import init_mjepa_model, init_opt
+from mask import MaskCollator1D, MaskCollator2D
+from mask.utils import (
+    apply_index_masks,
+    gather_grid_masks,
+    repeat_mask_blocks,
+)
+from utils.distributed import (
+    all_gather_objects,
+    barrier,
+    init_distributed,
+    reduce_mean,
+)
+from utils.logging import AverageMeter, CSVLogger, grad_logger
+from utils.schedulers import LinearMomentumSchedule
+
+
+logger = logging.getLogger(__name__)
+
+
+def _unwrapped(module):
+    return module.module if isinstance(module, DistributedDataParallel) else module
+
+
+@torch.no_grad()
+def update_ema(online, target, momentum: float) -> None:
+    for online_parameter, target_parameter in zip(
+        _unwrapped(online).parameters(), target.parameters()
+    ):
+        target_parameter.mul_(momentum).add_(
+            online_parameter.detach(), alpha=1.0 - momentum
+        )
+
+
+def capture_rng_state() -> dict:
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: dict) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _atomic_torch_save(payload: dict, path: Path) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
+def _save_checkpoint(
+    path: Path,
+    *,
+    encoder,
+    predictor,
+    target_encoder,
+    optimizer,
+    scaler,
+    lr_scheduler,
+    wd_scheduler,
+    momentum_scheduler,
+    mask_collator,
+    next_epoch: int,
+    global_step: int,
+    loss: float,
+    world_size: int,
+    rank: int,
+    config: dict,
+) -> None:
+    rng_states = all_gather_objects(capture_rng_state())
+    mask_states = all_gather_objects(mask_collator.state_dict())
+    if rank != 0:
+        return
+    payload = {
+        "format_version": 1,
+        "encoder": _unwrapped(encoder).state_dict(),
+        "predictor": _unwrapped(predictor).state_dict(),
+        "target_encoder": target_encoder.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scaler": None if scaler is None else scaler.state_dict(),
+        "lr_scheduler": lr_scheduler.state_dict(),
+        "wd_scheduler": wd_scheduler.state_dict(),
+        "momentum_scheduler": momentum_scheduler.state_dict(),
+        "mask_states": mask_states,
+        "rng_states": rng_states,
+        "next_epoch": int(next_epoch),
+        "global_step": int(global_step),
+        "world_size": int(world_size),
+        "loss": float(loss),
+        "config": config,
+    }
+    _atomic_torch_save(payload, path)
+
+
+def _load_checkpoint(
+    path: Path,
+    *,
+    device: torch.device,
+    encoder,
+    predictor,
+    target_encoder,
+    optimizer,
+    scaler,
+    lr_scheduler,
+    wd_scheduler,
+    momentum_scheduler,
+    mask_collator,
+    rank: int,
+    world_size: int,
+) -> tuple[int, int]:
+    checkpoint = torch.load(path, map_location="cpu")
+    if checkpoint.get("format_version") != 1:
+        raise ValueError(f"Unsupported Motion-JEPA checkpoint format: {path}")
+    if int(checkpoint["world_size"]) != world_size:
+        raise ValueError(
+            f"Exact resume requires world_size={checkpoint['world_size']}, got {world_size}"
+        )
+    encoder.load_state_dict(checkpoint["encoder"], strict=True)
+    predictor.load_state_dict(checkpoint["predictor"], strict=True)
+    target_encoder.load_state_dict(checkpoint["target_encoder"], strict=True)
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    if scaler is not None:
+        if checkpoint["scaler"] is None:
+            raise ValueError("Checkpoint has no scaler state for float16 resume")
+        scaler.load_state_dict(checkpoint["scaler"])
+    lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+    wd_scheduler.load_state_dict(checkpoint["wd_scheduler"])
+    momentum_scheduler.load_state_dict(checkpoint["momentum_scheduler"])
+    mask_collator.load_state_dict(checkpoint["mask_states"][rank])
+    restore_rng_state(checkpoint["rng_states"][rank])
+    return int(checkpoint["next_epoch"]), int(checkpoint["global_step"])
+
+
+def _build_mask_collator(args: dict, model_name: str):
+    mask = args["mask"]
+    common = dict(
+        num_frames=int(args["data"]["num_frames"]),
+        enc_frame_mask_ratio=tuple(mask["enc_frame_mask_ratio"]),
+        pred_frame_mask_ratio=tuple(mask["pred_frame_mask_ratio"]),
+        nenc=int(mask["num_enc_masks"]),
+        npred=int(mask["num_pred_masks"]),
+        allow_overlap=bool(mask["allow_overlap"]),
+    )
+    if model_name.endswith("_1d"):
+        return MaskCollator1D(**common)
+    return MaskCollator2D(
+        num_joints=int(args["data"]["num_joints"]),
+        enc_joint_mask_ratio=tuple(mask["enc_joint_mask_ratio"]),
+        pred_joint_mask_ratio=tuple(mask["pred_joint_mask_ratio"]),
+        **common,
+    )
+
+
+def _resolve_device(device: str | torch.device | None) -> torch.device:
+    if device is not None:
+        resolved = torch.device(device)
+    elif torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", 0)))
+        resolved = torch.device("cuda", local_rank)
+    else:
+        resolved = torch.device("cpu")
+    if resolved.type == "cuda":
+        torch.cuda.set_device(resolved)
+    return resolved
+
+
+def _seed_all(seed: int, device: torch.device) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+
+def main(args: dict, resume_preempt: bool = False, device=None):
+    device = _resolve_device(device)
+    distributed = init_distributed(device)
+    rank, world_size = distributed.rank, distributed.world_size
+    if rank != 0:
+        logger.setLevel(logging.ERROR)
+
+    seed = int(args.get("meta", {}).get("seed", 0))
+    # Model and EMA-target initialization must be identical before DDP broadcasts.
+    _seed_all(seed, device)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    data_args = args["data"]
+    meta_args = args["meta"]
+    opt_args = args["optimization"]
+    log_args = args["logging"]
+    model_name = str(meta_args["model_name"])
+    if not (model_name.endswith("_1d") or model_name.endswith("_2d")):
+        raise ValueError("Motion-JEPA model_name must end in '_1d' or '_2d'")
+
+    output = Path(log_args["folder"])
+    if distributed.is_main:
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "params-motion-jepa.yaml").write_text(
+            yaml.safe_dump(args, sort_keys=False), encoding="utf-8"
+        )
+    barrier()
+
+    mask_collator = _build_mask_collator(args, model_name)
+    _, loader, sampler = make_motion_dataset(
+        root_path=data_args["root_path"],
+        meta_files=data_args["meta_files"],
+        batch_size=int(data_args["batch_size"]),
+        num_frames=int(data_args["num_frames"]),
+        fps=int(data_args["fps"]),
+        motion_dim=int(data_args["motion_dim"]),
+        normalize=bool(data_args.get("normalize", False)),
+        stats_path=data_args.get("stats_path"),
+        rank=rank,
+        world_size=world_size,
+        collator=mask_collator,
+        drop_last=bool(data_args.get("drop_last", True)),
+        num_workers=int(data_args.get("num_workers", 8)),
+        pin_mem=bool(data_args.get("pin_mem", True)),
+        persistent_workers=bool(data_args.get("persistent_workers", True)),
+    )
+    if len(loader) == 0:
+        raise ValueError("Data loader has no batches; reduce batch_size or disable drop_last")
+
+    encoder, predictor = init_mjepa_model(
+        device=device,
+        num_frames=int(data_args["num_frames"]),
+        motion_dim=int(data_args["motion_dim"]),
+        num_joints=int(data_args["num_joints"]),
+        model_name=model_name,
+        pred_depth=int(meta_args["pred_depth"]),
+        pred_emb_dim=int(meta_args["pred_emb_dim"]),
+    )
+    target_encoder = copy.deepcopy(encoder).to(device)
+    target_encoder.requires_grad_(False)
+    target_encoder.eval()
+
+    optimizer, scaler, lr_scheduler, wd_scheduler = init_opt(
+        encoder=encoder,
+        predictor=predictor,
+        iterations_per_epoch=len(loader),
+        start_lr=float(opt_args["start_lr"]),
+        ref_lr=float(opt_args["lr"]),
+        final_lr=float(opt_args["final_lr"]),
+        warmup=float(opt_args["warmup"]),
+        num_epochs=int(opt_args["epochs"]),
+        wd=float(opt_args["weight_decay"]),
+        final_wd=float(opt_args["final_weight_decay"]),
+        use_float16=bool(meta_args.get("use_float16", False)),
+        ipe_scale=float(opt_args.get("ipe_scale", 1.0)),
+    )
+    total_steps = int(
+        len(loader) * int(opt_args["epochs"]) * float(opt_args.get("ipe_scale", 1.0))
+    )
+    momentum_scheduler = LinearMomentumSchedule(
+        opt_args["ema"][0], opt_args["ema"][1], total_steps
+    )
+
+    start_epoch = 0
+    global_step = 0
+    latest_path = output / f"{log_args['write_tag']}-latest.pth.tar"
+    should_load = bool(meta_args.get("load_checkpoint", False) or resume_preempt)
+    if should_load:
+        read_name = meta_args.get("read_checkpoint")
+        load_path = output / read_name if read_name else latest_path
+        if not load_path.is_file():
+            raise FileNotFoundError(f"Checkpoint requested but not found: {load_path}")
+        start_epoch, global_step = _load_checkpoint(
+            load_path,
+            device=device,
+            encoder=encoder,
+            predictor=predictor,
+            target_encoder=target_encoder,
+            optimizer=optimizer,
+            scaler=scaler,
+            lr_scheduler=lr_scheduler,
+            wd_scheduler=wd_scheduler,
+            momentum_scheduler=momentum_scheduler,
+            mask_collator=mask_collator,
+            rank=rank,
+            world_size=world_size,
+        )
+        logger.info("Resumed %s at epoch=%d global_step=%d", load_path, start_epoch, global_step)
+
+    if distributed.distributed:
+        ddp_kwargs = {"broadcast_buffers": False}
+        if device.type == "cuda":
+            ddp_kwargs.update(device_ids=[device.index], output_device=device.index)
+        encoder = DistributedDataParallel(encoder, **ddp_kwargs)
+        predictor = DistributedDataParallel(predictor, **ddp_kwargs)
+    if not should_load:
+        # Runtime stochasticity may differ by rank after identical model creation.
+        _seed_all(seed + rank, device)
+
+    encoder_params = sum(p.numel() for p in _unwrapped(encoder).parameters())
+    predictor_params = sum(p.numel() for p in _unwrapped(predictor).parameters())
+    logger.info(
+        "Initialized %s on %s rank=%d/%d (encoder %.2fM, predictor %.2fM)",
+        model_name,
+        device,
+        rank,
+        world_size,
+        encoder_params / 1.0e6,
+        predictor_params / 1.0e6,
+    )
+
+    csv_logger = None
+    if distributed.is_main:
+        csv_logger = CSVLogger(
+            str(output / f"{log_args['write_tag']}.csv"),
+            ("%d", "epoch"),
+            ("%d", "iteration"),
+            ("%d", "global_step"),
+            ("%.7f", "loss"),
+            ("%.7e", "learning_rate"),
+            ("%.7e", "weight_decay"),
+            ("%.3f", "time_ms"),
+        )
+
+    use_bfloat16 = bool(meta_args.get("use_bfloat16", False))
+    use_float16 = bool(meta_args.get("use_float16", False))
+    if use_bfloat16 and use_float16:
+        raise ValueError("Configure only one of use_bfloat16 and use_float16")
+    if use_float16 and device.type != "cuda":
+        raise ValueError("Float16 training requires CUDA; use bfloat16 or float32 on CPU")
+    amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16 if use_float16 else None
+    epochs = int(opt_args["epochs"])
+    checkpoint_frequency = int(log_args.get("checkpoint_freq", 50))
+    log_frequency = int(log_args.get("log_freq", 10))
+
+    for epoch in range(start_epoch, epochs):
+        sampler.set_epoch(epoch)
+        encoder.train()
+        predictor.train()
+        loss_meter = AverageMeter()
+        time_meter = AverageMeter()
+        for iteration, (batch, masks_enc, masks_pred) in enumerate(loader):
+            started = time.perf_counter()
+            motion = batch[0].to(device=device, dtype=torch.float32, non_blocking=True)
+            fps = batch[1].to(device=device, dtype=torch.float32, non_blocking=True)
+            valid_length = batch[2].to(device=device, non_blocking=True)
+            valid_frames = (
+                torch.arange(motion.shape[1], device=device).unsqueeze(0)
+                < valid_length.unsqueeze(1)
+            )
+            masks_enc = [mask.to(device, non_blocking=True) for mask in masks_enc]
+            masks_pred = [mask.to(device, non_blocking=True) for mask in masks_pred]
+            learning_rate = lr_scheduler.step()
+            weight_decay = wd_scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            amp_context = (
+                torch.autocast(device_type=device.type, dtype=amp_dtype)
+                if amp_dtype is not None
+                else nullcontext()
+            )
+            with amp_context:
+                with torch.no_grad():
+                    target = target_encoder(motion, fps, valid_frames=valid_frames)
+                    target = F.layer_norm(target, (target.shape[-1],))
+                    if model_name.endswith("_1d"):
+                        target = apply_index_masks(target, masks_pred)
+                    else:
+                        target = gather_grid_masks(target, masks_pred)
+                    target = repeat_mask_blocks(target, len(motion), len(masks_enc))
+                context = encoder(motion, fps, masks_enc, valid_frames=valid_frames)
+                prediction = predictor(context, fps, masks_enc, masks_pred)
+                loss = F.smooth_l1_loss(prediction, target)
+            if scaler is None:
+                loss.backward()
+                optimizer.step()
+            else:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+            momentum = momentum_scheduler.step()
+            update_ema(encoder, target_encoder, momentum)
+            global_step += 1
+            reported_loss = float(reduce_mean(loss).cpu())
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            loss_meter.update(reported_loss)
+            time_meter.update(elapsed_ms)
+            if distributed.is_main:
+                csv_logger.log(
+                    epoch + 1,
+                    iteration,
+                    global_step,
+                    reported_loss,
+                    learning_rate,
+                    weight_decay,
+                    elapsed_ms,
+                )
+                if iteration % log_frequency == 0:
+                    stats = grad_logger(_unwrapped(encoder).named_parameters())
+                    memory = (
+                        torch.cuda.max_memory_allocated(device) / 1024.0**2
+                        if device.type == "cuda"
+                        else 0.0
+                    )
+                    logger.info(
+                        "epoch=%d iteration=%d loss=%.5f lr=%.3e wd=%.3e "
+                        "time=%.1fms memory=%.0fMiB grad=[%.2e, %.2e]",
+                        epoch + 1,
+                        iteration,
+                        loss_meter.avg,
+                        learning_rate,
+                        weight_decay,
+                        time_meter.avg,
+                        memory,
+                        stats.first_layer,
+                        stats.last_layer,
+                    )
+            if not np.isfinite(reported_loss):
+                raise FloatingPointError(f"Non-finite loss at step {global_step}: {reported_loss}")
+
+        _save_checkpoint(
+            latest_path,
+            encoder=encoder,
+            predictor=predictor,
+            target_encoder=target_encoder,
+            optimizer=optimizer,
+            scaler=scaler,
+            lr_scheduler=lr_scheduler,
+            wd_scheduler=wd_scheduler,
+            momentum_scheduler=momentum_scheduler,
+            mask_collator=mask_collator,
+            next_epoch=epoch + 1,
+            global_step=global_step,
+            loss=loss_meter.avg,
+            world_size=world_size,
+            rank=rank,
+            config=args,
+        )
+        if distributed.is_main and (epoch + 1) % checkpoint_frequency == 0:
+            checkpoint_path = output / f"{log_args['write_tag']}-ep{epoch + 1}.pth.tar"
+            # The latest checkpoint is complete and atomically written; copy through torch
+            # serialization to keep each named checkpoint independently loadable.
+            _atomic_torch_save(torch.load(latest_path, map_location="cpu"), checkpoint_path)
+        barrier()
+        logger.info("epoch=%d average_loss=%.6f", epoch + 1, loss_meter.avg)
+
+    return {
+        "next_epoch": epochs,
+        "global_step": global_step,
+        "checkpoint": str(latest_path),
+    }
+
+
+__all__ = ["capture_rng_state", "main", "restore_rng_state", "update_ema"]
