@@ -51,10 +51,10 @@ NPY_FORMAT_VERSION = 1
 BUILD_MARKER = ".motion-jepa-npy-build"
 
 _DATASET_ROOT: Path | None = None
-_NUM_FRAMES = 180
+_NUM_FRAMES = 120
 _MIN_FRAMES = 90
-_FPS = 60
-_STRIDE_FRAMES = 150
+_FPS = 30
+_STRIDE_FRAMES = 60
 _SOURCE_SKELETON: SOMASkeleton77 | None = None
 _TARGET_SKELETON: SOMASkeleton30 | None = None
 _OUTPUT_ROOT: Path | None = None
@@ -666,13 +666,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workers",
         type=int,
-        default=min(64, os.cpu_count() or 1),
+        default=min(32, os.cpu_count() or 1),
         help="Worker processes. Each worker uses one PyTorch CPU thread.",
     )
-    parser.add_argument("--chunksize", type=int, default=16)
-    parser.add_argument("--num_frames", type=int, default=180)
+    parser.add_argument("--chunksize", type=int, default=8)
+    parser.add_argument("--num_frames", type=int, default=120)
     parser.add_argument("--min_frames", type=int, default=90)
-    parser.add_argument("--fps", type=int, default=60)
+    parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--overlap", type=float, default=0.5)
     parser.add_argument("--split_seed", type=int, default=42)
     parser.add_argument("--max_per_split", type=int, default=-1)
