@@ -1,5 +1,5 @@
 data:
-  batch_size: 8  # Per rank; tune for model size and available memory.
+  batch_size: 512  # Per rank; tune for model size and available memory.
   root_path: ./dataset/bones-seed-processed
   meta_files:
     - train.txt
