@@ -416,6 +416,8 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     log_frequency = int(log_args.get("log_freq", 10))
     if log_frequency <= 0:
         raise ValueError("logging.log_freq must be positive")
+    warmup = float(opt_args["warmup"])
+    clip_grad = float(opt_args["clip_grad"]) if opt_args.get("clip_grad") is not None else None
 
     # These meters span epoch boundaries and reset only after a log event, so
     # every TensorBoard point summarizes exactly the steps since the prior one.
@@ -460,11 +462,22 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                 context = encoder(motion, fps, masks_enc, valid_frames=valid_frames)
                 prediction = predictor(context, fps, masks_enc, masks_pred)
                 loss = F.smooth_l1_loss(prediction, target)
+
+            # full precision
             if scaler is None:
                 loss.backward()
+                if (epoch > warmup) and (clip_grad is not None):
+                    torch.nn.utils.clip_grad_norm_(encoder.parameters(), clip_grad)
+                    torch.nn.utils.clip_grad_norm_(predictor.parameters(), clip_grad)
                 optimizer.step()
+
+            # mixed precision
             else:
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                if (epoch > warmup) and (clip_grad is not None):
+                    torch.nn.utils.clip_grad_norm_(encoder.parameters(), clip_grad)
+                    torch.nn.utils.clip_grad_norm_(predictor.parameters(), clip_grad)
                 scaler.step(optimizer)
                 scaler.update()
 
