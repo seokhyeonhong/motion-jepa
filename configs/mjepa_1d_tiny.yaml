@@ -34,8 +34,8 @@ meta:
   load_checkpoint: false
   read_checkpoint: null
   model_name: mot_tiny_1d
-  pred_depth: 12
-  pred_emb_dim: 384
+  pred_depth: 4
+  pred_emb_dim: 192
   use_bfloat16: true
   use_float16: false
 
