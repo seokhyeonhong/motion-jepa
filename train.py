@@ -321,7 +321,6 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     target_encoder = copy.deepcopy(encoder).to(device)
     target_encoder.requires_grad_(False)
     target_encoder.eval()
-    breakpoint()
 
     optimizer, scaler, lr_scheduler, wd_scheduler = init_opt(
         encoder=encoder,
