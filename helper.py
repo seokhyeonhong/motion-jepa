@@ -8,8 +8,7 @@ import torch
 
 from model import (
     MODEL_FACTORIES,
-    MotionTransformerPredictor1D,
-    MotionTransformerPredictor2D,
+    PREDICTOR_FACTORIES,
 )
 from utils.schedulers import CosineWDSchedule, WarmupCosineSchedule
 
@@ -23,8 +22,7 @@ def init_mjepa_model(
     motion_dim: int,
     num_joints: int,
     model_name: str,
-    pred_depth: int,
-    pred_emb_dim: int,
+    predictor_name: str
 ):
     try:
         factory = MODEL_FACTORIES[model_name]
@@ -35,24 +33,16 @@ def init_mjepa_model(
     if model_name.endswith("_2d"):
         encoder_kwargs["num_joints"] = num_joints
     encoder = factory(**encoder_kwargs)
-    predictor_type = (
-        MotionTransformerPredictor1D if model_name.endswith("_1d")
-        else MotionTransformerPredictor2D
-    )
-    predictor = predictor_type(
-        num_frames=num_frames,
-        num_joints=num_joints,
-        embed_dim=encoder.embed_dim,
-        predictor_embed_dim=pred_emb_dim,
-        depth=pred_depth,
-        num_heads=encoder.num_heads,
-    ) if model_name.endswith("_2d") else predictor_type(
-        num_frames=num_frames,
-        embed_dim=encoder.embed_dim,
-        predictor_embed_dim=pred_emb_dim,
-        depth=pred_depth,
-        num_heads=encoder.num_heads,
-    )
+
+    try:
+        pred_factory = PREDICTOR_FACTORIES[predictor_name]
+    except KeyError as error:
+        choices = ", ".join(sorted(PREDICTOR_FACTORIES))
+        raise ValueError(f"Unknown predictor_name {predictor_name!r}; choose one of: {choices}") from error
+    predictor_kwargs = {"num_frames": num_frames, "embed_dim": encoder.embed_dim}
+    if model_name.endswith("_2d"):
+        predictor_kwargs["num_joints"] = num_joints
+    predictor = pred_factory(**predictor_kwargs)
     return encoder.to(device), predictor.to(device)
 
 

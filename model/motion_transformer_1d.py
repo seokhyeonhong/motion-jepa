@@ -11,7 +11,7 @@ from mask.utils import apply_index_masks, repeat_mask_blocks
 
 from .modules import TransformerBlock1D, initialize_transformer
 from .pos_embs import ContinuousSinCosPosEmbed1D
-from .specs import MODEL_SPECS
+from .specs import MODEL_SPECS, PREDICTOR_SPECS
 
 
 class _TemporalPositions(nn.Module):
@@ -220,13 +220,49 @@ def mot_giant_1d(**kwargs):
     return _encoder("giant", **kwargs)
 
 
+def _predictor(size: str, **kwargs) -> MotionTransformerPredictor1D:
+    return MotionTransformerPredictor1D(**PREDICTOR_SPECS[size], **kwargs)
+
+
+def mot_predictor_tiny_1d(**kwargs):
+    return _predictor("tiny", **kwargs)
+
+
+def mot_predictor_small_1d(**kwargs):
+    return _predictor("small", **kwargs)
+
+
+def mot_predictor_base_1d(**kwargs):
+    return _predictor("base", **kwargs)
+
+
+def mot_predictor_large_1d(**kwargs):
+    return _predictor("large", **kwargs)
+
+
+def mot_predictor_huge_1d(**kwargs):
+    return _predictor("huge", **kwargs)
+
+
+def mot_predictor_giant_1d(**kwargs):
+    return _predictor("giant", **kwargs)
+
+
 __all__ = [
     "MotionTransformer1D",
     "MotionTransformerPredictor1D",
-    "mot_base_1d",
-    "mot_giant_1d",
-    "mot_huge_1d",
-    "mot_large_1d",
-    "mot_small_1d",
+    
     "mot_tiny_1d",
+    "mot_small_1d",
+    "mot_base_1d",
+    "mot_large_1d",
+    "mot_huge_1d",
+    "mot_giant_1d",
+
+    "mot_predictor_tiny_1d",
+    "mot_predictor_small_1d",
+    "mot_predictor_base_1d",
+    "mot_predictor_large_1d",
+    "mot_predictor_huge_1d",
+    "mot_predictor_giant_1d",
 ]

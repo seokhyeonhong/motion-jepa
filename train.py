@@ -277,6 +277,9 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     model_name = str(meta_args["model_name"])
     if not (model_name.endswith("_1d") or model_name.endswith("_2d")):
         raise ValueError("Motion-JEPA model_name must end in '_1d' or '_2d'")
+    predictor_name = str(meta_args["predictor_name"])
+    if not (predictor_name.endswith("_1d") or predictor_name.endswith("_2d")):
+        raise ValueError("Motion-JEPA predictor_name must end in '_1d' or '_2d'")
 
     output = Path(log_args["folder"])
     if distributed.is_main:
@@ -313,12 +316,12 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         motion_dim=int(data_args["motion_dim"]),
         num_joints=int(data_args["num_joints"]),
         model_name=model_name,
-        pred_depth=int(meta_args["pred_depth"]),
-        pred_emb_dim=int(meta_args["pred_emb_dim"]),
+        predictor_name=predictor_name,
     )
     target_encoder = copy.deepcopy(encoder).to(device)
     target_encoder.requires_grad_(False)
     target_encoder.eval()
+    breakpoint()
 
     optimizer, scaler, lr_scheduler, wd_scheduler = init_opt(
         encoder=encoder,

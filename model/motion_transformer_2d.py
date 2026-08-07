@@ -12,7 +12,7 @@ from skeleton import SOMASkeleton30
 
 from .modules import AxialBlock2D, PredictorAxialBlock2D, initialize_transformer
 from .pos_embs import ContinuousSinCosPosEmbed1D
-from .specs import MODEL_SPECS
+from .specs import MODEL_SPECS, PREDICTOR_SPECS
 
 
 class MotionFeatureTokenizer2D(nn.Module):
@@ -326,14 +326,51 @@ def mot_giant_2d(**kwargs):
     return _encoder("giant", **kwargs)
 
 
+def _predictor(size: str, **kwargs) -> MotionTransformerPredictor2D:
+    return MotionTransformerPredictor2D(**PREDICTOR_SPECS[size], **kwargs)
+
+
+def mot_predictor_tiny_2d(**kwargs):
+    return _predictor("tiny", **kwargs)
+
+
+def mot_predictor_small_2d(**kwargs):
+    return _predictor("small", **kwargs)
+
+
+def mot_predictor_base_2d(**kwargs):
+    return _predictor("base", **kwargs)
+
+
+def mot_predictor_large_2d(**kwargs):
+    return _predictor("large", **kwargs)
+
+
+def mot_predictor_huge_2d(**kwargs):
+    return _predictor("huge", **kwargs)
+
+
+def mot_predictor_giant_2d(**kwargs):
+    return _predictor("giant", **kwargs)
+
+
 __all__ = [
     "MotionFeatureTokenizer2D",
     "MotionTransformer2D",
     "MotionTransformerPredictor2D",
-    "mot_base_2d",
-    "mot_giant_2d",
-    "mot_huge_2d",
-    "mot_large_2d",
-    "mot_small_2d",
+
     "mot_tiny_2d",
+    "mot_small_2d",
+    "mot_base_2d",
+    "mot_large_2d",
+    "mot_huge_2d",
+    "mot_giant_2d",
+
+    "mot_predictor_tiny_2d",
+    "mot_predictor_small_2d",
+    "mot_predictor_base_2d",
+    "mot_predictor_large_2d",
+    "mot_predictor_giant_2d",
+    "mot_predictor_huge_2d",
+
 ]
