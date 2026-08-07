@@ -1,8 +1,0 @@
-2026-07-25T21:28:47.789829Z  INFO codex_cli::login: starting browser login flow
-2026-07-25T21:29:23.817937Z  INFO codex_cli::login: starting device code login flow
-2026-07-25T21:30:09.594693Z  INFO codex_cli::login: starting device code login flow
-2026-07-25T21:30:31.389604Z  INFO codex_login::server: starting oauth token exchange issuer=https://auth.openai.com/ token_endpoint=https://auth.openai.com/oauth/token redirect_uri=https://auth.openai.com/deviceauth/callback
-2026-07-25T21:30:31.785841Z  INFO codex_login::server: oauth token exchange succeeded status=200 OK
-2026-08-06T06:31:10.502941Z  INFO codex_cli::login: starting device code login flow
-2026-08-06T06:31:33.005032Z  INFO codex_login::server: starting oauth token exchange issuer=https://auth.openai.com/ token_endpoint=https://auth.openai.com/oauth/token redirect_uri=https://auth.openai.com/deviceauth/callback
-2026-08-06T06:31:33.446341Z  INFO codex_login::server: oauth token exchange succeeded status=200 OK
