@@ -36,30 +36,16 @@ HELDOUT_SPLIT_FILES = (
     "test_content_split_paths.txt",
     "test_repetition_split_paths.txt",
 )
-CAPTION_FIELDS = (
-    "content_natural_desc_4",
-    "content_natural_desc_3",
-    "content_natural_desc_2",
-    "content_natural_desc_1",
-    "content_short_description",
-    "content_short_description_2",
-    "content_technical_description",
-)
 SPLITS = ("train", "val", "test")
-NPY_FORMAT = "motion_jepa_npy_v1"
-NPY_FORMAT_VERSION = 1
-BUILD_MARKER = ".motion-jepa-npy-build"
 
 _DATASET_ROOT: Path | None = None
-_NUM_FRAMES = 120
-_MIN_FRAMES = 90
+_NUM_FRAMES = 90
 _FPS = 30
-_STRIDE_FRAMES = 60
+_STRIDE_FRAMES = 45
 _SOURCE_SKELETON: SOMASkeleton77 | None = None
 _TARGET_SKELETON: SOMASkeleton30 | None = None
 _OUTPUT_ROOT: Path | None = None
 _THREAD_CONFIG_PID: int | None = None
-MAX_FPS = 60
 
 
 @dataclass(frozen=True)
@@ -67,7 +53,6 @@ class WorkItem:
     id: str
     split: str
     bvh_path: str
-    captions: tuple[str, ...]
     metadata: dict[str, Any]
 
 
@@ -104,15 +89,6 @@ def resample_motion_fps(
     return local_rotations[::step], root_positions[::step], target_fps
 
 
-def cap_motion_fps(
-    local_rotations: torch.Tensor,
-    root_positions: torch.Tensor,
-    fps: int,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Backward-compatible wrapper for the original 60 FPS cap."""
-    return resample_motion_fps(local_rotations, root_positions, fps, MAX_FPS)
-
-
 def calculate_stride(num_frames: int, overlap: float) -> int:
     """Return a positive stride using half-up integer rounding."""
     return max(1, int(math.floor(int(num_frames) * (1.0 - float(overlap)) + 0.5)))
@@ -121,13 +97,6 @@ def calculate_stride(num_frames: int, overlap: float) -> int:
 def _validate_config(args: argparse.Namespace) -> None:
     if args.num_frames <= 0:
         raise ValueError(f"--num_frames must be positive, got {args.num_frames}")
-    if not 1 <= args.min_frames <= args.num_frames:
-        raise ValueError(
-            f"--min_frames must be in [1, num_frames], got {args.min_frames} "
-            f"for num_frames={args.num_frames}"
-        )
-    if args.fps <= 0 or args.fps > MAX_FPS:
-        raise ValueError(f"--fps must be in [1, {MAX_FPS}], got {args.fps}")
     if not 0.0 <= args.overlap < 1.0:
         raise ValueError(f"--overlap must be in [0, 1), got {args.overlap}")
 
@@ -169,17 +138,6 @@ def _load_metadata(path: Path) -> dict[str, dict[str, str]]:
     return by_id
 
 
-def _clean_text(values: list[str]) -> tuple[str, ...]:
-    output: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        caption = " ".join(str(value or "").split())
-        if caption and caption.casefold() not in seen:
-            output.append(caption)
-            seen.add(caption.casefold())
-    return tuple(output)
-
-
 def _make_work_items(
     split_ids: dict[str, list[str]],
     metadata_by_id: dict[str, dict[str, str]],
@@ -212,7 +170,6 @@ def _make_work_items(
                     id=item_id,
                     split=split,
                     bvh_path=f"bvh/{item_id}.bvh",
-                    captions=_clean_text([row.get(field, "") for field in CAPTION_FIELDS]),
                     metadata=metadata,
                 )
             )
@@ -223,16 +180,14 @@ def _init_worker(
     dataset_root: str,
     output_root: str,
     num_frames: int,
-    min_frames: int,
     fps: int,
     stride_frames: int,
 ) -> None:
-    global _DATASET_ROOT, _OUTPUT_ROOT, _NUM_FRAMES, _MIN_FRAMES, _FPS, _STRIDE_FRAMES
+    global _DATASET_ROOT, _OUTPUT_ROOT, _NUM_FRAMES, _FPS, _STRIDE_FRAMES
     global _SOURCE_SKELETON, _TARGET_SKELETON, _THREAD_CONFIG_PID
     _DATASET_ROOT = Path(dataset_root)
     _OUTPUT_ROOT = Path(output_root)
     _NUM_FRAMES = int(num_frames)
-    _MIN_FRAMES = int(min_frames)
     _FPS = int(fps)
     _STRIDE_FRAMES = int(stride_frames)
     current_pid = os.getpid()
@@ -271,15 +226,6 @@ def _convert_one(item: WorkItem) -> dict[str, Any]:
             else []
         )
         clips = [(start, start + _NUM_FRAMES) for start in starts]
-        covered_end = clips[-1][1] if clips else 0
-        if num_source_frames - covered_end >= _MIN_FRAMES:
-            clips.append((covered_end, num_source_frames))
-        if not clips:
-            raise ValueError(
-                "Too few frames for a configured clip or tail: "
-                f"{num_source_frames} < {_MIN_FRAMES}"
-            )
-
         local_rotations, _ = _SOURCE_SKELETON.to_standard_tpose(local_rotations)
         local_rotations = _TARGET_SKELETON.from_soma77(local_rotations)
         motion_rep = MotionJEPAMotionRep(_TARGET_SKELETON, fps)
@@ -312,7 +258,6 @@ def _convert_one(item: WorkItem) -> dict[str, Any]:
                     "fps": fps,
                     "length": int(len(motion)),
                     "motion_dim": int(motion.shape[1]),
-                    "captions": list(item.captions),
                     "metadata": item.metadata,
                     "motion": motion,
                 }
@@ -382,7 +327,6 @@ def _ordered_results(items: list[WorkItem], args: argparse.Namespace) -> Iterato
         str(args.dataset_root),
         str(args.output),
         args.num_frames,
-        args.min_frames,
         args.fps,
         calculate_stride(args.num_frames, args.overlap),
     )
@@ -432,8 +376,6 @@ def _manifest(
 ) -> dict[str, Any]:
     split_path = root / f"{split}.txt"
     return {
-        "format": NPY_FORMAT,
-        "format_version": NPY_FORMAT_VERSION,
         "split": split,
         "motion_root": f"motions/{split}",
         "num_samples": len(records),
@@ -476,8 +418,6 @@ def _validate_complete_dataset(output: Path) -> bool:
             split_path = output / f"{split}.txt"
             manifest_path = output / f"motions/{split}.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if manifest.get("format") != NPY_FORMAT:
-                return False
             if manifest.get("split_sha256") != hashlib.sha256(split_path.read_bytes()).hexdigest():
                 return False
             rows = [line for line in split_path.read_text(encoding="utf-8").splitlines() if line]
@@ -493,10 +433,7 @@ def _prepare_output(output: Path, overwrite: bool) -> None:
     """Create the final output directory before conversion starts."""
     if output.exists():
         if not overwrite:
-            state = "incomplete" if (output / BUILD_MARKER).is_file() else "unrecognized"
-            raise FileExistsError(
-                f"Output is {state}: {output}; use --overwrite to rebuild"
-            )
+            raise FileExistsError(f"Output exists: {output}; use --overwrite to rebuild")
         if not output.is_dir():
             raise RuntimeError(f"Refusing to replace non-directory output: {output}")
         # The resolved output must be a named directory, never a filesystem root.
@@ -504,7 +441,6 @@ def _prepare_output(output: Path, overwrite: bool) -> None:
             raise RuntimeError(f"Refusing to remove unsafe output path: {output}")
         shutil.rmtree(output)
     output.mkdir(parents=True)
-    (output / BUILD_MARKER).write_text("motion-jepa direct NPY build\n", encoding="utf-8")
     (output / "motions").mkdir()
 
 
@@ -589,9 +525,7 @@ def preprocess(args: argparse.Namespace) -> None:
             "skeleton": "soma30",
             "motion_dim": MotionJEPAMotionRep.FEATURE_DIM,
             "fps": args.fps,
-            "max_fps": MAX_FPS,
             "num_frames": args.num_frames,
-            "min_frames": args.min_frames,
             "clip_seconds": args.num_frames / args.fps,
             "overlap": args.overlap,
             "stride_frames": calculate_stride(args.num_frames, args.overlap),
@@ -604,7 +538,6 @@ def preprocess(args: argparse.Namespace) -> None:
             "write_mode": "direct_on_the_fly",
             "split_seed": args.split_seed,
             "npy": {
-                "format": NPY_FORMAT,
                 "path": "motions",
                 "dtype": "float32",
                 "lazy_loading": True,
@@ -630,7 +563,6 @@ def preprocess(args: argparse.Namespace) -> None:
 
     if not _validate_complete_dataset(args.output):
         raise RuntimeError(f"NPY dataset failed final validation: {args.output}")
-    (args.output / BUILD_MARKER).unlink()
     print(f"Output: {args.output}")
     print(
         "Splits: "
@@ -670,8 +602,7 @@ def parse_args() -> argparse.Namespace:
         help="Worker processes. Each worker uses one PyTorch CPU thread.",
     )
     parser.add_argument("--chunksize", type=int, default=8)
-    parser.add_argument("--num_frames", type=int, default=120)
-    parser.add_argument("--min_frames", type=int, default=90)
+    parser.add_argument("--num_frames", type=int, default=90)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--overlap", type=float, default=0.5)
     parser.add_argument("--split_seed", type=int, default=42)
