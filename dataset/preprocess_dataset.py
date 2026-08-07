@@ -37,6 +37,7 @@ HELDOUT_SPLIT_FILES = (
     "test_repetition_split_paths.txt",
 )
 SPLITS = ("train", "val", "test")
+NPY_FORMAT = "motion_jepa_npy_v1"
 
 _DATASET_ROOT: Path | None = None
 _NUM_FRAMES = 90
@@ -376,6 +377,7 @@ def _manifest(
 ) -> dict[str, Any]:
     split_path = root / f"{split}.txt"
     return {
+        "format": NPY_FORMAT,
         "split": split,
         "motion_root": f"motions/{split}",
         "num_samples": len(records),
@@ -418,6 +420,8 @@ def _validate_complete_dataset(output: Path) -> bool:
             split_path = output / f"{split}.txt"
             manifest_path = output / f"motions/{split}.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("format") != NPY_FORMAT:
+                return False
             if manifest.get("split_sha256") != hashlib.sha256(split_path.read_bytes()).hexdigest():
                 return False
             rows = [line for line in split_path.read_text(encoding="utf-8").splitlines() if line]
@@ -538,6 +542,7 @@ def preprocess(args: argparse.Namespace) -> None:
             "write_mode": "direct_on_the_fly",
             "split_seed": args.split_seed,
             "npy": {
+                "format": NPY_FORMAT,
                 "path": "motions",
                 "dtype": "float32",
                 "lazy_loading": True,
