@@ -15,7 +15,7 @@ data:
   stats_path: stats
 
 logging:
-  folder: ./output/mot_base_1d-bs.512-ep.300
+  folder: ./output/mot_huge_1d-bs.512-ep.300
   write_tag: motion-jepa-1d
   log_freq: 100
   tensorboard: true
