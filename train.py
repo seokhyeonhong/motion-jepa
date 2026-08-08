@@ -282,6 +282,8 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         raise ValueError("Motion-JEPA predictor_name must end in '_1d' or '_2d'")
 
     output = Path(log_args["folder"])
+    if output.exists() and not resume_preempt:
+        raise FileExistsError(f"Output folder already exists: {output}")
     if distributed.is_main:
         output.mkdir(parents=True, exist_ok=True)
         (output / "params-motion-jepa.yaml").write_text(
