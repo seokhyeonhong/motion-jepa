@@ -7,6 +7,8 @@ dataset/*
 !dataset/*.py
 dataset-bvh/
 output/
+/output
+findings/**/runs/
 
 .vscode/
 ijepa/
