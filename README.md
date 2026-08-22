@@ -50,6 +50,16 @@ writes independently canonicalized clips as individual NumPy arrays:
 python dataset/preprocess_dataset.py --workers 64
 ```
 
+For a quick end-to-end check, limit preprocessing to a few source motions per
+split:
+
+```bash
+python dataset/preprocess_dataset.py \
+  --limit 3 \
+  --workers 1 \
+  --output dataset/bones-seed-processed-preview
+```
+
 The default output is `dataset/bones-seed-processed`:
 
 ```text
@@ -83,6 +93,27 @@ dimension, finite values, and normalization statistics. Runtime resampling is
 not supported. Variable-length tails are normalized over their real frames,
 then end-padded with literal zeros; padding is excluded from masks, attention,
 targets, and loss.
+
+### 100STYLE preprocessing
+
+The 100STYLE preprocessor discovers SOMA77 BVHs directly, creates complete
+non-overlapping windows, shuffles all windows with a fixed seed, and writes an
+80/10/10 train/validation/test split in the same NPY format. No external split
+path files are required.
+
+Run a small end-to-end preview with:
+
+```bash
+python dataset/preprocess_100style.py \
+  --limit 10 \
+  --workers 1 \
+  --output dataset/100style-processed-preview
+```
+
+Omit `--limit` to process every `bvh/*_soma77.bvh` file under
+`dataset/100STYLE_soma77`. Windows from the same source motion may be assigned
+to different splits, but windows never overlap and therefore never share input
+frames.
 
 Workers convert and save source motions directly, avoiding transfer of large
 feature arrays back to the parent process. Training uses global per-epoch
@@ -171,6 +202,71 @@ Events are written under `<logging.folder>/tensorboard` at `logging.log_freq`.
 Loss, iteration time, learning rate, and weight decay are interval averages
 accumulated since the previous log event. The CSV continues to store raw values
 for every optimization step.
+
+## Linear probing
+
+Extract and cache frozen features from a pretrained EMA target encoder, then
+train a single linear style classifier on 100STYLE:
+
+```bash
+python -m experiment.linear_probe \
+  --checkpoint output/<run>/motion-jepa-1d-latest.pth.tar \
+  --dataset-root dataset/100style-processed \
+  --output output/linear-probe/<run>
+```
+
+`--output` may be omitted; in that case results are written under
+`<checkpoint directory>/linear-probe`. Supplying it explicitly selects a
+different linear-probe result directory.
+
+The encoder is reconstructed from the checkpoint config and uses the
+pretraining mean and standard deviation, not the 100STYLE statistics. Its
+valid output tokens are globally averaged and cached as `float32` under
+`<output>/features`. The probe is a bias-enabled `nn.Linear` trained with
+ordinary cross-entropy and momentum SGD. Use `--overwrite` to rerun the head
+while retaining valid feature caches, or `--recompute-features` when the
+checkpoint, dataset index, statistics, or extraction setup has changed.
+
+Per-epoch train and validation metrics are written to `metrics.csv`. The head
+with the best validation top-1 accuracy is restored for the single final test
+evaluation recorded in `summary.json`.
+
+Sweep every direct-child latest checkpoint with:
+
+```bash
+python -m experiment.linear_probe.lr_sweep --device cuda:0
+```
+
+Train matched-size supervised CNN and Transformer baselines directly on raw
+100STYLE motion with:
+
+```bash
+python -m experiment.linear_probe.supervised \
+  --model all \
+  --dataset-root dataset/100style-soma77-processed \
+  --seed 42 \
+  --device cuda:0
+```
+
+The same classifiers can consume frozen frame-token features from a pretrained
+1D Motion-JEPA target encoder:
+
+```bash
+python -m experiment.linear_probe.supervised \
+  --input-source jepa \
+  --jepa-checkpoint output/<run>/motion-jepa-1d-latest.pth.tar \
+  --checkpoint-key target_encoder \
+  --model all \
+  --dataset-root dataset/100style-soma77-processed \
+  --seed 42 \
+  --device cuda:0
+```
+
+Token features are cached once as BF16 under
+`<checkpoint directory>/linear-probe/token-features`. Classifier outputs default
+to `<checkpoint directory>/linear-probe/classifiers`; both locations can be
+overridden. The classifier checkpoints record the JEPA model name, checkpoint
+key, checkpoint SHA256, feature dimension, and normalization-statistics hashes.
 
 ## Tests
 
