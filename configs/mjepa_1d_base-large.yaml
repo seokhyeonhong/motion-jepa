@@ -1,5 +1,5 @@
 data:
-  batch_size: 256  # Per rank; global batch is batch_size * world_size.
+  batch_size: 512  # Per rank; global batch is batch_size * world_size.
   root_path: ./dataset/bones-seed-processed
   meta_files:
     - train.txt
@@ -15,7 +15,7 @@ data:
   stats_path: stats
 
 logging:
-  folder: ./output/mot_giant_1d-bs.512-ep.300
+  folder: ./output/mot_base-large_1d-bs.512-ep.300
   write_tag: motion-jepa-1d
   log_freq: 100
   tensorboard: true
@@ -33,8 +33,8 @@ meta:
   seed: 0
   load_checkpoint: false
   read_checkpoint: null
-  model_name: mot_giant_1d
-  predictor_name: mot_predictor_giant_1d
+  model_name: mot_base_1d
+  predictor_name: mot_predictor_large_1d
   use_bfloat16: true
   use_float16: false
 
