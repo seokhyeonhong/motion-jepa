@@ -448,6 +448,111 @@ def _prepare_output(output: Path, overwrite: bool) -> None:
     (output / "motions").mkdir()
 
 
+def finalize_processed_dataset(
+    args: argparse.Namespace,
+    records_by_split: dict[str, list[dict[str, Any]]],
+    errors: list[dict[str, Any]],
+    source_success_counts: dict[str, int],
+    *,
+    source_dataset: str,
+    segmentation: str,
+    num_source_motions: int | None = None,
+    metadata_extra: dict[str, Any] | None = None,
+) -> None:
+    """Write manifests, training statistics, and metadata for converted records."""
+    for split in SPLITS:
+        records = records_by_split.setdefault(split, [])
+        _write_split(args.output / f"{split}.txt", records)
+        _write_json(
+            args.output / f"motions/{split}.json",
+            _manifest(args.output, split, records, args),
+        )
+
+    train_count = 0
+    train_sum: np.ndarray | None = None
+    train_sq_sum: np.ndarray | None = None
+    for record in records_by_split["train"]:
+        clip_sum = record.pop("_stats_sum")
+        clip_sq_sum = record.pop("_stats_sq_sum")
+        train_count += int(record["length"])
+        train_sum = clip_sum if train_sum is None else train_sum + clip_sum
+        train_sq_sum = clip_sq_sum if train_sq_sum is None else train_sq_sum + clip_sq_sum
+
+    if train_count == 0 or train_sum is None or train_sq_sum is None:
+        raise RuntimeError("No training motions were converted; statistics cannot be computed.")
+    mean = train_sum / train_count
+    variance = np.maximum(train_sq_sum / train_count - np.square(mean), 1e-12)
+    std = np.sqrt(variance)
+    std = np.where(std < 1e-6, 1.0, std)
+    stats_root = args.output / "stats"
+    stats_root.mkdir(parents=True)
+    np.save(stats_root / "mean.npy", mean.astype(np.float32))
+    np.save(stats_root / "std.npy", std.astype(np.float32))
+
+    all_records = [record for split in SPLITS for record in records_by_split[split]]
+    _write_json(args.output / "index.json", all_records)
+    metadata = {
+        "source_dataset": source_dataset,
+        "representation": MotionJEPAMotionRep.FORMAT_NAME,
+        "producer": "motion-jepa",
+        "motion_storage": "npy_float32_v1",
+        "split_format": "sample_id,relative_npy_path,fps,actual_length",
+        "skeleton": "soma30",
+        "motion_dim": MotionJEPAMotionRep.FEATURE_DIM,
+        "fps": args.fps,
+        "num_frames": args.num_frames,
+        "clip_seconds": args.num_frames / args.fps,
+        "overlap": args.overlap,
+        "stride_frames": calculate_stride(args.num_frames, args.overlap),
+        "segmentation": segmentation,
+        "window_canonicalization": "independent",
+        "downsampling": "fixed_step_from_frame_zero_no_interpolation",
+        "fps_validation": "source_fps_must_equal_or_be_divisible_by_configured_fps",
+        "resampled": True,
+        "canonicalized": True,
+        "write_mode": "direct_on_the_fly",
+        "split_seed": args.split_seed,
+        "npy": {
+            "format": NPY_FORMAT,
+            "path": "motions",
+            "dtype": "float32",
+            "lazy_loading": True,
+        },
+        "statistics": {
+            "format": "numpy_float32_pair",
+            "mean_path": "stats/mean.npy",
+            "std_path": "stats/std.npy",
+            "source_split": "train",
+            "valid_frames_only": True,
+        },
+        "split_counts": {split: len(records_by_split[split]) for split in SPLITS},
+        "source_split_counts": source_success_counts,
+        "num_source_motions": (
+            sum(source_success_counts.values())
+            if num_source_motions is None
+            else int(num_source_motions)
+        ),
+        "num_samples": len(all_records),
+        "num_errors": len(errors),
+        "train_stats_frames": int(train_count),
+    }
+    if metadata_extra:
+        metadata.update(metadata_extra)
+    _write_json(args.output / "meta.json", metadata)
+    with (args.output / "errors.jsonl").open("w", encoding="utf-8") as file:
+        for error in errors:
+            file.write(json.dumps(error, ensure_ascii=False) + "\n")
+
+    if not _validate_complete_dataset(args.output):
+        raise RuntimeError(f"NPY dataset failed final validation: {args.output}")
+    print(f"Output: {args.output}")
+    print(
+        "Splits: "
+        + ", ".join(f"{split}={len(records_by_split[split])}" for split in SPLITS)
+    )
+    print(f"Errors: {len(errors)}")
+
+
 def preprocess(args: argparse.Namespace) -> None:
     """Write a complete NPY-backed dataset directly to its final directory."""
     _validate_config(args)
@@ -465,9 +570,6 @@ def preprocess(args: argparse.Namespace) -> None:
     items_by_split = _make_work_items(split_ids, metadata, limit)
     records_by_split: dict[str, list[dict[str, Any]]] = {}
     errors: list[dict[str, Any]] = []
-    train_count = 0
-    train_sum: np.ndarray | None = None
-    train_sq_sum: np.ndarray | None = None
     source_success_counts = {split: 0 for split in SPLITS}
 
     for split in SPLITS:
@@ -489,91 +591,16 @@ def preprocess(args: argparse.Namespace) -> None:
                 # array; production workers save it before crossing the process pipe.
                 if "motion" in record:
                     _save_record_motion(record, args.output)
-                if split == "train":
-                    clip_sum = record.pop("_stats_sum")
-                    clip_sq_sum = record.pop("_stats_sq_sum")
-                    train_count += int(record["length"])
-                    train_sum = clip_sum if train_sum is None else train_sum + clip_sum
-                    train_sq_sum = (
-                        clip_sq_sum if train_sq_sum is None else train_sq_sum + clip_sq_sum
-                    )
                 split_records.append(record)
         records_by_split[split] = split_records
-        _write_split(args.output / f"{split}.txt", split_records)
-        _write_json(
-            args.output / f"motions/{split}.json",
-            _manifest(args.output, split, split_records, args),
-        )
-
-    if train_count == 0 or train_sum is None or train_sq_sum is None:
-        raise RuntimeError("No training motions were converted; statistics cannot be computed.")
-    mean = train_sum / train_count
-    variance = np.maximum(train_sq_sum / train_count - np.square(mean), 1e-12)
-    std = np.sqrt(variance)
-    std = np.where(std < 1e-6, 1.0, std)
-    stats_root = args.output / "stats"
-    stats_root.mkdir(parents=True)
-    np.save(stats_root / "mean.npy", mean.astype(np.float32))
-    np.save(stats_root / "std.npy", std.astype(np.float32))
-
-    all_records = [record for split in SPLITS for record in records_by_split[split]]
-    _write_json(args.output / "index.json", all_records)
-    _write_json(
-        args.output / "meta.json",
-        {
-            "source_dataset": "BONES-SEED/soma_uniform",
-            "representation": MotionJEPAMotionRep.FORMAT_NAME,
-            "producer": "motion-jepa",
-            "motion_storage": "npy_float32_v1",
-            "split_format": "sample_id,relative_npy_path,fps,actual_length",
-            "skeleton": "soma30",
-            "motion_dim": MotionJEPAMotionRep.FEATURE_DIM,
-            "fps": args.fps,
-            "num_frames": args.num_frames,
-            "clip_seconds": args.num_frames / args.fps,
-            "overlap": args.overlap,
-            "stride_frames": calculate_stride(args.num_frames, args.overlap),
-            "segmentation": "overlapping_complete_windows_plus_qualifying_uncovered_tail",
-            "window_canonicalization": "independent",
-            "downsampling": "fixed_step_from_frame_zero_no_interpolation",
-            "fps_validation": "source_fps_must_equal_or_be_divisible_by_configured_fps",
-            "resampled": True,
-            "canonicalized": True,
-            "write_mode": "direct_on_the_fly",
-            "split_seed": args.split_seed,
-            "npy": {
-                "format": NPY_FORMAT,
-                "path": "motions",
-                "dtype": "float32",
-                "lazy_loading": True,
-            },
-            "statistics": {
-                "format": "numpy_float32_pair",
-                "mean_path": "stats/mean.npy",
-                "std_path": "stats/std.npy",
-                "source_split": "train",
-                "valid_frames_only": True,
-            },
-            "split_counts": {split: len(records_by_split[split]) for split in SPLITS},
-            "source_split_counts": source_success_counts,
-            "num_source_motions": sum(source_success_counts.values()),
-            "num_samples": len(all_records),
-            "num_errors": len(errors),
-            "train_stats_frames": int(train_count),
-        },
+    finalize_processed_dataset(
+        args,
+        records_by_split,
+        errors,
+        source_success_counts,
+        source_dataset="BONES-SEED/soma_uniform",
+        segmentation="overlapping_complete_windows",
     )
-    with (args.output / "errors.jsonl").open("w", encoding="utf-8") as file:
-        for error in errors:
-            file.write(json.dumps(error, ensure_ascii=False) + "\n")
-
-    if not _validate_complete_dataset(args.output):
-        raise RuntimeError(f"NPY dataset failed final validation: {args.output}")
-    print(f"Output: {args.output}")
-    print(
-        "Splits: "
-        + ", ".join(f"{split}={len(records_by_split[split])}" for split in SPLITS)
-    )
-    print(f"Errors: {len(errors)}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -611,7 +638,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--overlap", type=float, default=0.5)
     parser.add_argument("--split_seed", type=int, default=42)
-    parser.add_argument("--max_per_split", type=int, default=-1)
+    parser.add_argument(
+        "--limit",
+        "--max_per_split",
+        dest="max_per_split",
+        type=int,
+        default=-1,
+        metavar="N",
+        help=(
+            "Process at most N source motions from each split. "
+            "Negative values process every source motion."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
