@@ -22,21 +22,17 @@ class MotionTransformerClassifier(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
         drop_path_rate: float = 0.1,
-        pooling: str = "cls_token",
         *,
         input_dim: int | None = None,
     ) -> None:
         super().__init__()
         if motion_dim is not None and input_dim is not None and motion_dim != input_dim:
             raise ValueError("motion_dim and input_dim must match when both are provided")
-        if pooling != "cls_token":
-            raise ValueError(f"Unsupported Transformer pooling: {pooling}")
         self.input_dim = int(input_dim if input_dim is not None else motion_dim or 366)
         self.motion_dim = self.input_dim  # Backward-compatible attribute.
         self.num_frames = int(num_frames)
         self.num_classes = int(num_classes)
         self.embed_dim = int(embed_dim)
-        self.pooling = pooling
         self.input_projection = nn.Linear(self.input_dim, self.embed_dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         self.position_embedding = nn.Parameter(

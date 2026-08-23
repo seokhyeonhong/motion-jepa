@@ -17,6 +17,31 @@ from test_linear_probe import _write_checkpoint, _write_dataset
 
 
 class SweepUnitTest(unittest.TestCase):
+    def test_model_size_ordering_uses_encoder_then_predictor(self):
+        run_names = [
+            "mot_small-base_1d-bs.512-ep.300",
+            "mot_huge-large_1d-bs.512-ep.300",
+            "mot_huge-giant_1d-bs.512-ep.300",
+            "mot_huge_1d-bs.512-ep.300",
+        ]
+        self.assertEqual(
+            sorted(run_names, key=sweep.run_architecture_sort_key),
+            [
+                "mot_huge-giant_1d-bs.512-ep.300",
+                "mot_huge_1d-bs.512-ep.300",
+                "mot_huge-large_1d-bs.512-ep.300",
+                "mot_small-base_1d-bs.512-ep.300",
+            ],
+        )
+
+    def test_default_findings_root_is_unified_component(self):
+        default = sweep.build_parser().get_default("findings_root")
+        self.assertEqual(
+            default,
+            sweep.PROJECT_ROOT
+            / "findings/000-100style-classification/linear-probe",
+        )
+
     def test_discovers_only_direct_child_latest_checkpoints(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -34,7 +59,7 @@ class SweepUnitTest(unittest.TestCase):
     def test_adaptive_extraction_halves_batch_size_after_oom(self):
         expected = {"features": torch.zeros(1, 2)}
         with mock.patch.object(
-            sweep.probe,
+            sweep.features,
             "load_or_extract_split",
             side_effect=[RuntimeError("CUDA out of memory"), expected],
         ) as extract:

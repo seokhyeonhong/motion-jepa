@@ -237,11 +237,14 @@ Sweep every direct-child latest checkpoint with:
 python -m experiment.linear_probe.lr_sweep --device cuda:0
 ```
 
+The sweep writes its component artifacts to
+`findings/000-100style-classification/linear-probe` by default.
+
 Train matched-size supervised CNN and Transformer baselines directly on raw
 100STYLE motion with:
 
 ```bash
-python -m experiment.linear_probe.supervised \
+python -m experiment.linear_probe.train_classifier \
   --model all \
   --dataset-root dataset/100style-soma77-processed \
   --seed 42 \
@@ -252,7 +255,7 @@ The same classifiers can consume frozen frame-token features from a pretrained
 1D Motion-JEPA target encoder:
 
 ```bash
-python -m experiment.linear_probe.supervised \
+python -m experiment.linear_probe.train_classifier \
   --input-source jepa \
   --jepa-checkpoint output/<run>/motion-jepa-1d-latest.pth.tar \
   --checkpoint-key target_encoder \
@@ -265,8 +268,21 @@ python -m experiment.linear_probe.supervised \
 Token features are cached once as BF16 under
 `<checkpoint directory>/linear-probe/token-features`. Classifier outputs default
 to `<checkpoint directory>/linear-probe/classifiers`; both locations can be
-overridden. The classifier checkpoints record the JEPA model name, checkpoint
-key, checkpoint SHA256, feature dimension, and normalization-statistics hashes.
+overridden. Classifier provenance—including the JEPA model name, checkpoint key
+and SHA256, feature dimension, and normalization-statistics hashes—is recorded
+once in the final summary. The best checkpoint contains only model weights and
+the architecture fields required to reconstruct the classifier; resumable latest
+state is removed after successful completion.
+
+Regenerate the combined seed-42 comparison, validation-selected CSV, and plots
+after both components finish:
+
+```bash
+python -m experiment.linear_probe.report
+```
+
+See the [unified 100STYLE findings](findings/000-100style-classification/README.md)
+for the current CNN, CLS Transformer, and 15-probe comparison.
 
 ## Tests
 

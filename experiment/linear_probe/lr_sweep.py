@@ -21,15 +21,20 @@ import torch  # noqa: E402
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MODEL_SIZE_RANK = {
+    name: rank
+    for rank, name in enumerate(("tiny", "small", "base", "large", "huge", "giant"))
+}
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from . import probe  # noqa: E402
+from . import features  # noqa: E402
 from .dataset import build_style_datasets, load_style_label_index  # noqa: E402
+from .train_probe import train_linear_probe  # noqa: E402
 
 
-DEFAULT_LRS = (0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0)
-DEFAULT_SEEDS = (0, 1, 2)
+DEFAULT_LRS = (0.1, 0.3, 0.5, 0.7, 1.0)
+DEFAULT_SEEDS = (42,)
 METRIC_NAMES = (
     "loss",
     "top1_accuracy",
@@ -104,7 +109,7 @@ def load_or_extract_adaptive(
     split: str,
     cache_path: Path,
     metadata: dict[str, Any],
-    dataset: probe.StyleMotionDataset,
+    dataset: features.StyleMotionDataset,
     encoder: torch.nn.Module,
     device: torch.device,
     initial_batch_size: int,
@@ -116,7 +121,7 @@ def load_or_extract_adaptive(
     if cache_path.is_file() and not recompute:
         try:
             payload = torch.load(cache_path, map_location="cpu", weights_only=False)
-            probe._validate_feature_cache(payload, metadata)
+            features._validate_feature_cache(payload, metadata)
             return payload, initial_batch_size
         except (ValueError, KeyError, TypeError):
             recompute = True
@@ -124,7 +129,7 @@ def load_or_extract_adaptive(
     last_error: BaseException | None = None
     for batch_size in _feature_batch_candidates(initial_batch_size):
         try:
-            payload = probe.load_or_extract_split(
+            payload = features.load_or_extract_split(
                 split=split,
                 cache_path=cache_path,
                 metadata=metadata,
@@ -157,15 +162,15 @@ def prepare_checkpoint_features(
     num_workers: int,
     recompute_features: bool,
 ) -> tuple[dict[str, dict[str, Any]], list[str], dict[str, Any]]:
-    encoder, config, model_info = probe.load_frozen_encoder(
+    encoder, config, model_info = features.load_frozen_encoder(
         checkpoint_path, "target_encoder", device
     )
-    stats_root = probe.resolve_pretraining_stats(config, None)
+    stats_root = features.resolve_pretraining_stats(config, None)
     label_index = load_style_label_index(dataset_root)
     class_names = list(label_index.class_names)
     datasets, _ = build_style_datasets(
         dataset_root,
-        splits=probe.SPLITS,
+        splits=features.SPLITS,
         num_frames=model_info["num_frames"],
         fps=model_info["fps"],
         motion_dim=model_info["motion_dim"],
@@ -185,8 +190,8 @@ def prepare_checkpoint_features(
     caches: dict[str, dict[str, Any]] = {}
     used_batch_sizes: dict[str, int] = {}
     next_batch_size = feature_batch_size
-    for split in probe.SPLITS:
-        metadata = probe.build_cache_metadata(
+    for split in features.SPLITS:
+        metadata = features.build_cache_metadata(
             split=split,
             checkpoint_path=checkpoint_path,
             checkpoint_key="target_encoder",
@@ -213,15 +218,15 @@ def prepare_checkpoint_features(
     info = {
         "run_name": run_name,
         "checkpoint": str(checkpoint_path),
-        "checkpoint_sha256": probe._sha256_file(checkpoint_path),
+        "checkpoint_sha256": features._sha256_file(checkpoint_path),
         "model_name": model_info["model_name"],
         "feature_dim": model_info["feature_dim"],
         "dataset_root": str(dataset_root),
-        "dataset_index_sha256": probe._sha256_file(dataset_root / "index.json"),
+        "dataset_index_sha256": features._sha256_file(dataset_root / "index.json"),
         "stats_root": str(stats_root),
-        "stats_mean_sha256": probe._sha256_file(stats_root / "mean.npy"),
-        "stats_std_sha256": probe._sha256_file(stats_root / "std.npy"),
-        "split_counts": {split: len(datasets[split]) for split in probe.SPLITS},
+        "stats_mean_sha256": features._sha256_file(stats_root / "mean.npy"),
+        "stats_std_sha256": features._sha256_file(stats_root / "std.npy"),
+        "split_counts": {split: len(datasets[split]) for split in features.SPLITS},
         "feature_batch_sizes": used_batch_sizes,
     }
     del encoder, datasets
@@ -269,7 +274,7 @@ def run_one_probe(
                 return summary
 
     run_root.mkdir(parents=True, exist_ok=True)
-    summary = probe.train_linear_probe(
+    summary = train_linear_probe(
         caches,
         output=run_root,
         checkpoint_path=Path(checkpoint_info["checkpoint"]),
@@ -377,7 +382,10 @@ def _plot_heatmap(
 ) -> None:
     lookup = {(row["run_name"], float(row["lr"])): row for row in aggregates}
     values = np.array(
-        [[lookup[(run, lr)][metric] * 100.0 for lr in lrs] for run in run_names]
+        [
+            [float(lookup[(run, lr)][metric]) * 100.0 for lr in lrs]
+            for run in run_names
+        ]
     )
     figure, axis = plt.subplots(figsize=(12, max(7, len(run_names) * 0.48)))
     image = axis.imshow(values, aspect="auto", cmap="viridis")
@@ -403,6 +411,20 @@ def _plot_heatmap(
     figure.tight_layout()
     figure.savefig(output, dpi=180)
     plt.close(figure)
+
+
+def run_architecture_sort_key(run_name: str) -> tuple[int, int, str]:
+    """Order larger encoders first, then larger predictors within an encoder."""
+    architecture = run_name.split("-bs.", 1)[0]
+    architecture = architecture.removeprefix("mot_").split("_1d", 1)[0]
+    names = architecture.split("-", 1)
+    encoder_name = names[0]
+    predictor_name = names[1] if len(names) == 2 else encoder_name
+    return (
+        -MODEL_SIZE_RANK.get(encoder_name, -1),
+        -MODEL_SIZE_RANK.get(predictor_name, -1),
+        run_name,
+    )
 
 
 def create_plots(
@@ -435,16 +457,27 @@ def create_plots(
             key=lambda row: float(row["lr"]),
         )
         figure, axis = plt.subplots(figsize=(7, 4.5))
+        multiple_seeds = any(int(row["num_seeds"]) > 1 for row in group)
         for split, color in (("val", "tab:blue"), ("test", "tab:orange")):
-            axis.errorbar(
-                [float(row["lr"]) for row in group],
-                [float(row[f"{split}_top1_accuracy_mean"]) * 100 for row in group],
-                yerr=[float(row[f"{split}_top1_accuracy_std"]) * 100 for row in group],
-                marker="o",
-                capsize=3,
-                label=split,
-                color=color,
-            )
+            x_values = [float(row["lr"]) for row in group]
+            y_values = [
+                float(row[f"{split}_top1_accuracy_mean"]) * 100 for row in group
+            ]
+            if multiple_seeds:
+                axis.errorbar(
+                    x_values,
+                    y_values,
+                    yerr=[
+                        float(row[f"{split}_top1_accuracy_std"]) * 100
+                        for row in group
+                    ],
+                    marker="o",
+                    capsize=3,
+                    label=split,
+                    color=color,
+                )
+            else:
+                axis.plot(x_values, y_values, marker="o", label=split, color=color)
         axis.set_xscale("log")
         axis.set_xlabel("Initial learning rate")
         axis.set_ylabel("Top-1 accuracy (%)")
@@ -460,6 +493,15 @@ def _percent(value: float) -> str:
     return f"{value * 100:.2f}"
 
 
+def _format_aggregate_metric(
+    row: dict[str, Any], field: str, *, multiple_seeds: bool
+) -> str:
+    value = _percent(float(row[field + "_mean"]))
+    if not multiple_seeds:
+        return value
+    return f"{value} +/- {_percent(float(row[field + '_std']))}"
+
+
 def write_readme(
     findings_root: Path,
     checkpoint_infos: list[dict[str, Any]],
@@ -469,8 +511,9 @@ def write_readme(
     args: argparse.Namespace,
 ) -> None:
     lookup = {(row["run_name"], float(row["lr"])): row for row in aggregates}
+    multiple_seeds = len(seeds) > 1
     lines = [
-        "# All-Latest Motion-JEPA Linear-Probe LR Sweep",
+        "# 100STYLE Motion-JEPA Linear-Probe LR Sweep",
         "",
         "## Settings",
         "",
@@ -482,7 +525,7 @@ def write_readme(
         f"- Optimizer: SGD, momentum {args.momentum}, weight decay {args.weight_decay}",
         "- Schedule: cosine decay; loss: ordinary cross entropy",
         "- Pooling: frozen EMA target encoder valid-token global mean",
-        "- All test results are reported for every LR; no single best LR is declared",
+        "- Test results are reported for every LR; downstream comparisons select LR by validation top-1",
         "",
         "## Overall comparison",
         "",
@@ -490,7 +533,11 @@ def write_readme(
         "",
         "![Test top-1 heatmap](test-top1-heatmap.png)",
         "",
-        "Values are means over seeds 0-2 and are reported in percent.",
+        (
+            f"Values are means over {len(seeds)} seeds and are reported in percent."
+            if multiple_seeds
+            else f"Values are from seed {seeds[0]} and are reported in percent."
+        ),
         "",
         "## Checkpoints",
         "",
@@ -527,8 +574,9 @@ def write_readme(
                 "test_top5_accuracy",
             ):
                 values.append(
-                    f"{_percent(float(row[field + '_mean']))} +/- "
-                    f"{_percent(float(row[field + '_std']))}"
+                    _format_aggregate_metric(
+                        row, field, multiple_seeds=multiple_seeds
+                    )
                 )
             lines.append(f"| {lr:g} | " + " | ".join(values) + " |")
         val_values = [float(lookup[(run_name, lr)]["val_top1_accuracy_mean"]) for lr in lrs]
@@ -566,6 +614,10 @@ def _write_reports(
     seeds: list[int],
     args: argparse.Namespace,
 ) -> None:
+    checkpoint_infos = sorted(
+        checkpoint_infos,
+        key=lambda info: run_architecture_sort_key(str(info["run_name"])),
+    )
     rows = [_result_row(summary) for summary in summaries]
     result_fields = list(rows[0])
     _atomic_csv(findings_root / "sweep-results.csv", rows, result_fields)
@@ -599,7 +651,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.epochs <= 0 or args.batch_size <= 0 or args.feature_batch_size <= 0:
         raise ValueError("Epoch and batch sizes must be positive")
     checkpoints = discover_latest_checkpoints(output_root)
-    device = probe.resolve_device(args.device)
+    device = features.resolve_device(args.device)
     checkpoint_infos: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
@@ -699,7 +751,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--findings-root",
         type=Path,
-        default=PROJECT_ROOT / "findings/000-linear-probe-lr-sweep-all-latest",
+        default=(
+            PROJECT_ROOT
+            / "findings/000-100style-classification/linear-probe"
+        ),
     )
     parser.add_argument("--lrs", nargs="+", type=float, default=list(DEFAULT_LRS))
     parser.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS))

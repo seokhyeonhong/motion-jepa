@@ -28,6 +28,12 @@ from .motion_transformer_2d import (
     mot_large_2d,
     mot_huge_2d,
     mot_giant_2d,
+    mot_predictor_tiny_2d,
+    mot_predictor_small_2d,
+    mot_predictor_base_2d,
+    mot_predictor_large_2d,
+    mot_predictor_huge_2d,
+    mot_predictor_giant_2d,
 )
 
 MODEL_FACTORIES = {
@@ -58,6 +64,13 @@ PREDICTOR_FACTORIES = {
         mot_predictor_large_1d,
         mot_predictor_huge_1d,
         mot_predictor_giant_1d,
+
+        mot_predictor_tiny_2d,
+        mot_predictor_small_2d,
+        mot_predictor_base_2d,
+        mot_predictor_large_2d,
+        mot_predictor_huge_2d,
+        mot_predictor_giant_2d,
     )
 }
 

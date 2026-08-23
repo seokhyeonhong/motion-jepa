@@ -1,0 +1,109 @@
+{
+  "format_version": 1,
+  "input_source": "raw",
+  "seed": 42,
+  "summaries": {
+    "cnn": {
+      "status": "complete",
+      "model": "cnn",
+      "num_parameters": 6371172,
+      "best_epoch": 76,
+      "best_val": {
+        "loss": 0.26529729307039746,
+        "top1_accuracy": 0.9426386233269598,
+        "macro_accuracy": 0.9425250887870789,
+        "top5_accuracy": 0.9774378585086042
+      },
+      "test": {
+        "loss": 0.25947966973290887,
+        "top1_accuracy": 0.9445294567712318,
+        "macro_accuracy": 0.9387474656105042,
+        "top5_accuracy": 0.976664116296863
+      },
+      "split_counts": {
+        "train": 20916,
+        "val": 2615,
+        "test": 2614
+      },
+      "signature": {
+        "model": "cnn",
+        "architecture": {
+          "name": "MotionCNNClassifier",
+          "input_dim": 366,
+          "num_classes": 100,
+          "widths": [
+            256,
+            384,
+            512
+          ],
+          "blocks_per_stage": 2,
+          "dropout": 0.1
+        },
+        "dataset_index_sha256": "d9d646353f5889dbb7a08dde828503be384145225b273d19af1a2ef1a48c9355",
+        "stats_mean_sha256": "5f6990b41749ff1c12108c8e2f0a97a7b9ce9de720320db4c0d880748e39d805",
+        "stats_std_sha256": "60c1bc6f997d775e4ca939c49132369b22ef52282d9453d9cad4ddbdf2b209a7",
+        "input_source": "raw",
+        "seed": 42,
+        "epochs": 100,
+        "warmup_epochs": 5,
+        "batch_size": 256,
+        "lr": 0.0003,
+        "final_lr": 1e-06,
+        "weight_decay": 0.05,
+        "gradient_clip": 1.0,
+        "use_bfloat16": true
+      }
+    },
+    "transformer": {
+      "status": "complete",
+      "model": "transformer",
+      "num_parameters": 6461796,
+      "best_epoch": 71,
+      "best_val": {
+        "loss": 0.3000799547417898,
+        "top1_accuracy": 0.9483747609942639,
+        "macro_accuracy": 0.9471560716629028,
+        "top5_accuracy": 0.9766730401529636
+      },
+      "test": {
+        "loss": 0.2791712592372296,
+        "top1_accuracy": 0.9483550114766641,
+        "macro_accuracy": 0.9428582191467285,
+        "top5_accuracy": 0.9804896710022953
+      },
+      "split_counts": {
+        "train": 20916,
+        "val": 2615,
+        "test": 2614
+      },
+      "signature": {
+        "model": "transformer",
+        "architecture": {
+          "name": "MotionTransformerClassifier",
+          "input_dim": 366,
+          "num_frames": 90,
+          "num_classes": 100,
+          "embed_dim": 256,
+          "depth": 8,
+          "num_heads": 8,
+          "mlp_ratio": 4.0,
+          "dropout": 0.1,
+          "drop_path_rate": 0.1
+        },
+        "dataset_index_sha256": "d9d646353f5889dbb7a08dde828503be384145225b273d19af1a2ef1a48c9355",
+        "stats_mean_sha256": "5f6990b41749ff1c12108c8e2f0a97a7b9ce9de720320db4c0d880748e39d805",
+        "stats_std_sha256": "60c1bc6f997d775e4ca939c49132369b22ef52282d9453d9cad4ddbdf2b209a7",
+        "input_source": "raw",
+        "seed": 42,
+        "epochs": 100,
+        "warmup_epochs": 5,
+        "batch_size": 256,
+        "lr": 0.0003,
+        "final_lr": 1e-06,
+        "weight_decay": 0.05,
+        "gradient_clip": 1.0,
+        "use_bfloat16": true
+      }
+    }
+  }
+}

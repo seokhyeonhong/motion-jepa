@@ -1,0 +1,379 @@
+"""Train a linear probe on frozen Motion-JEPA features."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from .dataset import build_style_datasets, load_style_label_index
+from .features import (
+    PROJECT_ROOT,
+    SPLITS,
+    Metrics,
+    _atomic_json_save,
+    _atomic_torch_save,
+    _seed_all,
+    build_cache_metadata,
+    load_frozen_encoder,
+    load_or_extract_split,
+    resolve_device,
+    resolve_pretraining_stats,
+)
+
+
+RESULT_FILENAMES = (
+    "metrics.csv",
+    "summary.json",
+    "linear-probe-best.pth.tar",
+    "class-index.json",
+)
+
+
+def evaluate_classifier(
+    classifier: nn.Linear,
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    device: torch.device,
+    batch_size: int,
+    num_classes: int,
+) -> Metrics:
+    classifier.eval()
+    loader = DataLoader(TensorDataset(features, labels), batch_size=batch_size)
+    loss_sum = 0.0
+    total = 0
+    correct = 0
+    top5_correct = 0
+    class_total = torch.zeros(num_classes, dtype=torch.long)
+    class_correct = torch.zeros(num_classes, dtype=torch.long)
+    with torch.inference_mode():
+        for batch_features, batch_labels in loader:
+            batch_features = batch_features.to(device, non_blocking=True)
+            batch_labels = batch_labels.to(device, non_blocking=True)
+            logits = classifier(batch_features)
+            loss_sum += float(F.cross_entropy(logits, batch_labels, reduction="sum"))
+            predictions = logits.argmax(dim=1)
+            matches = predictions.eq(batch_labels)
+            correct += int(matches.sum())
+            total += len(batch_labels)
+            topk = min(5, num_classes)
+            top5_correct += int(
+                logits.topk(topk, dim=1)
+                .indices.eq(batch_labels[:, None])
+                .any(dim=1)
+                .sum()
+            )
+            cpu_labels = batch_labels.cpu()
+            class_total += torch.bincount(cpu_labels, minlength=num_classes)
+            class_correct += torch.bincount(
+                cpu_labels[matches.cpu()], minlength=num_classes
+            )
+    if total == 0:
+        raise ValueError("Cannot evaluate an empty feature split")
+    present = class_total > 0
+    macro = (class_correct[present].float() / class_total[present].float()).mean()
+    return Metrics(
+        loss=loss_sum / total,
+        top1_accuracy=correct / total,
+        macro_accuracy=float(macro),
+        top5_accuracy=top5_correct / total,
+    )
+
+
+def train_linear_probe(
+    caches: dict[str, dict[str, Any]],
+    *,
+    output: Path,
+    checkpoint_path: Path,
+    checkpoint_key: str,
+    class_names: list[str],
+    device: torch.device,
+    epochs: int,
+    batch_size: int,
+    learning_rate: float,
+    momentum: float,
+    weight_decay: float,
+    seed: int,
+    run_args: dict[str, Any],
+) -> dict[str, Any]:
+    train_features = caches["train"]["features"]
+    train_labels = caches["train"]["labels"]
+    feature_dim = int(train_features.shape[1])
+    num_classes = len(class_names)
+    _seed_all(seed)
+    classifier = nn.Linear(feature_dim, num_classes).to(device)
+    optimizer = torch.optim.SGD(
+        classifier.parameters(),
+        lr=learning_rate,
+        momentum=momentum,
+        weight_decay=weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    generator = torch.Generator().manual_seed(seed)
+    train_loader = DataLoader(
+        TensorDataset(train_features, train_labels),
+        batch_size=batch_size,
+        shuffle=True,
+        generator=generator,
+    )
+    metrics_path = output / "metrics.csv"
+    best_path = output / "linear-probe-best.pth.tar"
+    best_accuracy = -1.0
+    best_epoch = 0
+    fields = [
+        "epoch",
+        "learning_rate",
+        "train_loss",
+        "train_top1_accuracy",
+        "train_macro_accuracy",
+        "train_top5_accuracy",
+        "val_loss",
+        "val_top1_accuracy",
+        "val_macro_accuracy",
+        "val_top5_accuracy",
+    ]
+    with metrics_path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        for epoch in range(1, epochs + 1):
+            classifier.train()
+            current_lr = float(optimizer.param_groups[0]["lr"])
+            for batch_features, batch_labels in train_loader:
+                batch_features = batch_features.to(device, non_blocking=True)
+                batch_labels = batch_labels.to(device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                loss = F.cross_entropy(classifier(batch_features), batch_labels)
+                loss.backward()
+                optimizer.step()
+            train_metrics = evaluate_classifier(
+                classifier,
+                train_features,
+                train_labels,
+                device=device,
+                batch_size=batch_size,
+                num_classes=num_classes,
+            )
+            val_metrics = evaluate_classifier(
+                classifier,
+                caches["val"]["features"],
+                caches["val"]["labels"],
+                device=device,
+                batch_size=batch_size,
+                num_classes=num_classes,
+            )
+            row = {
+                "epoch": epoch,
+                "learning_rate": current_lr,
+                **{f"train_{key}": value for key, value in asdict(train_metrics).items()},
+                **{f"val_{key}": value for key, value in asdict(val_metrics).items()},
+            }
+            writer.writerow(row)
+            file.flush()
+            if val_metrics.top1_accuracy > best_accuracy:
+                best_accuracy = val_metrics.top1_accuracy
+                best_epoch = epoch
+                _atomic_torch_save(
+                    {
+                        "format_version": 1,
+                        "classifier": classifier.state_dict(),
+                        "feature_dim": feature_dim,
+                        "num_classes": num_classes,
+                        "class_names": class_names,
+                        "epoch": epoch,
+                        "val_metrics": asdict(val_metrics),
+                        "checkpoint": str(checkpoint_path),
+                        "checkpoint_key": checkpoint_key,
+                        "run_args": run_args,
+                    },
+                    best_path,
+                )
+            scheduler.step()
+
+    best = torch.load(best_path, map_location=device, weights_only=False)
+    classifier.load_state_dict(best["classifier"], strict=True)
+    test_metrics = evaluate_classifier(
+        classifier,
+        caches["test"]["features"],
+        caches["test"]["labels"],
+        device=device,
+        batch_size=batch_size,
+        num_classes=num_classes,
+    )
+    return {
+        "best_epoch": best_epoch,
+        "best_val": best["val_metrics"],
+        "test": asdict(test_metrics),
+        "feature_dim": feature_dim,
+        "num_classes": num_classes,
+        "split_counts": {
+            split: int(len(caches[split]["labels"])) for split in SPLITS
+        },
+    }
+
+
+def _serializable_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+
+
+def run(args: argparse.Namespace) -> dict[str, Any]:
+    if args.epochs <= 0 or args.batch_size <= 0 or args.feature_batch_size <= 0:
+        raise ValueError("Epoch and batch-size arguments must be positive")
+    if args.num_workers < 0:
+        raise ValueError("--num-workers must be non-negative")
+    checkpoint_path = Path(args.checkpoint).expanduser().resolve()
+    dataset_root = Path(args.dataset_root).expanduser().resolve()
+    output = (
+        checkpoint_path.parent / "linear-probe"
+        if args.output is None
+        else Path(args.output).expanduser().resolve()
+    )
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
+    existing_results = [name for name in RESULT_FILENAMES if (output / name).exists()]
+    if existing_results and not args.overwrite:
+        raise FileExistsError(
+            f"Linear-probe results already exist under {output}: {existing_results}; "
+            "use --overwrite to replace result files"
+        )
+    output.mkdir(parents=True, exist_ok=True)
+    cache_root = output / "features"
+    cache_root.mkdir(exist_ok=True)
+    device = resolve_device(args.device)
+    _seed_all(args.seed)
+    encoder, config, model_info = load_frozen_encoder(
+        checkpoint_path,
+        args.checkpoint_key,
+        device,
+    )
+    stats_root = resolve_pretraining_stats(config, args.stats_path)
+    label_index = load_style_label_index(dataset_root)
+    class_names = list(label_index.class_names)
+    _atomic_json_save(label_index.to_json(), output / "class-index.json")
+
+    datasets, _ = build_style_datasets(
+        dataset_root,
+        splits=SPLITS,
+        num_frames=model_info["num_frames"],
+        fps=model_info["fps"],
+        motion_dim=model_info["motion_dim"],
+        stats_root=stats_root,
+        label_index=label_index,
+    )
+    train_classes = set(datasets["train"].labels)
+    expected_classes = set(range(len(class_names)))
+    if train_classes != expected_classes:
+        missing = [class_names[index] for index in sorted(expected_classes - train_classes)]
+        raise ValueError(f"Training split does not contain every style class: {missing}")
+
+    caches = {}
+    for split in SPLITS:
+        metadata = build_cache_metadata(
+            split=split,
+            checkpoint_path=checkpoint_path,
+            checkpoint_key=args.checkpoint_key,
+            dataset_root=dataset_root,
+            stats_root=stats_root,
+            model_info=model_info,
+            class_names=class_names,
+        )
+        caches[split] = load_or_extract_split(
+            split=split,
+            cache_path=cache_root / f"{split}.pt",
+            metadata=metadata,
+            dataset=datasets[split],
+            encoder=encoder,
+            device=device,
+            batch_size=args.feature_batch_size,
+            num_workers=args.num_workers,
+            use_bfloat16=model_info["use_bfloat16"],
+            recompute=args.recompute_features,
+        )
+
+    if any(parameter.grad is not None for parameter in encoder.parameters()):
+        raise RuntimeError("Frozen encoder unexpectedly accumulated gradients")
+    summary = train_linear_probe(
+        caches,
+        output=output,
+        checkpoint_path=checkpoint_path,
+        checkpoint_key=args.checkpoint_key,
+        class_names=class_names,
+        device=device,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
+        seed=args.seed,
+        run_args=_serializable_args(args),
+    )
+    summary.update(
+        {
+            "checkpoint": str(checkpoint_path),
+            "checkpoint_key": args.checkpoint_key,
+            "dataset_root": str(dataset_root),
+            "stats_root": str(stats_root),
+            "model_name": model_info["model_name"],
+            "pooling": "valid_token_mean",
+            "seed": args.seed,
+        }
+    )
+    _atomic_json_save(summary, output / "summary.json")
+    return summary
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Linear-probe Motion-JEPA features")
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=PROJECT_ROOT / "dataset/100style-processed",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help=(
+            "Linear-probe result directory "
+            "(default: <checkpoint directory>/linear-probe)"
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-key",
+        choices=("target_encoder", "encoder"),
+        default="target_encoder",
+    )
+    parser.add_argument("--stats-path", type=Path, default=None)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--feature-batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=0.1)
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--recompute-features", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    return parser
+
+
+def main() -> None:
+    summary = run(build_parser().parse_args())
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

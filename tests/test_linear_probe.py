@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from experiment import linear_probe
+from experiment.linear_probe import train_probe
 from model import MODEL_FACTORIES
 
 
@@ -253,7 +254,7 @@ class LinearProbeEndToEndTest(unittest.TestCase):
                 recompute_features=False,
                 overwrite=False,
             )
-            summary = linear_probe.run(args)
+            summary = train_probe.run(args)
             self.assertEqual(summary["stats_root"], str(pretrain_stats.resolve()))
             self.assertEqual(summary["num_classes"], 2)
             self.assertIn(summary["best_epoch"], (1, 2))
@@ -287,11 +288,11 @@ class LinearProbeEndToEndTest(unittest.TestCase):
             self.assertAlmostEqual(float(motion[0, 0]), -1.0)
 
             args.overwrite = True
-            reused = linear_probe.run(args)
+            reused = train_probe.run(args)
             self.assertEqual(reused["split_counts"], summary["split_counts"])
 
             args.output = None
-            default_output = linear_probe.run(args)
+            default_output = train_probe.run(args)
             self.assertEqual(default_output["checkpoint"], str(checkpoint.resolve()))
             self.assertTrue(
                 (checkpoint.parent / "linear-probe" / "summary.json").is_file()
