@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from model import MODEL_FACTORIES  # noqa: E402
+from helper import init_mjepa_encoder_from_config  # noqa: E402
 
 from .dataset import StyleMotionDataset  # noqa: E402
 
@@ -135,16 +135,12 @@ def load_frozen_encoder(
         data_config = config["data"]
         meta_config = config["meta"]
         model_name = str(meta_config["model_name"])
-        factory = MODEL_FACTORIES[model_name]
         num_frames = int(data_config["num_frames"])
         motion_dim = int(data_config["motion_dim"])
         num_joints = int(data_config["num_joints"])
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"Invalid model config in checkpoint: {checkpoint_path}") from error
-    kwargs: dict[str, Any] = {"in_chans": motion_dim, "num_frames": num_frames}
-    if model_name.endswith("_2d"):
-        kwargs["num_joints"] = num_joints
-    encoder = factory(**kwargs)
+    encoder = init_mjepa_encoder_from_config(config, torch.device("cpu"))
     encoder.load_state_dict(checkpoint[checkpoint_key], strict=True)
     encoder.to(device).eval().requires_grad_(False)
     info = {
@@ -154,6 +150,10 @@ def load_frozen_encoder(
         "num_joints": num_joints,
         "fps": int(data_config["fps"]),
         "feature_dim": int(encoder.embed_dim),
+        "kind": encoder.token_layout.kind,
+        "token_num_frames": int(encoder.token_layout.token_num_frames),
+        "temporal_patch_size": int(encoder.token_layout.temporal_patch_size),
+        "patchified": bool(encoder.token_layout.patchified),
         "use_bfloat16": bool(meta_config.get("use_bfloat16", False)),
     }
     return encoder, config, info
@@ -184,9 +184,12 @@ def resolve_pretraining_stats(
 def pool_encoder_output(
     output: torch.Tensor,
     valid_length: torch.Tensor,
+    token_layout=None,
 ) -> torch.Tensor:
     """Mean-pool valid 1D frame tokens or valid 2D frame-by-joint cells."""
     frames = output.shape[1]
+    if token_layout is not None:
+        valid_length = token_layout.valid_token_lengths(valid_length)
     valid_frames = (
         torch.arange(frames, device=output.device).unsqueeze(0)
         < valid_length.to(device=output.device).unsqueeze(1)
@@ -225,6 +228,10 @@ def build_cache_metadata(
         "motion_dim": model_info["motion_dim"],
         "fps": model_info["fps"],
         "feature_dim": model_info["feature_dim"],
+        "token_num_frames": model_info["token_num_frames"],
+        "temporal_patch_size": model_info["temporal_patch_size"],
+        "patchified": model_info["patchified"],
+        "kind": model_info["kind"],
         "pooling": "valid_token_mean",
         "class_names": class_names,
     }
@@ -288,7 +295,7 @@ def extract_features(
             )
             with amp_context:
                 encoded = encoder(motion, fps, valid_frames=valid_frames)
-                pooled = pool_encoder_output(encoded, length)
+                pooled = pool_encoder_output(encoded, length, encoder.token_layout)
             feature_batches.append(pooled.float().cpu())
             label_batches.append(labels.to(dtype=torch.long).cpu())
             sample_ids.extend(list(ids))

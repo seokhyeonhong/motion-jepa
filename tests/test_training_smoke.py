@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from _npy_fixture import write_npy_dataset
 from train import main as train_main
@@ -59,6 +60,7 @@ class TrainingSmokeTest(unittest.TestCase):
                     "load_checkpoint": False,
                     "read_checkpoint": None,
                     "model_name": "mot_tiny_1d",
+                    "predictor_name": "mot_predictor_tiny_1d",
                     "pred_depth": 1,
                     "pred_emb_dim": 12,
                     "use_bfloat16": False,
@@ -79,6 +81,12 @@ class TrainingSmokeTest(unittest.TestCase):
             result = train_main(config, device="cpu")
             self.assertEqual(result["global_step"], 1)
             self.assertTrue(Path(result["checkpoint"]).is_file())
+
+            # Simulate a format-v1 checkpoint written before architecture
+            # signatures were added; resume must derive the raw layout from config.
+            checkpoint = torch.load(result["checkpoint"], map_location="cpu", weights_only=False)
+            checkpoint.pop("architecture")
+            torch.save(checkpoint, result["checkpoint"])
 
             config["meta"]["load_checkpoint"] = True
             config["optimization"]["epochs"] = 2

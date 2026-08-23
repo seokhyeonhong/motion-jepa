@@ -13,6 +13,7 @@ from skeleton import SOMASkeleton30
 from .modules import AxialBlock2D, PredictorAxialBlock2D, initialize_transformer
 from .pos_embs import ContinuousSinCosPosEmbed1D
 from .specs import MODEL_SPECS, PREDICTOR_SPECS
+from .token_layout import TokenLayout
 
 
 class MotionFeatureTokenizer2D(nn.Module):
@@ -127,6 +128,14 @@ class MotionTransformer2D(nn.Module):
         self.num_joints = 30
         self.embed_dim = int(embed_dim)
         self.num_heads = int(num_heads)
+        self.token_layout = TokenLayout(
+            kind="2d",
+            patchified=False,
+            raw_num_frames=self.num_frames,
+            token_num_frames=self.num_frames,
+            raw_num_joints=self.num_joints,
+            token_num_joints=self.num_joints,
+        )
         self.tokenizer = MotionFeatureTokenizer2D(self.embed_dim)
         self.positions = _GridPositions(self.num_frames, self.num_joints, self.embed_dim)
         drop_paths = torch.linspace(0.0, drop_path_rate, depth).tolist()
@@ -219,6 +228,14 @@ class MotionTransformerPredictor2D(nn.Module):
         self.num_joints = 30
         self.embed_dim = int(embed_dim)
         self.predictor_embed_dim = int(predictor_embed_dim)
+        self.token_layout = TokenLayout(
+            kind="2d",
+            patchified=False,
+            raw_num_frames=self.num_frames,
+            token_num_frames=self.num_frames,
+            raw_num_joints=self.num_joints,
+            token_num_joints=self.num_joints,
+        )
         self.input_proj = nn.Linear(self.embed_dim, self.predictor_embed_dim)
         self.positions = _GridPositions(
             self.num_frames, self.num_joints, self.predictor_embed_dim

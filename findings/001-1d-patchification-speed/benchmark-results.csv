@@ -1,0 +1,5 @@
+device,pytorch,dtype,batch_size,warmup_steps,measured_steps,variant,raw_frames,token_frames,context_tokens,target_tokens_per_mask,median_step_ms,mean_step_ms,samples_per_second,peak_allocated_gib,speedup_vs_raw,memory_reduction_vs_raw
+NVIDIA RTX 6000 Ada Generation,2.1.0,bfloat16,128,3,10,raw,90,90,24,16,27.922976,28.375456,4584.0387,1.890721,1.0000,0.0000
+NVIDIA RTX 6000 Ada Generation,2.1.0,bfloat16,128,3,10,patch_p3,90,30,9,5,21.826688,22.375369,5864.3804,0.965841,1.2793,0.4892
+NVIDIA RTX 6000 Ada Generation,2.1.0,bfloat16,512,5,20,raw,90,90,23,16,103.494019,103.284979,4947.1458,5.906023,1.0000,0.0000
+NVIDIA RTX 6000 Ada Generation,2.1.0,bfloat16,512,5,20,patch_p3,90,30,9,5,39.918383,40.287763,12826.1710,2.585143,2.5926,0.5623

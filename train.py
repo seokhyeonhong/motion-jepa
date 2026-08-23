@@ -19,8 +19,14 @@ import yaml
 from torch.nn.parallel import DistributedDataParallel
 
 from dataset import make_motion_dataset
-from helper import init_mjepa_model, init_opt
-from mask import MaskCollator1D, MaskCollator2D
+from helper import (
+    architecture_signature,
+    architecture_signature_from_config,
+    init_mjepa_model_from_config,
+    init_opt,
+)
+from mask import MaskCollator1D, MaskCollator2D, PatchMaskCollator1D
+from model import MODEL_FACTORIES, PREDICTOR_FACTORIES, TokenLayout
 from mask.utils import (
     apply_index_masks,
     gather_grid_masks,
@@ -148,6 +154,7 @@ def _save_checkpoint(
     world_size: int,
     rank: int,
     config: dict,
+    architecture: dict | None = None,
 ) -> None:
     rng_states = all_gather_objects(capture_rng_state())
     mask_states = all_gather_objects(mask_collator.state_dict())
@@ -171,6 +178,8 @@ def _save_checkpoint(
         "loss": float(loss),
         "config": config,
     }
+    if architecture is not None:
+        payload["architecture"] = architecture
     _atomic_torch_save(payload, path)
 
 
@@ -189,6 +198,7 @@ def _load_checkpoint(
     mask_collator,
     rank: int,
     world_size: int,
+    architecture: dict | None = None,
 ) -> tuple[int, int]:
     # Full training checkpoints contain trusted local Python/NumPy RNG state,
     # optimizer state, and scheduler state in addition to tensor weights.
@@ -200,6 +210,15 @@ def _load_checkpoint(
         raise ValueError(
             f"Exact resume requires world_size={checkpoint['world_size']}, got {world_size}"
         )
+    if architecture is not None:
+        saved_architecture = checkpoint.get("architecture")
+        if saved_architecture is None:
+            saved_architecture = architecture_signature_from_config(checkpoint["config"])
+        if saved_architecture != architecture:
+            raise ValueError(
+                "Checkpoint architecture differs from the requested run: "
+                f"checkpoint={saved_architecture}, requested={architecture}"
+            )
     encoder.load_state_dict(checkpoint["encoder"], strict=True)
     predictor.load_state_dict(checkpoint["predictor"], strict=True)
     target_encoder.load_state_dict(checkpoint["target_encoder"], strict=True)
@@ -216,19 +235,25 @@ def _load_checkpoint(
     return int(checkpoint["next_epoch"]), int(checkpoint["global_step"])
 
 
-def _build_mask_collator(args: dict, model_name: str):
+def _build_mask_collator(args: dict, layout: TokenLayout):
     mask = args["mask"]
     common = dict(
-        num_frames=int(args["data"]["num_frames"]),
         enc_frame_mask_ratio=tuple(mask["enc_frame_mask_ratio"]),
         pred_frame_mask_ratio=tuple(mask["pred_frame_mask_ratio"]),
         nenc=int(mask["num_enc_masks"]),
         npred=int(mask["num_pred_masks"]),
         allow_overlap=bool(mask["allow_overlap"]),
     )
-    if model_name.endswith("_1d"):
-        return MaskCollator1D(**common)
+    if layout.kind == "1d":
+        if layout.patchified:
+            return PatchMaskCollator1D(
+                raw_num_frames=layout.raw_num_frames,
+                temporal_patch_size=layout.temporal_patch_size,
+                **common,
+            )
+        return MaskCollator1D(num_frames=layout.token_num_frames, **common)
     return MaskCollator2D(
+        num_frames=layout.token_num_frames,
         num_joints=int(args["data"]["num_joints"]),
         enc_joint_mask_ratio=tuple(mask["enc_joint_mask_ratio"]),
         pred_joint_mask_ratio=tuple(mask["pred_joint_mask_ratio"]),
@@ -275,14 +300,15 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     opt_args = args["optimization"]
     log_args = args["logging"]
     model_name = str(meta_args["model_name"])
-    if not (model_name.endswith("_1d") or model_name.endswith("_2d")):
-        raise ValueError("Motion-JEPA model_name must end in '_1d' or '_2d'")
+    if model_name not in MODEL_FACTORIES:
+        raise ValueError(f"Unknown Motion-JEPA model_name: {model_name!r}")
     predictor_name = str(meta_args["predictor_name"])
-    if not (predictor_name.endswith("_1d") or predictor_name.endswith("_2d")):
-        raise ValueError("Motion-JEPA predictor_name must end in '_1d' or '_2d'")
+    if predictor_name not in PREDICTOR_FACTORIES:
+        raise ValueError(f"Unknown Motion-JEPA predictor_name: {predictor_name!r}")
 
     output = Path(log_args["folder"])
-    if output.exists() and not resume_preempt:
+    resume_requested = bool(meta_args.get("load_checkpoint", False) or resume_preempt)
+    if output.exists() and not resume_requested:
         raise FileExistsError(f"Output folder already exists: {output}")
     if distributed.is_main:
         output.mkdir(parents=True, exist_ok=True)
@@ -291,7 +317,16 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         )
     barrier()
 
-    mask_collator = _build_mask_collator(args, model_name)
+    encoder, predictor = init_mjepa_model_from_config(args, device)
+    layout = encoder.token_layout
+    architecture = architecture_signature(
+        encoder,
+        predictor,
+        model_name=model_name,
+        predictor_name=predictor_name,
+        motion_dim=int(data_args["motion_dim"]),
+    )
+    mask_collator = _build_mask_collator(args, layout)
     _, loader, sampler = make_motion_dataset(
         root_path=data_args["root_path"],
         meta_files=data_args["meta_files"],
@@ -312,14 +347,6 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     if len(loader) == 0:
         raise ValueError("Data loader has no batches; reduce batch_size or disable drop_last")
 
-    encoder, predictor = init_mjepa_model(
-        device=device,
-        num_frames=int(data_args["num_frames"]),
-        motion_dim=int(data_args["motion_dim"]),
-        num_joints=int(data_args["num_joints"]),
-        model_name=model_name,
-        predictor_name=predictor_name,
-    )
     target_encoder = copy.deepcopy(encoder).to(device)
     target_encoder.requires_grad_(False)
     target_encoder.eval()
@@ -348,7 +375,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     start_epoch = 0
     global_step = 0
     latest_path = output / f"{log_args['write_tag']}-latest.pth.tar"
-    should_load = bool(meta_args.get("load_checkpoint", False) or resume_preempt)
+    should_load = resume_requested
     if should_load:
         read_name = meta_args.get("read_checkpoint")
         load_path = output / read_name if read_name else latest_path
@@ -368,6 +395,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             mask_collator=mask_collator,
             rank=rank,
             world_size=world_size,
+            architecture=architecture,
         )
         logger.info("Resumed %s at epoch=%d global_step=%d", load_path, start_epoch, global_step)
 
@@ -458,7 +486,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                 with torch.no_grad():
                     target = target_encoder(motion, fps, valid_frames=valid_frames)
                     target = F.layer_norm(target, (target.shape[-1],))
-                    if model_name.endswith("_1d"):
+                    if layout.kind == "1d":
                         target = apply_index_masks(target, masks_pred)
                     else:
                         target = gather_grid_masks(target, masks_pred)
@@ -567,6 +595,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             world_size=world_size,
             rank=rank,
             config=args,
+            architecture=architecture,
         )
         if distributed.is_main and (epoch + 1) % checkpoint_frequency == 0:
             checkpoint_path = output / f"{log_args['write_tag']}-ep{epoch + 1}.pth.tar"

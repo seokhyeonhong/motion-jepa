@@ -1,4 +1,4 @@
-"""Frame-token Motion-JEPA encoder and predictor."""
+"""Non-overlapping temporal-patch Motion-JEPA encoder and predictor."""
 
 from __future__ import annotations
 
@@ -15,28 +15,39 @@ from .specs import MODEL_SPECS, PREDICTOR_SPECS
 from .token_layout import TokenLayout
 
 
-class _TemporalPositions(nn.Module):
-    def __init__(self, num_frames: int, embed_dim: int):
+class _TemporalPatchPositions(nn.Module):
+    def __init__(
+        self,
+        raw_num_frames: int,
+        temporal_patch_size: int,
+        embed_dim: int,
+    ) -> None:
         super().__init__()
-        self.register_buffer(
-            "frame_index", torch.arange(num_frames, dtype=torch.float32), persistent=False
+        token_num_frames = raw_num_frames // temporal_patch_size
+        centers = (
+            torch.arange(token_num_frames, dtype=torch.float32) * temporal_patch_size
+            + (temporal_patch_size - 1) / 2.0
         )
+        self.register_buffer("frame_center", centers, persistent=False)
         self.embedding = ContinuousSinCosPosEmbed1D(embed_dim, theta=100.0)
 
     def forward(self, fps: torch.Tensor) -> torch.Tensor:
-        fps = torch.as_tensor(fps, device=self.frame_index.device, dtype=torch.float32)
+        fps = torch.as_tensor(fps, device=self.frame_center.device, dtype=torch.float32)
         if fps.ndim != 1:
             raise ValueError(f"fps must have shape [B], got {tuple(fps.shape)}")
-        return self.embedding(self.frame_index.unsqueeze(0) / fps.clamp_min(1.0).unsqueeze(1))
+        return self.embedding(
+            self.frame_center.unsqueeze(0) / fps.clamp_min(1.0).unsqueeze(1)
+        )
 
 
-class MotionTransformer1D(nn.Module):
-    """Encode one 366-D (or configurable-width) frame per temporal token."""
+class MotionPatchTransformer1D(nn.Module):
+    """Encode non-overlapping temporal patches as transformer tokens."""
 
     def __init__(
         self,
         in_chans: int,
         num_frames: int = 300,
+        temporal_patch_size: int = 3,
         embed_dim: int = 768,
         depth: int = 12,
         num_heads: int = 12,
@@ -50,16 +61,28 @@ class MotionTransformer1D(nn.Module):
         super().__init__()
         self.in_chans = int(in_chans)
         self.num_frames = int(num_frames)
+        self.temporal_patch_size = int(temporal_patch_size)
+        if self.temporal_patch_size <= 0 or self.num_frames < self.temporal_patch_size:
+            raise ValueError("temporal_patch_size must be in [1, num_frames]")
+        self.token_num_frames = self.num_frames // self.temporal_patch_size
         self.embed_dim = int(embed_dim)
         self.num_heads = int(num_heads)
         self.token_layout = TokenLayout(
             kind="1d",
-            patchified=False,
+            patchified=True,
             raw_num_frames=self.num_frames,
-            token_num_frames=self.num_frames,
+            token_num_frames=self.token_num_frames,
+            temporal_patch_size=self.temporal_patch_size,
         )
-        self.input_proj = nn.Linear(self.in_chans, self.embed_dim)
-        self.positions = _TemporalPositions(self.num_frames, self.embed_dim)
+        self.patch_embed = nn.Conv1d(
+            self.in_chans,
+            self.embed_dim,
+            kernel_size=self.temporal_patch_size,
+            stride=self.temporal_patch_size,
+        )
+        self.positions = _TemporalPatchPositions(
+            self.num_frames, self.temporal_patch_size, self.embed_dim
+        )
         drop_paths = torch.linspace(0.0, drop_path_rate, depth).tolist()
         self.blocks = nn.ModuleList(
             [
@@ -78,6 +101,9 @@ class MotionTransformer1D(nn.Module):
         )
         self.norm = norm_layer(self.embed_dim)
         self.apply(initialize_transformer)
+        nn.init.trunc_normal_(self.patch_embed.weight, std=0.02)
+        if self.patch_embed.bias is not None:
+            nn.init.zeros_(self.patch_embed.bias)
 
     def forward(
         self,
@@ -90,30 +116,26 @@ class MotionTransformer1D(nn.Module):
             raise ValueError(
                 f"Expected motion [B,{self.num_frames},{self.in_chans}], got {tuple(motion.shape)}"
             )
-        x = self.input_proj(motion)
-        position = self.positions(fps).to(device=x.device, dtype=x.dtype)
-        x = x + position
+        x = self.patch_embed(motion.transpose(1, 2)).transpose(1, 2)
+        x = x + self.positions(fps).to(device=x.device, dtype=x.dtype)
         active = None
         if valid_frames is not None:
-            active = valid_frames.to(device=x.device, dtype=torch.bool)
-            if active.shape != motion.shape[:2]:
-                raise ValueError(
-                    f"valid_frames must have shape {tuple(motion.shape[:2])}, "
-                    f"got {tuple(active.shape)}"
-                )
+            active = self.token_layout.valid_token_mask(
+                valid_frames.to(device=x.device, dtype=torch.bool)
+            )
         if masks is not None:
             if not masks:
                 raise ValueError("At least one context mask is required")
             if active is not None:
                 for mask in masks:
-                    mask = mask.to(device=x.device, dtype=torch.long)
+                    index = mask.to(device=x.device, dtype=torch.long)
                     if (
-                        mask.shape[0] != len(motion)
-                        or (mask < 0).any()
-                        or (mask >= self.num_frames).any()
-                        or not torch.gather(active, 1, mask).all()
+                        index.shape[0] != len(motion)
+                        or (index < 0).any()
+                        or (index >= self.token_num_frames).any()
+                        or not torch.gather(active, 1, index).all()
                     ):
-                        raise ValueError("Context masks select an invalid or padded frame")
+                        raise ValueError("Context masks select an invalid or padded patch")
             x = apply_index_masks(x, masks)
             active = None
         elif active is not None:
@@ -126,12 +148,13 @@ class MotionTransformer1D(nn.Module):
         return x
 
 
-class MotionTransformerPredictor1D(nn.Module):
-    """Predict target-frame embeddings from packed context-frame embeddings."""
+class MotionPatchTransformerPredictor1D(nn.Module):
+    """Predict target temporal-patch embeddings from context patches."""
 
     def __init__(
         self,
         num_frames: int = 300,
+        temporal_patch_size: int = 3,
         embed_dim: int = 768,
         predictor_embed_dim: int = 384,
         depth: int = 6,
@@ -145,16 +168,23 @@ class MotionTransformerPredictor1D(nn.Module):
     ) -> None:
         super().__init__()
         self.num_frames = int(num_frames)
+        self.temporal_patch_size = int(temporal_patch_size)
+        if self.temporal_patch_size <= 0 or self.num_frames < self.temporal_patch_size:
+            raise ValueError("temporal_patch_size must be in [1, num_frames]")
+        self.token_num_frames = self.num_frames // self.temporal_patch_size
         self.embed_dim = int(embed_dim)
         self.predictor_embed_dim = int(predictor_embed_dim)
         self.token_layout = TokenLayout(
             kind="1d",
-            patchified=False,
+            patchified=True,
             raw_num_frames=self.num_frames,
-            token_num_frames=self.num_frames,
+            token_num_frames=self.token_num_frames,
+            temporal_patch_size=self.temporal_patch_size,
         )
         self.input_proj = nn.Linear(self.embed_dim, self.predictor_embed_dim)
-        self.positions = _TemporalPositions(self.num_frames, self.predictor_embed_dim)
+        self.positions = _TemporalPatchPositions(
+            self.num_frames, self.temporal_patch_size, self.predictor_embed_dim
+        )
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.predictor_embed_dim))
         drop_paths = torch.linspace(0.0, drop_path_rate, depth).tolist()
         self.blocks = nn.ModuleList(
@@ -193,9 +223,10 @@ class MotionTransformerPredictor1D(nn.Module):
         position = self.positions(fps).to(device=x.device, dtype=x.dtype)
         x = x + apply_index_masks(position, masks_enc)
         context_tokens = context.shape[1]
-
         target_position = apply_index_masks(position, masks_pred)
-        target_position = repeat_mask_blocks(target_position, batch_size, len(masks_enc))
+        target_position = repeat_mask_blocks(
+            target_position, batch_size, len(masks_enc)
+        )
         target = self.mask_token.to(dtype=x.dtype) + target_position
         x = x.repeat(len(masks_pred), 1, 1)
         x = torch.cat([x, target], dim=1)
@@ -205,77 +236,75 @@ class MotionTransformerPredictor1D(nn.Module):
         return self.output_proj(x)
 
 
-def _encoder(size: str, **kwargs) -> MotionTransformer1D:
-    return MotionTransformer1D(**MODEL_SPECS[size], **kwargs)
+def _encoder(size: str, **kwargs) -> MotionPatchTransformer1D:
+    return MotionPatchTransformer1D(**MODEL_SPECS[size], **kwargs)
 
 
-def mot_tiny_1d(**kwargs):
+def _predictor(size: str, **kwargs) -> MotionPatchTransformerPredictor1D:
+    return MotionPatchTransformerPredictor1D(**PREDICTOR_SPECS[size], **kwargs)
+
+
+def mot_patch_tiny_1d(**kwargs):
     return _encoder("tiny", **kwargs)
 
 
-def mot_small_1d(**kwargs):
+def mot_patch_small_1d(**kwargs):
     return _encoder("small", **kwargs)
 
 
-def mot_base_1d(**kwargs):
+def mot_patch_base_1d(**kwargs):
     return _encoder("base", **kwargs)
 
 
-def mot_large_1d(**kwargs):
+def mot_patch_large_1d(**kwargs):
     return _encoder("large", **kwargs)
 
 
-def mot_huge_1d(**kwargs):
+def mot_patch_huge_1d(**kwargs):
     return _encoder("huge", **kwargs)
 
 
-def mot_giant_1d(**kwargs):
+def mot_patch_giant_1d(**kwargs):
     return _encoder("giant", **kwargs)
 
 
-def _predictor(size: str, **kwargs) -> MotionTransformerPredictor1D:
-    return MotionTransformerPredictor1D(**PREDICTOR_SPECS[size], **kwargs)
-
-
-def mot_predictor_tiny_1d(**kwargs):
+def mot_predictor_patch_tiny_1d(**kwargs):
     return _predictor("tiny", **kwargs)
 
 
-def mot_predictor_small_1d(**kwargs):
+def mot_predictor_patch_small_1d(**kwargs):
     return _predictor("small", **kwargs)
 
 
-def mot_predictor_base_1d(**kwargs):
+def mot_predictor_patch_base_1d(**kwargs):
     return _predictor("base", **kwargs)
 
 
-def mot_predictor_large_1d(**kwargs):
+def mot_predictor_patch_large_1d(**kwargs):
     return _predictor("large", **kwargs)
 
 
-def mot_predictor_huge_1d(**kwargs):
+def mot_predictor_patch_huge_1d(**kwargs):
     return _predictor("huge", **kwargs)
 
 
-def mot_predictor_giant_1d(**kwargs):
+def mot_predictor_patch_giant_1d(**kwargs):
     return _predictor("giant", **kwargs)
 
 
 __all__ = [
-    "MotionTransformer1D",
-    "MotionTransformerPredictor1D",
-    
-    "mot_tiny_1d",
-    "mot_small_1d",
-    "mot_base_1d",
-    "mot_large_1d",
-    "mot_huge_1d",
-    "mot_giant_1d",
-
-    "mot_predictor_tiny_1d",
-    "mot_predictor_small_1d",
-    "mot_predictor_base_1d",
-    "mot_predictor_large_1d",
-    "mot_predictor_huge_1d",
-    "mot_predictor_giant_1d",
+    "MotionPatchTransformer1D",
+    "MotionPatchTransformerPredictor1D",
+    "mot_patch_tiny_1d",
+    "mot_patch_small_1d",
+    "mot_patch_base_1d",
+    "mot_patch_large_1d",
+    "mot_patch_huge_1d",
+    "mot_patch_giant_1d",
+    "mot_predictor_patch_tiny_1d",
+    "mot_predictor_patch_small_1d",
+    "mot_predictor_patch_base_1d",
+    "mot_predictor_patch_large_1d",
+    "mot_predictor_patch_huge_1d",
+    "mot_predictor_patch_giant_1d",
 ]

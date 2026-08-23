@@ -302,6 +302,10 @@ def _token_cache_metadata(
         "motion_dim": model_info["motion_dim"],
         "fps": model_info["fps"],
         "feature_dim": model_info["feature_dim"],
+        "token_num_frames": model_info["token_num_frames"],
+        "temporal_patch_size": model_info["temporal_patch_size"],
+        "patchified": model_info["patchified"],
+        "layout_kind": model_info["kind"],
         "dtype": "bfloat16",
         "class_names": class_names,
     }
@@ -323,7 +327,7 @@ def _validate_token_cache(
         fps=int(expected_metadata["fps"]),
     )
     expected_shape = (
-        int(expected_metadata["num_frames"]),
+        int(expected_metadata["token_num_frames"]),
         int(expected_metadata["feature_dim"]),
     )
     if dataset.features.shape[1:] != expected_shape:
@@ -373,9 +377,11 @@ def _extract_token_features(
                     "JEPA token classifiers require a 1D encoder output [B,T,D], "
                     f"got {tuple(encoded.shape)}"
                 )
-            encoded = encoded * active.unsqueeze(-1).to(dtype=encoded.dtype)
+            token_active = encoder.token_layout.valid_token_mask(active)
+            encoded = encoded * token_active.unsqueeze(-1).to(dtype=encoded.dtype)
             feature_batches.append(encoded.to(dtype=torch.bfloat16).cpu())
-            length_batches.append(length.to(dtype=torch.long).cpu())
+            token_lengths = encoder.token_layout.valid_token_lengths(length_device)
+            length_batches.append(token_lengths.to(dtype=torch.long).cpu())
             label_batches.append(labels.to(dtype=torch.long).cpu())
             sample_ids.extend(list(ids))
     if not feature_batches:
@@ -455,7 +461,7 @@ def _prepare_input(
     encoder, config, model_info = load_frozen_encoder(
         checkpoint_path, checkpoint_key, device
     )
-    if not str(model_info["model_name"]).endswith("_1d"):
+    if model_info["kind"] != "1d":
         raise ValueError("JEPA token classifiers currently support only 1D encoders")
     for key in ("num_frames", "motion_dim", "fps"):
         if int(model_info[key]) != int(dataset_info[key]):
@@ -517,6 +523,8 @@ def _prepare_input(
         "model_name": model_info["model_name"],
         "feature_dim": model_info["feature_dim"],
         "num_frames": model_info["num_frames"],
+        "token_num_frames": model_info["token_num_frames"],
+        "temporal_patch_size": model_info["temporal_patch_size"],
         "stats_root": str(stats_root),
         "stats_mean_sha256": _sha256_file(stats_root / "mean.npy"),
         "stats_std_sha256": _sha256_file(stats_root / "std.npy"),
@@ -531,7 +539,7 @@ def _prepare_input(
         datasets=token_datasets,
         label_index=label_index,
         input_dim=int(model_info["feature_dim"]),
-        num_frames=int(model_info["num_frames"]),
+        num_frames=int(model_info["token_num_frames"]),
         stats_root=stats_root,
         input_source="jepa",
         jepa_source=jepa_source,
