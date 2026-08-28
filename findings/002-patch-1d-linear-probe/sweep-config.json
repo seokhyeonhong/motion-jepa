@@ -1,0 +1,289 @@
+{
+  "format_version": 1,
+  "output_root": "/data/seokhyeon/MotionJEPA/output",
+  "dataset_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/100style-soma77-processed",
+  "findings_root": "/source/seokhyeon/motion-jepa/motion-jepa/findings/002-patch-1d-linear-probe",
+  "lrs": [
+    0.1,
+    0.3,
+    0.5,
+    0.7,
+    1.0
+  ],
+  "seeds": [
+    42
+  ],
+  "epochs": 50,
+  "batch_size": 256,
+  "feature_batch_size": 128,
+  "momentum": 0.9,
+  "weight_decay": 0.0,
+  "device": "cuda:0",
+  "checkpoints": [
+    {
+      "run_name": "mot_patch_tiny_1d-p3-bs.512-ep.100",
+      "checkpoint": "/data/seokhyeon/MotionJEPA/output/mot_patch_tiny_1d-p3-bs.512-ep.300/motion-jepa-patch-1d-p3-ep100.pth.tar",
+      "checkpoint_sha256": "eb7cf4325610acd7ba02e811ad6777037d14ffaf582beea7463c0cfe71066149",
+      "model_name": "mot_patch_tiny_1d",
+      "feature_dim": 192,
+      "dataset_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/100style-soma77-processed",
+      "dataset_index_sha256": "d9d646353f5889dbb7a08dde828503be384145225b273d19af1a2ef1a48c9355",
+      "stats_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/bones-seed-processed/stats",
+      "stats_mean_sha256": "f121191be5a597b9d61339ff114cb04d1a99581f21cab6fc54a1a9a99b85a55e",
+      "stats_std_sha256": "83cc310da1f78fc9279b80e9fb4fa304ea5cb8d2b88d186b6416b2e93d1a3267",
+      "split_counts": {
+        "train": 20916,
+        "val": 2615,
+        "test": 2614
+      },
+      "feature_batch_sizes": {
+        "train": 128,
+        "val": 128,
+        "test": 128
+      }
+    },
+    {
+      "run_name": "mot_patch_tiny_1d-p3-bs.512-ep.200",
+      "checkpoint": "/data/seokhyeon/MotionJEPA/output/mot_patch_tiny_1d-p3-bs.512-ep.300/motion-jepa-patch-1d-p3-ep200.pth.tar",
+      "checkpoint_sha256": "d586e32397783edb375b6cc0a43c1ebd8871ded3e9dd947d389b80b62f58bda1",
+      "model_name": "mot_patch_tiny_1d",
+      "feature_dim": 192,
+      "dataset_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/100style-soma77-processed",
+      "dataset_index_sha256": "d9d646353f5889dbb7a08dde828503be384145225b273d19af1a2ef1a48c9355",
+      "stats_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/bones-seed-processed/stats",
+      "stats_mean_sha256": "f121191be5a597b9d61339ff114cb04d1a99581f21cab6fc54a1a9a99b85a55e",
+      "stats_std_sha256": "83cc310da1f78fc9279b80e9fb4fa304ea5cb8d2b88d186b6416b2e93d1a3267",
+      "split_counts": {
+        "train": 20916,
+        "val": 2615,
+        "test": 2614
+      },
+      "feature_batch_sizes": {
+        "train": 128,
+        "val": 128,
+        "test": 128
+      }
+    },
+    {
+      "run_name": "mot_patch_tiny_1d-p3-bs.512-ep.300",
+      "checkpoint": "/data/seokhyeon/MotionJEPA/output/mot_patch_tiny_1d-p3-bs.512-ep.300/motion-jepa-patch-1d-p3-ep300.pth.tar",
+      "checkpoint_sha256": "d5789229811c72842e87e924041202b867c150e1ac6ac4090eef80a11fdb3821",
+      "model_name": "mot_patch_tiny_1d",
+      "feature_dim": 192,
+      "dataset_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/100style-soma77-processed",
+      "dataset_index_sha256": "d9d646353f5889dbb7a08dde828503be384145225b273d19af1a2ef1a48c9355",
+      "stats_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/bones-seed-processed/stats",
+      "stats_mean_sha256": "f121191be5a597b9d61339ff114cb04d1a99581f21cab6fc54a1a9a99b85a55e",
+      "stats_std_sha256": "83cc310da1f78fc9279b80e9fb4fa304ea5cb8d2b88d186b6416b2e93d1a3267",
+      "split_counts": {
+        "train": 20916,
+        "val": 2615,
+        "test": 2614
+      },
+      "feature_batch_sizes": {
+        "train": 128,
+        "val": 128,
+        "test": 128
+      }
+    },
+    {
+      "run_name": "mot_patch_small_1d-p3-bs.512-ep.100",
+      "checkpoint": "/data/seokhyeon/MotionJEPA/output/mot_patch_small_1d-p3-bs.512-ep.300/motion-jepa-patch-1d-p3-ep100.pth.tar",
+      "checkpoint_sha256": "1d70941e374e414068c573efd5109e9ac66e75aba001dacf83dfa1a973134f9e",
+      "model_name": "mot_patch_small_1d",
+      "feature_dim": 256,
+      "dataset_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/100style-soma77-processed",
+      "dataset_index_sha256": "d9d646353f5889dbb7a08dde828503be384145225b273d19af1a2ef1a48c9355",
+      "stats_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/bones-seed-processed/stats",
+      "stats_mean_sha256": "f121191be5a597b9d61339ff114cb04d1a99581f21cab6fc54a1a9a99b85a55e",
+      "stats_std_sha256": "83cc310da1f78fc9279b80e9fb4fa304ea5cb8d2b88d186b6416b2e93d1a3267",
+      "split_counts": {
+        "train": 20916,
+        "val": 2615,
+        "test": 2614
+      },
+      "feature_batch_sizes": {
+        "train": 128,
+        "val": 128,
+        "test": 128
+      }
+    },
+    {
+      "run_name": "mot_patch_small_1d-p3-bs.512-ep.200",
+      "checkpoint": "/data/seokhyeon/MotionJEPA/output/mot_patch_small_1d-p3-bs.512-ep.300/motion-jepa-patch-1d-p3-ep200.pth.tar",
+      "checkpoint_sha256": "947e21476fc239bc5681e001c9190da6c5faadb4ed0d3ad68a5b2bdf5d403dd1",
+      "model_name": "mot_patch_small_1d",
+      "feature_dim": 256,
+      "dataset_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/100style-soma77-processed",
+      "dataset_index_sha256": "d9d646353f5889dbb7a08dde828503be384145225b273d19af1a2ef1a48c9355",
+      "stats_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/bones-seed-processed/stats",
+      "stats_mean_sha256": "f121191be5a597b9d61339ff114cb04d1a99581f21cab6fc54a1a9a99b85a55e",
+      "stats_std_sha256": "83cc310da1f78fc9279b80e9fb4fa304ea5cb8d2b88d186b6416b2e93d1a3267",
+      "split_counts": {
+        "train": 20916,
+        "val": 2615,
+        "test": 2614
+      },
+      "feature_batch_sizes": {
+        "train": 128,
+        "val": 128,
+        "test": 128
+      }
+    },
+    {
+      "run_name": "mot_patch_small_1d-p3-bs.512-ep.300",
+      "checkpoint": "/data/seokhyeon/MotionJEPA/output/mot_patch_small_1d-p3-bs.512-ep.300/motion-jepa-patch-1d-p3-ep300.pth.tar",
+      "checkpoint_sha256": "b9ba81dc5c18c57550e1294c3af4a462a03b0122e02d35f659796ff21d908f3f",
+      "model_name": "mot_patch_small_1d",
+      "feature_dim": 256,
+      "dataset_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/100style-soma77-processed",
+      "dataset_index_sha256": "d9d646353f5889dbb7a08dde828503be384145225b273d19af1a2ef1a48c9355",
+      "stats_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/bones-seed-processed/stats",
+      "stats_mean_sha256": "f121191be5a597b9d61339ff114cb04d1a99581f21cab6fc54a1a9a99b85a55e",
+      "stats_std_sha256": "83cc310da1f78fc9279b80e9fb4fa304ea5cb8d2b88d186b6416b2e93d1a3267",
+      "split_counts": {
+        "train": 20916,
+        "val": 2615,
+        "test": 2614
+      },
+      "feature_batch_sizes": {
+        "train": 128,
+        "val": 128,
+        "test": 128
+      }
+    },
+    {
+      "run_name": "mot_patch_base_1d-p3-bs.512-ep.100",
+      "checkpoint": "/data/seokhyeon/MotionJEPA/output/mot_patch_base_1d-p3-bs.512-ep.300/motion-jepa-patch-1d-p3-ep100.pth.tar",
+      "checkpoint_sha256": "331723e348bd953f3cfd9d5e47d7267a69c322ad3894c1db697a5716ab524616",
+      "model_name": "mot_patch_base_1d",
+      "feature_dim": 384,
+      "dataset_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/100style-soma77-processed",
+      "dataset_index_sha256": "d9d646353f5889dbb7a08dde828503be384145225b273d19af1a2ef1a48c9355",
+      "stats_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/bones-seed-processed/stats",
+      "stats_mean_sha256": "f121191be5a597b9d61339ff114cb04d1a99581f21cab6fc54a1a9a99b85a55e",
+      "stats_std_sha256": "83cc310da1f78fc9279b80e9fb4fa304ea5cb8d2b88d186b6416b2e93d1a3267",
+      "split_counts": {
+        "train": 20916,
+        "val": 2615,
+        "test": 2614
+      },
+      "feature_batch_sizes": {
+        "train": 128,
+        "val": 128,
+        "test": 128
+      }
+    },
+    {
+      "run_name": "mot_patch_base_1d-p3-bs.512-ep.200",
+      "checkpoint": "/data/seokhyeon/MotionJEPA/output/mot_patch_base_1d-p3-bs.512-ep.300/motion-jepa-patch-1d-p3-ep200.pth.tar",
+      "checkpoint_sha256": "9b8c00e723401a2a9e6f1867a8d0073bb7b2916ac835e507cdc9fc4b15da2277",
+      "model_name": "mot_patch_base_1d",
+      "feature_dim": 384,
+      "dataset_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/100style-soma77-processed",
+      "dataset_index_sha256": "d9d646353f5889dbb7a08dde828503be384145225b273d19af1a2ef1a48c9355",
+      "stats_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/bones-seed-processed/stats",
+      "stats_mean_sha256": "f121191be5a597b9d61339ff114cb04d1a99581f21cab6fc54a1a9a99b85a55e",
+      "stats_std_sha256": "83cc310da1f78fc9279b80e9fb4fa304ea5cb8d2b88d186b6416b2e93d1a3267",
+      "split_counts": {
+        "train": 20916,
+        "val": 2615,
+        "test": 2614
+      },
+      "feature_batch_sizes": {
+        "train": 128,
+        "val": 128,
+        "test": 128
+      }
+    },
+    {
+      "run_name": "mot_patch_base_1d-p3-bs.512-ep.300",
+      "checkpoint": "/data/seokhyeon/MotionJEPA/output/mot_patch_base_1d-p3-bs.512-ep.300/motion-jepa-patch-1d-p3-ep300.pth.tar",
+      "checkpoint_sha256": "69a55436007c0a3297d895e520e0cec0685ebeb2e2f33af2c4a235688e9d2051",
+      "model_name": "mot_patch_base_1d",
+      "feature_dim": 384,
+      "dataset_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/100style-soma77-processed",
+      "dataset_index_sha256": "d9d646353f5889dbb7a08dde828503be384145225b273d19af1a2ef1a48c9355",
+      "stats_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/bones-seed-processed/stats",
+      "stats_mean_sha256": "f121191be5a597b9d61339ff114cb04d1a99581f21cab6fc54a1a9a99b85a55e",
+      "stats_std_sha256": "83cc310da1f78fc9279b80e9fb4fa304ea5cb8d2b88d186b6416b2e93d1a3267",
+      "split_counts": {
+        "train": 20916,
+        "val": 2615,
+        "test": 2614
+      },
+      "feature_batch_sizes": {
+        "train": 128,
+        "val": 128,
+        "test": 128
+      }
+    },
+    {
+      "run_name": "mot_patch_large_1d-p3-bs.512-ep.100",
+      "checkpoint": "/data/seokhyeon/MotionJEPA/output/mot_patch_large_1d-p3-bs.512-ep.300/motion-jepa-patch-1d-p3-ep100.pth.tar",
+      "checkpoint_sha256": "bd50943fcaebafe5a2fdd1cf763254b80ab7cba8f8f48dda202a105ce8e44a5c",
+      "model_name": "mot_patch_large_1d",
+      "feature_dim": 512,
+      "dataset_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/100style-soma77-processed",
+      "dataset_index_sha256": "d9d646353f5889dbb7a08dde828503be384145225b273d19af1a2ef1a48c9355",
+      "stats_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/bones-seed-processed/stats",
+      "stats_mean_sha256": "f121191be5a597b9d61339ff114cb04d1a99581f21cab6fc54a1a9a99b85a55e",
+      "stats_std_sha256": "83cc310da1f78fc9279b80e9fb4fa304ea5cb8d2b88d186b6416b2e93d1a3267",
+      "split_counts": {
+        "train": 20916,
+        "val": 2615,
+        "test": 2614
+      },
+      "feature_batch_sizes": {
+        "train": 128,
+        "val": 128,
+        "test": 128
+      }
+    },
+    {
+      "run_name": "mot_patch_large_1d-p3-bs.512-ep.200",
+      "checkpoint": "/data/seokhyeon/MotionJEPA/output/mot_patch_large_1d-p3-bs.512-ep.300/motion-jepa-patch-1d-p3-ep200.pth.tar",
+      "checkpoint_sha256": "78ee52a67dccbfbe22e3cc7a3e91f5efd09699c0d9061626de6b08df87557dcc",
+      "model_name": "mot_patch_large_1d",
+      "feature_dim": 512,
+      "dataset_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/100style-soma77-processed",
+      "dataset_index_sha256": "d9d646353f5889dbb7a08dde828503be384145225b273d19af1a2ef1a48c9355",
+      "stats_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/bones-seed-processed/stats",
+      "stats_mean_sha256": "f121191be5a597b9d61339ff114cb04d1a99581f21cab6fc54a1a9a99b85a55e",
+      "stats_std_sha256": "83cc310da1f78fc9279b80e9fb4fa304ea5cb8d2b88d186b6416b2e93d1a3267",
+      "split_counts": {
+        "train": 20916,
+        "val": 2615,
+        "test": 2614
+      },
+      "feature_batch_sizes": {
+        "train": 128,
+        "val": 128,
+        "test": 128
+      }
+    },
+    {
+      "run_name": "mot_patch_large_1d-p3-bs.512-ep.300",
+      "checkpoint": "/data/seokhyeon/MotionJEPA/output/mot_patch_large_1d-p3-bs.512-ep.300/motion-jepa-patch-1d-p3-ep300.pth.tar",
+      "checkpoint_sha256": "1d071501ba099a10312d5933d2d92108825b201f5bacbbddfab797900512e877",
+      "model_name": "mot_patch_large_1d",
+      "feature_dim": 512,
+      "dataset_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/100style-soma77-processed",
+      "dataset_index_sha256": "d9d646353f5889dbb7a08dde828503be384145225b273d19af1a2ef1a48c9355",
+      "stats_root": "/source/seokhyeon/motion-jepa/motion-jepa/dataset/bones-seed-processed/stats",
+      "stats_mean_sha256": "f121191be5a597b9d61339ff114cb04d1a99581f21cab6fc54a1a9a99b85a55e",
+      "stats_std_sha256": "83cc310da1f78fc9279b80e9fb4fa304ea5cb8d2b88d186b6416b2e93d1a3267",
+      "split_counts": {
+        "train": 20916,
+        "val": 2615,
+        "test": 2614
+      },
+      "feature_batch_sizes": {
+        "train": 128,
+        "val": 128,
+        "test": 128
+      }
+    }
+  ],
+  "failures": []
+}

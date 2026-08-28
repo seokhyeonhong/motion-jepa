@@ -6,7 +6,14 @@ import unittest
 
 import torch
 
-from mask import PatchMaskCollator1D
+from mask import (
+    PatchBodyRegionSegmentMaskCollator2D,
+    PatchMaskCollator1D,
+    PatchMaskCollator2D,
+)
+from mask.body_region_collator import COARSE7_GRAPH_EDGES
+from model import TokenLayout
+from train import _build_mask_collator
 
 
 class PatchMaskCollatorTest(unittest.TestCase):
@@ -50,6 +57,198 @@ class PatchMaskCollatorTest(unittest.TestCase):
         collator = PatchMaskCollator1D(8, 3)
         with self.assertRaisesRegex(ValueError, "complete temporal patch"):
             collator([(torch.zeros(8, 6), 60, 2)])
+
+    def test_2d_masks_use_patch_and_group_coordinates(self):
+        collator = PatchMaskCollator2D(
+            raw_num_frames=8,
+            raw_num_joints=30,
+            token_num_joints=7,
+            temporal_patch_size=3,
+            spatial_grouping="coarse7",
+            enc_frame_mask_ratio=(1.0, 1.0),
+            enc_joint_mask_ratio=(1.0, 1.0),
+            pred_frame_mask_ratio=(0.5, 0.5),
+            pred_joint_mask_ratio=(0.15, 0.15),
+            allow_overlap=True,
+        )
+        batch = [(torch.zeros(8, 366), 60, 8), (torch.zeros(8, 366), 60, 5)]
+        collated, contexts, targets = collator(batch)
+        torch.testing.assert_close(collated[2], torch.tensor([8, 5]))
+        for mask in contexts + targets:
+            self.assertEqual(mask.shape, (2, 2, 7))
+            self.assertFalse(mask[1, 1:].any())
+
+    def test_2d_state_rejects_different_grouping(self):
+        common = dict(
+            raw_num_frames=9,
+            raw_num_joints=30,
+            temporal_patch_size=3,
+            enc_frame_mask_ratio=(0.5, 0.5),
+            enc_joint_mask_ratio=(0.5, 0.5),
+            pred_frame_mask_ratio=(0.25, 0.25),
+            pred_joint_mask_ratio=(0.25, 0.25),
+        )
+        fine = PatchMaskCollator2D(
+            token_num_joints=11, spatial_grouping="fine11", **common
+        )
+        coarse = PatchMaskCollator2D(
+            token_num_joints=7, spatial_grouping="coarse7", **common
+        )
+        joint30 = PatchMaskCollator2D(
+            token_num_joints=30, spatial_grouping="joint30", **common
+        )
+        self.assertEqual(joint30.layout.token_num_joints, 30)
+        with self.assertRaisesRegex(ValueError, "configuration differs"):
+            coarse.load_state_dict(fine.state_dict())
+
+    @staticmethod
+    def _body_region_collator(**kwargs):
+        options = {
+            "raw_num_frames": 12,
+            "raw_num_joints": 30,
+            "token_num_joints": 7,
+            "temporal_patch_size": 3,
+            "spatial_grouping": "coarse7",
+            "spatial_pooling": "graph_mean",
+            "pred_frame_mask_ratio": (0.5, 0.5),
+            "graph_mask_ratio": (2.0 / 7.0, 2.0 / 7.0),
+        }
+        options.update(kwargs)
+        return PatchBodyRegionSegmentMaskCollator2D(**options)
+
+    def test_body_region_candidates_cover_every_connected_subset(self):
+        collator = self._body_region_collator(
+            graph_mask_ratio=(2.0 / 7.0, 3.0 / 7.0)
+        )
+        expected_pairs = {tuple(sorted(edge)) for edge in COARSE7_GRAPH_EDGES}
+        self.assertEqual(set(collator.connected_regions(2)), expected_pairs)
+        self.assertEqual(len(collator.connected_regions(3)), 9)
+        for region in collator.connected_regions(3):
+            selected = set(region)
+            selected_edges = [
+                edge for edge in COARSE7_GRAPH_EDGES if set(edge) <= selected
+            ]
+            self.assertEqual(len(selected_edges), 2)
+
+    def test_body_region_is_contiguous_and_context_is_exact_complement(self):
+        collator = self._body_region_collator()
+        batch = [(torch.zeros(12, 366), 60, 12), (torch.zeros(12, 366), 60, 9)]
+        collated, contexts, targets = collator(batch)
+        torch.testing.assert_close(collated[2], torch.tensor([12, 9]))
+        self.assertEqual(len(contexts), 1)
+        self.assertEqual(len(targets), 1)
+        context, target = contexts[0], targets[0]
+        self.assertEqual(target.flatten(1).sum(1).tolist(), [4, 4])
+        for index, valid_frames in enumerate((4, 3)):
+            active_frames = torch.nonzero(target[index].any(dim=1)).flatten()
+            self.assertEqual(len(active_frames), 2)
+            self.assertTrue(bool((active_frames[1:] - active_frames[:-1] == 1).all()))
+            groups = target[index, active_frames[0]]
+            self.assertEqual(int(groups.sum()), 2)
+            self.assertTrue(bool((target[index, active_frames] == groups).all()))
+            valid = torch.zeros_like(target[index])
+            valid[:valid_frames] = True
+            self.assertFalse(bool((context[index] & target[index]).any()))
+            torch.testing.assert_close(context[index] | target[index], valid)
+
+    def test_body_region_state_restores_next_mask(self):
+        batch = [(torch.zeros(12, 366), 60, 12) for _ in range(2)]
+        first = self._body_region_collator()
+        first(batch)
+        state = first.state_dict()
+        expected = first(batch)[1:]
+        restored = self._body_region_collator()
+        restored.load_state_dict(state)
+        actual = restored(batch)[1:]
+        for expected_group, actual_group in zip(expected, actual):
+            for expected_mask, actual_mask in zip(expected_group, actual_group):
+                torch.testing.assert_close(actual_mask, expected_mask)
+
+    def test_body_region_union_has_fixed_non_overlapping_coverage(self):
+        collator = self._body_region_collator(num_regions=2)
+        batch = [(torch.zeros(12, 366), 60, 12) for _ in range(4)]
+        _, contexts, targets = collator(batch)
+        context, target = contexts[0], targets[0]
+        self.assertEqual(target.flatten(1).sum(1).tolist(), [8, 8, 8, 8])
+        valid = torch.ones_like(target)
+        self.assertFalse(bool((context & target).any()))
+        torch.testing.assert_close(context | target, valid)
+
+    def test_builder_selects_body_region_and_preserves_legacy_default(self):
+        layout = TokenLayout(
+            kind="2d",
+            patchified=True,
+            raw_num_frames=12,
+            token_num_frames=4,
+            temporal_patch_size=3,
+            raw_num_joints=30,
+            token_num_joints=7,
+        )
+        body_config = {
+            "patch": {
+                "spatial_grouping": "coarse7",
+                "spatial_pooling": "graph_mean",
+            },
+            "mask": {
+                "strategy": "body_region_segment",
+                "allow_overlap": False,
+                "num_enc_masks": 1,
+                "num_pred_masks": 1,
+                "pred_frame_mask_ratio": [0.3, 0.6],
+                "graph_mask_ratio": [2.0 / 7.0, 3.0 / 7.0],
+            },
+        }
+        self.assertIsInstance(
+            _build_mask_collator(body_config, layout),
+            PatchBodyRegionSegmentMaskCollator2D,
+        )
+
+        legacy_config = {
+            "patch": body_config["patch"],
+            "mask": {
+                "allow_overlap": False,
+                "num_enc_masks": 1,
+                "num_pred_masks": 1,
+                "enc_frame_mask_ratio": [1.0, 1.0],
+                "enc_joint_mask_ratio": [1.0, 1.0],
+                "pred_frame_mask_ratio": [0.5, 0.5],
+                "pred_joint_mask_ratio": [1.0 / 7.0, 1.0 / 7.0],
+            },
+        }
+        self.assertIsInstance(
+            _build_mask_collator(legacy_config, layout), PatchMaskCollator2D
+        )
+
+    def test_builder_rejects_invalid_body_region_mask_counts_and_overlap(self):
+        layout = TokenLayout(
+            kind="2d",
+            patchified=True,
+            raw_num_frames=12,
+            token_num_frames=4,
+            temporal_patch_size=3,
+            raw_num_joints=30,
+            token_num_joints=7,
+        )
+        config = {
+            "patch": {
+                "spatial_grouping": "coarse7",
+                "spatial_pooling": "graph_mean",
+            },
+            "mask": {
+                "strategy": "body_region_segment",
+                "allow_overlap": False,
+                "num_enc_masks": 1,
+                "num_pred_masks": 2,
+                "pred_frame_mask_ratio": [0.3, 0.6],
+                "graph_mask_ratio": [2.0 / 7.0, 3.0 / 7.0],
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "one encoder and one target"):
+            _build_mask_collator(config, layout)
+        config["mask"]["num_pred_masks"] = 1
+        config["mask"]["allow_overlap"] = True
+        with self.assertRaisesRegex(ValueError, "allow_overlap=false"):
+            _build_mask_collator(config, layout)
 
 
 if __name__ == "__main__":

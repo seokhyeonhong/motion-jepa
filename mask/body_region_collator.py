@@ -1,0 +1,233 @@
+"""Graph-connected body-region masking for patchified skeletal motion."""
+
+from __future__ import annotations
+
+from itertools import combinations
+
+import torch
+
+from model.token_layout import TokenLayout
+
+from .collators import (
+    _StatefulMaskCollator,
+    _block_length,
+    _sample_ratio,
+    _valid_lengths,
+)
+
+
+COARSE7_GROUP_NAMES = (
+    "pelvis",
+    "torso",
+    "head",
+    "left_arm_hand",
+    "right_arm_hand",
+    "left_leg_foot",
+    "right_leg_foot",
+)
+COARSE7_GRAPH_EDGES = (
+    (0, 1),  # pelvis -- torso
+    (1, 2),  # torso -- head
+    (1, 3),  # torso -- left arm/hand
+    (1, 4),  # torso -- right arm/hand
+    (0, 5),  # pelvis -- left leg/foot
+    (0, 6),  # pelvis -- right leg/foot
+)
+
+
+def _connected_subsets(
+    num_nodes: int,
+    edges: tuple[tuple[int, int], ...],
+    size: int,
+) -> tuple[tuple[int, ...], ...]:
+    """Enumerate every connected node subset of an undirected graph."""
+    adjacency = [set() for _ in range(num_nodes)]
+    for left, right in edges:
+        if not 0 <= left < num_nodes or not 0 <= right < num_nodes or left == right:
+            raise ValueError(f"Invalid graph edge ({left}, {right}) for {num_nodes} nodes")
+        adjacency[left].add(right)
+        adjacency[right].add(left)
+
+    connected = []
+    for nodes in combinations(range(num_nodes), size):
+        selected = set(nodes)
+        visited = {nodes[0]}
+        frontier = [nodes[0]]
+        while frontier:
+            node = frontier.pop()
+            unseen = (adjacency[node] & selected) - visited
+            visited.update(unseen)
+            frontier.extend(unseen)
+        if visited == selected:
+            connected.append(nodes)
+    return tuple(connected)
+
+
+class PatchBodyRegionSegmentMaskCollator2D(_StatefulMaskCollator):
+    """Mask a contiguous time segment over a connected coarse7 body region."""
+
+    def __init__(
+        self,
+        raw_num_frames: int,
+        raw_num_joints: int,
+        token_num_joints: int,
+        temporal_patch_size: int = 3,
+        spatial_grouping: str = "coarse7",
+        spatial_pooling: str = "graph_mean",
+        pred_frame_mask_ratio: tuple[float, float] = (0.3, 0.6),
+        graph_mask_ratio: tuple[float, float] = (2.0 / 7.0, 3.0 / 7.0),
+        num_regions: int = 1,
+    ) -> None:
+        super().__init__()
+        if spatial_grouping != "coarse7":
+            raise ValueError(
+                "body_region_segment requires spatial_grouping='coarse7'"
+            )
+        if spatial_pooling != "graph_mean":
+            raise ValueError(
+                "body_region_segment supports only spatial_pooling='graph_mean'"
+            )
+        if int(raw_num_joints) != 30 or int(token_num_joints) != 7:
+            raise ValueError("body_region_segment requires SOMA30 pooled to coarse7")
+
+        self.layout = TokenLayout(
+            kind="2d",
+            patchified=True,
+            raw_num_frames=int(raw_num_frames),
+            token_num_frames=int(raw_num_frames) // int(temporal_patch_size),
+            temporal_patch_size=int(temporal_patch_size),
+            raw_num_joints=int(raw_num_joints),
+            token_num_joints=int(token_num_joints),
+        )
+        self.pred_frame_mask_ratio = tuple(
+            float(value) for value in pred_frame_mask_ratio
+        )
+        self.graph_mask_ratio = tuple(float(value) for value in graph_mask_ratio)
+        self.num_regions = int(num_regions)
+        if self.num_regions <= 0:
+            raise ValueError("num_regions must be positive")
+        _sample_ratio(torch.Generator().manual_seed(0), self.pred_frame_mask_ratio)
+        _sample_ratio(torch.Generator().manual_seed(0), self.graph_mask_ratio)
+        if self.graph_mask_ratio[0] <= 0.0:
+            raise ValueError("graph_mask_ratio must select at least one body group")
+
+        minimum_groups = _block_length(7, self.graph_mask_ratio[0])
+        maximum_groups = _block_length(7, self.graph_mask_ratio[1])
+        self._regions_by_size = {
+            size: _connected_subsets(7, COARSE7_GRAPH_EDGES, size)
+            for size in range(minimum_groups, maximum_groups + 1)
+        }
+        if any(not regions for regions in self._regions_by_size.values()):
+            raise ValueError("graph_mask_ratio has no connected coarse7 regions")
+
+        self._configuration = {
+            "variant": "patch_2d_body_region_segment",
+            "raw_num_frames": self.layout.raw_num_frames,
+            "token_num_frames": self.layout.token_num_frames,
+            "temporal_patch_size": self.layout.temporal_patch_size,
+            "raw_num_joints": self.layout.raw_num_joints,
+            "token_num_joints": self.layout.token_num_joints,
+            "spatial_grouping": str(spatial_grouping),
+            "spatial_pooling": str(spatial_pooling),
+            "pred_frame_mask_ratio": self.pred_frame_mask_ratio,
+            "graph_mask_ratio": self.graph_mask_ratio,
+            "num_regions": self.num_regions,
+            "graph_edges": COARSE7_GRAPH_EDGES,
+        }
+
+    def connected_regions(self, group_count: int) -> tuple[tuple[int, ...], ...]:
+        """Return the selectable connected coarse7 regions for one group count."""
+        return self._regions_by_size.get(int(group_count), ())
+
+    def __call__(self, batch):
+        collated_batch = torch.utils.data.default_collate(batch)
+        generator = torch.Generator().manual_seed(self.step())
+        raw_lengths = torch.tensor(
+            [
+                int(sample[2]) if len(sample) >= 3 else self.layout.raw_num_frames
+                for sample in batch
+            ],
+            dtype=torch.long,
+        )
+        token_lengths = self.layout.valid_token_lengths(raw_lengths)
+        if (token_lengths < 1).any():
+            raise ValueError(
+                "Every sample must contain at least one complete temporal patch"
+            )
+        valid_lengths = _valid_lengths(
+            [(None, None, int(length)) for length in token_lengths.tolist()],
+            self.layout.token_num_frames,
+        )
+        shortest = min(valid_lengths)
+        frame_count = _block_length(
+            shortest, _sample_ratio(generator, self.pred_frame_mask_ratio)
+        )
+        group_count = _block_length(
+            self.layout.token_num_joints,
+            _sample_ratio(generator, self.graph_mask_ratio),
+        )
+        regions = self.connected_regions(group_count)
+        if not regions:
+            raise ValueError(f"No connected coarse7 region has {group_count} groups")
+
+        contexts = []
+        targets = []
+        for valid_length in valid_lengths:
+            target = torch.zeros(
+                self.layout.token_num_frames,
+                self.layout.token_num_joints,
+                dtype=torch.bool,
+            )
+            cells_per_region = frame_count * group_count
+            if self.num_regions * cells_per_region >= valid_length * 7:
+                raise ValueError(
+                    "body-region union leaves no context cells; reduce num_regions "
+                    "or mask ratios"
+                )
+            for _union_attempt in range(256):
+                target.zero_()
+                complete = True
+                for _region_number in range(self.num_regions):
+                    for _region_attempt in range(256):
+                        start = int(
+                            torch.randint(
+                                valid_length - frame_count + 1,
+                                (),
+                                generator=generator,
+                            ).item()
+                        )
+                        region_index = int(
+                            torch.randint(
+                                len(regions), (), generator=generator
+                            ).item()
+                        )
+                        region = regions[region_index]
+                        proposal = torch.zeros_like(target)
+                        proposal[start : start + frame_count, list(region)] = True
+                        if not (target & proposal).any():
+                            target |= proposal
+                            break
+                    else:
+                        complete = False
+                        break
+                if complete:
+                    break
+            else:
+                raise ValueError(
+                    "Could not sample non-overlapping body regions; reduce "
+                    "num_regions or mask ratios"
+                )
+            valid = (
+                torch.arange(self.layout.token_num_frames)[:, None] < valid_length
+            ).expand(-1, self.layout.token_num_joints)
+            targets.append(target)
+            contexts.append(valid & ~target)
+
+        return collated_batch, [torch.stack(contexts)], [torch.stack(targets)]
+
+
+__all__ = [
+    "COARSE7_GRAPH_EDGES",
+    "COARSE7_GROUP_NAMES",
+    "PatchBodyRegionSegmentMaskCollator2D",
+]

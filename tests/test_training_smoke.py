@@ -86,6 +86,9 @@ class TrainingSmokeTest(unittest.TestCase):
             # signatures were added; resume must derive the raw layout from config.
             checkpoint = torch.load(result["checkpoint"], map_location="cpu", weights_only=False)
             checkpoint.pop("architecture")
+            checkpoint.pop("linear_probe_latest")
+            checkpoint.pop("best_probe_val_top1")
+            checkpoint.pop("best_probe_epoch")
             torch.save(checkpoint, result["checkpoint"])
 
             config["meta"]["load_checkpoint"] = True

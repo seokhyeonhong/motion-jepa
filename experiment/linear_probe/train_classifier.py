@@ -287,7 +287,7 @@ def _token_cache_metadata(
     model_info: dict[str, Any],
     class_names: list[str],
 ) -> dict[str, Any]:
-    return {
+    metadata = {
         "format_version": TOKEN_CACHE_FORMAT_VERSION,
         "kind": "motion_jepa_frame_tokens",
         "split": split,
@@ -309,6 +309,12 @@ def _token_cache_metadata(
         "dtype": "bfloat16",
         "class_names": class_names,
     }
+    for key in ("token_num_joints", "spatial_grouping", "spatial_pooling"):
+        if key in model_info:
+            metadata[key] = model_info[key]
+    if model_info["kind"] == "2d":
+        metadata["spatial_token_reduction"] = "group_mean"
+    return metadata
 
 
 def _validate_token_cache(
@@ -372,9 +378,11 @@ def _extract_token_features(
             )
             with amp_context:
                 encoded = encoder(motion, fps, valid_frames=active)
+            if encoded.ndim == 4:
+                encoded = encoded.mean(dim=2)
             if encoded.ndim != 3:
                 raise ValueError(
-                    "JEPA token classifiers require a 1D encoder output [B,T,D], "
+                    "JEPA token classifiers require encoder output [B,T,D] or [B,T,J,D], "
                     f"got {tuple(encoded.shape)}"
                 )
             token_active = encoder.token_layout.valid_token_mask(active)
@@ -461,8 +469,6 @@ def _prepare_input(
     encoder, config, model_info = load_frozen_encoder(
         checkpoint_path, checkpoint_key, device
     )
-    if model_info["kind"] != "1d":
-        raise ValueError("JEPA token classifiers currently support only 1D encoders")
     for key in ("num_frames", "motion_dim", "fps"):
         if int(model_info[key]) != int(dataset_info[key]):
             raise ValueError(
@@ -532,6 +538,9 @@ def _prepare_input(
         "token_cache_dtype": "bfloat16",
         "token_cache_format_version": TOKEN_CACHE_FORMAT_VERSION,
     }
+    for key in ("token_num_joints", "spatial_grouping", "spatial_pooling"):
+        if key in model_info:
+            jepa_source[key] = model_info[key]
     del encoder, motion_datasets
     if device.type == "cuda":
         torch.cuda.empty_cache()

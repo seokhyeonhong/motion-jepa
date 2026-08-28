@@ -51,6 +51,25 @@ from .motion_patch_transformer_1d import (
     mot_predictor_patch_huge_1d,
     mot_predictor_patch_giant_1d,
 )
+from .motion_patch_transformer_2d import (
+    MotionPatchTransformer2D,
+    MotionPatchTransformerPredictor2D,
+    SPATIAL_GROUPINGS,
+    get_spatial_grouping,
+    spatial_patch_signature,
+    mot_patch_tiny_2d,
+    mot_patch_small_2d,
+    mot_patch_base_2d,
+    mot_patch_large_2d,
+    mot_patch_huge_2d,
+    mot_patch_giant_2d,
+    mot_predictor_patch_tiny_2d,
+    mot_predictor_patch_small_2d,
+    mot_predictor_patch_base_2d,
+    mot_predictor_patch_large_2d,
+    mot_predictor_patch_huge_2d,
+    mot_predictor_patch_giant_2d,
+)
 from .token_layout import TokenLayout
 
 MODEL_FACTORIES = {
@@ -76,6 +95,13 @@ MODEL_FACTORIES = {
         mot_large_2d,
         mot_huge_2d,
         mot_giant_2d,
+
+        mot_patch_tiny_2d,
+        mot_patch_small_2d,
+        mot_patch_base_2d,
+        mot_patch_large_2d,
+        mot_patch_huge_2d,
+        mot_patch_giant_2d,
     )
 }
 
@@ -102,6 +128,13 @@ PREDICTOR_FACTORIES = {
         mot_predictor_large_2d,
         mot_predictor_huge_2d,
         mot_predictor_giant_2d,
+
+        mot_predictor_patch_tiny_2d,
+        mot_predictor_patch_small_2d,
+        mot_predictor_patch_base_2d,
+        mot_predictor_patch_large_2d,
+        mot_predictor_patch_huge_2d,
+        mot_predictor_patch_giant_2d,
     )
 }
 
@@ -114,6 +147,12 @@ PATCH_MODEL_NAMES = frozenset(
         mot_patch_large_1d,
         mot_patch_huge_1d,
         mot_patch_giant_1d,
+        mot_patch_tiny_2d,
+        mot_patch_small_2d,
+        mot_patch_base_2d,
+        mot_patch_large_2d,
+        mot_patch_huge_2d,
+        mot_patch_giant_2d,
     )
 )
 PATCH_PREDICTOR_NAMES = frozenset(
@@ -125,12 +164,20 @@ PATCH_PREDICTOR_NAMES = frozenset(
         mot_predictor_patch_large_1d,
         mot_predictor_patch_huge_1d,
         mot_predictor_patch_giant_1d,
+        mot_predictor_patch_tiny_2d,
+        mot_predictor_patch_small_2d,
+        mot_predictor_patch_base_2d,
+        mot_predictor_patch_large_2d,
+        mot_predictor_patch_huge_2d,
+        mot_predictor_patch_giant_2d,
     )
 )
 MODEL_KINDS = {
     name: ("2d" if factory in {
         mot_tiny_2d, mot_small_2d, mot_base_2d,
         mot_large_2d, mot_huge_2d, mot_giant_2d,
+        mot_patch_tiny_2d, mot_patch_small_2d, mot_patch_base_2d,
+        mot_patch_large_2d, mot_patch_huge_2d, mot_patch_giant_2d,
     } else "1d")
     for name, factory in MODEL_FACTORIES.items()
 }
@@ -138,6 +185,9 @@ PREDICTOR_KINDS = {
     name: ("2d" if factory in {
         mot_predictor_tiny_2d, mot_predictor_small_2d, mot_predictor_base_2d,
         mot_predictor_large_2d, mot_predictor_huge_2d, mot_predictor_giant_2d,
+        mot_predictor_patch_tiny_2d, mot_predictor_patch_small_2d,
+        mot_predictor_patch_base_2d, mot_predictor_patch_large_2d,
+        mot_predictor_patch_huge_2d, mot_predictor_patch_giant_2d,
     } else "1d")
     for name, factory in PREDICTOR_FACTORIES.items()
 }
@@ -155,6 +205,11 @@ __all__ = [
     "MotionTransformerPredictor2D",
     "MotionPatchTransformer1D",
     "MotionPatchTransformerPredictor1D",
+    "MotionPatchTransformer2D",
+    "MotionPatchTransformerPredictor2D",
+    "SPATIAL_GROUPINGS",
+    "get_spatial_grouping",
+    "spatial_patch_signature",
     "TokenLayout",
     *MODEL_FACTORIES,
     *PREDICTOR_FACTORIES,

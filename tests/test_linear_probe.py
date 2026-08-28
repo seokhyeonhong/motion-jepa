@@ -210,6 +210,19 @@ class LinearProbeUnitTest(unittest.TestCase):
         pooled_2d = linear_probe.pool_encoder_output(two_d, torch.tensor([2]))
         torch.testing.assert_close(pooled_2d, torch.tensor([[4.0]]))
 
+        spatial = linear_probe.pool_encoder_output(
+            two_d,
+            torch.tensor([2]),
+            pooling=linear_probe.SPATIAL_FLATTEN_POOLING,
+        )
+        torch.testing.assert_close(spatial, torch.tensor([[3.0, 5.0]]))
+        with self.assertRaisesRegex(ValueError, "requires 2D output"):
+            linear_probe.pool_encoder_output(
+                one_d,
+                torch.tensor([2]),
+                pooling=linear_probe.SPATIAL_FLATTEN_POOLING,
+            )
+
     def test_stale_cache_is_rejected(self):
         metadata = {"format_version": 1, "feature_dim": 3}
         payload = {
@@ -296,6 +309,49 @@ class LinearProbeEndToEndTest(unittest.TestCase):
             self.assertEqual(default_output["checkpoint"], str(checkpoint.resolve()))
             self.assertTrue(
                 (checkpoint.parent / "linear-probe" / "summary.json").is_file()
+            )
+
+    def test_2d_probe_preserves_spatial_token_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_root = root / "dataset"
+            _write_dataset(dataset_root, motion_dim=366)
+            checkpoint = root / "checkpoint-2d.pth.tar"
+            _write_checkpoint(
+                checkpoint,
+                dataset_root / "stats",
+                model_name="mot_tiny_2d",
+                motion_dim=366,
+            )
+            args = argparse.Namespace(
+                checkpoint=checkpoint,
+                dataset_root=dataset_root,
+                output=None,
+                checkpoint_key="target_encoder",
+                stats_path=None,
+                device="cpu",
+                feature_batch_size=4,
+                batch_size=2,
+                num_workers=0,
+                epochs=1,
+                lr=0.1,
+                momentum=0.9,
+                weight_decay=0.0,
+                seed=0,
+                pooling=linear_probe.SPATIAL_FLATTEN_POOLING,
+                recompute_features=False,
+                overwrite=False,
+            )
+            summary = train_probe.run(args)
+            self.assertEqual(summary["pooling"], linear_probe.SPATIAL_FLATTEN_POOLING)
+            self.assertEqual(summary["feature_dim"], 30 * 192)
+            cache = torch.load(
+                root / "linear-probe-2d/features/train.pt", weights_only=False
+            )
+            self.assertEqual(cache["features"].shape, (4, 30 * 192))
+            self.assertEqual(
+                cache["metadata"]["pooling"],
+                linear_probe.SPATIAL_FLATTEN_POOLING,
             )
 
 

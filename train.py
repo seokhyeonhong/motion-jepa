@@ -25,7 +25,13 @@ from helper import (
     init_mjepa_model_from_config,
     init_opt,
 )
-from mask import MaskCollator1D, MaskCollator2D, PatchMaskCollator1D
+from mask import (
+    MaskCollator1D,
+    MaskCollator2D,
+    PatchBodyRegionSegmentMaskCollator2D,
+    PatchMaskCollator1D,
+    PatchMaskCollator2D,
+)
 from model import MODEL_FACTORIES, PREDICTOR_FACTORIES, TokenLayout
 from mask.utils import (
     apply_index_masks,
@@ -94,6 +100,28 @@ def _write_tensorboard_interval(
     writer.flush()
 
 
+def _write_tensorboard_linear_probe(
+    writer,
+    *,
+    global_step: int,
+    summary: dict,
+    best_val_top1: float,
+) -> None:
+    if writer is None:
+        return
+    scalars = {
+        "linear_probe/val_top1_accuracy": float(
+            summary["best_val"]["top1_accuracy"]
+        ),
+        "linear_probe/test_top1_accuracy": float(summary["test"]["top1_accuracy"]),
+        "linear_probe/best_val_top1_accuracy": float(best_val_top1),
+        "linear_probe/probe_best_epoch": float(summary["best_epoch"]),
+    }
+    for name, value in scalars.items():
+        writer.add_scalar(name, value, global_step)
+    writer.flush()
+
+
 @torch.no_grad()
 def update_ema(online, target, momentum: float) -> None:
     for online_parameter, target_parameter in zip(
@@ -121,6 +149,14 @@ def restore_rng_state(state: dict) -> None:
     torch.set_rng_state(state["torch"])
     if "cuda" in state and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _evaluate_online_probe_preserving_rng(evaluator, encoder) -> dict:
+    rng_state = capture_rng_state()
+    try:
+        return evaluator.evaluate(encoder)
+    finally:
+        restore_rng_state(rng_state)
 
 
 def _atomic_torch_save(payload: dict, path: Path) -> None:
@@ -155,6 +191,9 @@ def _save_checkpoint(
     rank: int,
     config: dict,
     architecture: dict | None = None,
+    linear_probe_latest: dict | None = None,
+    best_probe_val_top1: float = float("-inf"),
+    best_probe_epoch: int | None = None,
 ) -> None:
     rng_states = all_gather_objects(capture_rng_state())
     mask_states = all_gather_objects(mask_collator.state_dict())
@@ -177,6 +216,9 @@ def _save_checkpoint(
         "world_size": int(world_size),
         "loss": float(loss),
         "config": config,
+        "linear_probe_latest": linear_probe_latest,
+        "best_probe_val_top1": float(best_probe_val_top1),
+        "best_probe_epoch": best_probe_epoch,
     }
     if architecture is not None:
         payload["architecture"] = architecture
@@ -199,6 +241,7 @@ def _load_checkpoint(
     rank: int,
     world_size: int,
     architecture: dict | None = None,
+    linear_probe_state: dict | None = None,
 ) -> tuple[int, int]:
     # Full training checkpoints contain trusted local Python/NumPy RNG state,
     # optimizer state, and scheduler state in addition to tensor weights.
@@ -232,11 +275,51 @@ def _load_checkpoint(
     momentum_scheduler.load_state_dict(checkpoint["momentum_scheduler"])
     mask_collator.load_state_dict(checkpoint["mask_states"][rank])
     restore_rng_state(checkpoint["rng_states"][rank])
+    if linear_probe_state is not None:
+        linear_probe_state.update(
+            latest=checkpoint.get("linear_probe_latest"),
+            best_val_top1=float(checkpoint.get("best_probe_val_top1", float("-inf"))),
+            best_epoch=checkpoint.get("best_probe_epoch"),
+        )
     return int(checkpoint["next_epoch"]), int(checkpoint["global_step"])
 
 
 def _build_mask_collator(args: dict, layout: TokenLayout):
     mask = args["mask"]
+    strategy = str(mask.get("strategy", "multiblock"))
+    if strategy == "body_region_segment":
+        if layout.kind != "2d" or not layout.patchified:
+            raise ValueError(
+                "mask.strategy='body_region_segment' requires patchified 2D tokens"
+            )
+        patch = args["patch"]
+        if str(patch["spatial_grouping"]) != "coarse7":
+            raise ValueError(
+                "mask.strategy='body_region_segment' requires spatial_grouping='coarse7'"
+            )
+        if int(mask["num_enc_masks"]) != 1 or int(mask["num_pred_masks"]) != 1:
+            raise ValueError(
+                "mask.strategy='body_region_segment' requires one encoder and one target mask"
+            )
+        if bool(mask["allow_overlap"]):
+            raise ValueError(
+                "mask.strategy='body_region_segment' requires allow_overlap=false"
+            )
+        return PatchBodyRegionSegmentMaskCollator2D(
+            raw_num_frames=layout.raw_num_frames,
+            raw_num_joints=int(layout.raw_num_joints),
+            token_num_joints=int(layout.token_num_joints),
+            temporal_patch_size=layout.temporal_patch_size,
+            spatial_grouping=str(patch["spatial_grouping"]),
+            spatial_pooling=str(patch["spatial_pooling"]),
+            pred_frame_mask_ratio=tuple(mask["pred_frame_mask_ratio"]),
+            graph_mask_ratio=tuple(mask["graph_mask_ratio"]),
+            num_regions=int(mask.get("num_regions", 1)),
+        )
+    if strategy != "multiblock":
+        raise ValueError(
+            f"Unknown mask.strategy {strategy!r}; choose one of: body_region_segment, multiblock"
+        )
     common = dict(
         enc_frame_mask_ratio=tuple(mask["enc_frame_mask_ratio"]),
         pred_frame_mask_ratio=tuple(mask["pred_frame_mask_ratio"]),
@@ -252,9 +335,22 @@ def _build_mask_collator(args: dict, layout: TokenLayout):
                 **common,
             )
         return MaskCollator1D(num_frames=layout.token_num_frames, **common)
+    if layout.patchified:
+        patch = args["patch"]
+        return PatchMaskCollator2D(
+            raw_num_frames=layout.raw_num_frames,
+            raw_num_joints=int(layout.raw_num_joints),
+            token_num_joints=int(layout.token_num_joints),
+            temporal_patch_size=layout.temporal_patch_size,
+            spatial_grouping=str(patch["spatial_grouping"]),
+            spatial_pooling=str(patch["spatial_pooling"]),
+            enc_joint_mask_ratio=tuple(mask["enc_joint_mask_ratio"]),
+            pred_joint_mask_ratio=tuple(mask["pred_joint_mask_ratio"]),
+            **common,
+        )
     return MaskCollator2D(
         num_frames=layout.token_num_frames,
-        num_joints=int(args["data"]["num_joints"]),
+        num_joints=int(layout.token_num_joints),
         enc_joint_mask_ratio=tuple(mask["enc_joint_mask_ratio"]),
         pred_joint_mask_ratio=tuple(mask["pred_joint_mask_ratio"]),
         **common,
@@ -299,6 +395,15 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     meta_args = args["meta"]
     opt_args = args["optimization"]
     log_args = args["logging"]
+    probe_args = args.get("linear_probe", {})
+    if not isinstance(probe_args, dict):
+        raise ValueError("linear_probe config must be a mapping")
+    probe_enabled = bool(probe_args.get("enabled", False))
+    probe_frequency = int(
+        probe_args.get("frequency", log_args.get("checkpoint_freq", 50))
+    )
+    if probe_enabled and probe_frequency <= 0:
+        raise ValueError("linear_probe.frequency must be positive")
     model_name = str(meta_args["model_name"])
     if model_name not in MODEL_FACTORIES:
         raise ValueError(f"Unknown Motion-JEPA model_name: {model_name!r}")
@@ -374,7 +479,13 @@ def main(args: dict, resume_preempt: bool = False, device=None):
 
     start_epoch = 0
     global_step = 0
+    linear_probe_state = {
+        "latest": None,
+        "best_val_top1": float("-inf"),
+        "best_epoch": None,
+    }
     latest_path = output / f"{log_args['write_tag']}-latest.pth.tar"
+    best_accuracy_path = output / f"{log_args['write_tag']}-best-accuracy.pth.tar"
     should_load = resume_requested
     if should_load:
         read_name = meta_args.get("read_checkpoint")
@@ -396,6 +507,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             rank=rank,
             world_size=world_size,
             architecture=architecture,
+            linear_probe_state=linear_probe_state,
         )
         logger.info("Resumed %s at epoch=%d global_step=%d", load_path, start_epoch, global_step)
 
@@ -436,6 +548,19 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         )
         tensorboard_writer = _make_tensorboard_writer(log_args, output, global_step)
 
+    online_linear_probe = None
+    if probe_enabled and distributed.is_main:
+        from experiment.linear_probe.online import OnlineLinearProbe
+
+        online_linear_probe = OnlineLinearProbe(args, probe_args, device=device)
+        logger.info(
+            "Enabled online linear probe on %s (epochs=%d, lr=%.3g, frequency=%d)",
+            online_linear_probe.dataset_root,
+            online_linear_probe.epochs,
+            online_linear_probe.learning_rate,
+            probe_frequency,
+        )
+
     use_bfloat16 = bool(meta_args.get("use_bfloat16", False))
     use_float16 = bool(meta_args.get("use_float16", False))
     if use_bfloat16 and use_float16:
@@ -446,10 +571,83 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     epochs = int(opt_args["epochs"])
     checkpoint_frequency = int(log_args.get("checkpoint_freq", 50))
     log_frequency = int(log_args.get("log_freq", 10))
+    if checkpoint_frequency <= 0:
+        raise ValueError("logging.checkpoint_freq must be positive")
     if log_frequency <= 0:
         raise ValueError("logging.log_freq must be positive")
     warmup = float(opt_args["warmup"])
     clip_grad = float(opt_args["clip_grad"]) if opt_args.get("clip_grad") is not None else None
+
+    def run_online_linear_probe(pretrain_epoch: int) -> bool:
+        if not distributed.is_main:
+            return False
+        if online_linear_probe is None:
+            raise RuntimeError("Online linear probe was not initialized on rank 0")
+        probe_summary = _evaluate_online_probe_preserving_rng(
+            online_linear_probe, target_encoder
+        )
+        val_top1 = float(probe_summary["best_val"]["top1_accuracy"])
+        test_top1 = float(probe_summary["test"]["top1_accuracy"])
+        linear_probe_state["latest"] = {
+            "pretrain_epoch": pretrain_epoch,
+            "global_step": global_step,
+            **probe_summary,
+        }
+        improved = val_top1 > float(linear_probe_state["best_val_top1"])
+        if improved:
+            linear_probe_state["best_val_top1"] = val_top1
+            linear_probe_state["best_epoch"] = pretrain_epoch
+        _write_tensorboard_linear_probe(
+            tensorboard_writer,
+            global_step=global_step,
+            summary=probe_summary,
+            best_val_top1=float(linear_probe_state["best_val_top1"]),
+        )
+        logger.info(
+            "epoch=%d linear_probe val_top1=%.4f test_top1=%.4f "
+            "best_val_top1=%.4f best_epoch=%s",
+            pretrain_epoch,
+            val_top1,
+            test_top1,
+            float(linear_probe_state["best_val_top1"]),
+            linear_probe_state["best_epoch"],
+        )
+        return improved
+
+    # Establish a frozen-encoder baseline before the first optimization step.
+    # A resumed epoch-0 checkpoint already contains this result, so do not
+    # repeat the relatively expensive probe in that case.
+    if (
+        probe_enabled
+        and start_epoch == 0
+        and linear_probe_state["latest"] is None
+    ):
+        initial_probe_improved = run_online_linear_probe(pretrain_epoch=0)
+        _save_checkpoint(
+            latest_path,
+            encoder=encoder,
+            predictor=predictor,
+            target_encoder=target_encoder,
+            optimizer=optimizer,
+            scaler=scaler,
+            lr_scheduler=lr_scheduler,
+            wd_scheduler=wd_scheduler,
+            momentum_scheduler=momentum_scheduler,
+            mask_collator=mask_collator,
+            next_epoch=0,
+            global_step=global_step,
+            loss=float("nan"),
+            world_size=world_size,
+            rank=rank,
+            config=args,
+            architecture=architecture,
+            linear_probe_latest=linear_probe_state["latest"],
+            best_probe_val_top1=float(linear_probe_state["best_val_top1"]),
+            best_probe_epoch=linear_probe_state["best_epoch"],
+        )
+        if distributed.is_main and initial_probe_improved:
+            _atomic_copy(latest_path, best_accuracy_path)
+        barrier()
 
     # These meters span epoch boundaries and reset only after a log event, so
     # every TensorBoard point summarizes exactly the steps since the prior one.
@@ -578,6 +776,13 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             if not np.isfinite(reported_loss):
                 raise FloatingPointError(f"Non-finite loss at step {global_step}: {reported_loss}")
 
+        should_probe = probe_enabled and (
+            (epoch + 1) % probe_frequency == 0 or (epoch + 1) == epochs
+        )
+        probe_improved = False
+        if should_probe and distributed.is_main:
+            probe_improved = run_online_linear_probe(pretrain_epoch=epoch + 1)
+
         _save_checkpoint(
             latest_path,
             encoder=encoder,
@@ -596,6 +801,9 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             rank=rank,
             config=args,
             architecture=architecture,
+            linear_probe_latest=linear_probe_state["latest"],
+            best_probe_val_top1=float(linear_probe_state["best_val_top1"]),
+            best_probe_epoch=linear_probe_state["best_epoch"],
         )
         if distributed.is_main and (epoch + 1) % checkpoint_frequency == 0:
             checkpoint_path = output / f"{log_args['write_tag']}-ep{epoch + 1}.pth.tar"
@@ -603,6 +811,8 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             # Copy its bytes instead of loading arbitrary pickle content merely
             # to create the named epoch snapshot.
             _atomic_copy(latest_path, checkpoint_path)
+        if distributed.is_main and probe_improved:
+            _atomic_copy(latest_path, best_accuracy_path)
         barrier()
         logger.info("epoch=%d average_loss=%.6f", epoch + 1, loss_meter.avg)
 

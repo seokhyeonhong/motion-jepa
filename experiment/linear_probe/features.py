@@ -31,6 +31,8 @@ from .dataset import StyleMotionDataset  # noqa: E402
 
 SPLITS = ("train", "val", "test")
 CACHE_FORMAT_VERSION = 1
+GLOBAL_MEAN_POOLING = "valid_token_mean"
+SPATIAL_FLATTEN_POOLING = "temporal_mean_spatial_flatten"
 
 
 @dataclass(frozen=True)
@@ -156,6 +158,13 @@ def load_frozen_encoder(
         "patchified": bool(encoder.token_layout.patchified),
         "use_bfloat16": bool(meta_config.get("use_bfloat16", False)),
     }
+    if encoder.token_layout.kind == "2d":
+        info["token_num_joints"] = int(encoder.token_layout.token_num_joints)
+    if hasattr(encoder, "spatial_grouping"):
+        info.update(
+            spatial_grouping=str(encoder.spatial_grouping),
+            spatial_pooling=str(encoder.spatial_pooling),
+        )
     return encoder, config, info
 
 
@@ -185,8 +194,9 @@ def pool_encoder_output(
     output: torch.Tensor,
     valid_length: torch.Tensor,
     token_layout=None,
+    pooling: str = GLOBAL_MEAN_POOLING,
 ) -> torch.Tensor:
-    """Mean-pool valid 1D frame tokens or valid 2D frame-by-joint cells."""
+    """Pool valid encoder tokens for a frozen linear probe."""
     frames = output.shape[1]
     if token_layout is not None:
         valid_length = token_layout.valid_token_lengths(valid_length)
@@ -194,6 +204,19 @@ def pool_encoder_output(
         torch.arange(frames, device=output.device).unsqueeze(0)
         < valid_length.to(device=output.device).unsqueeze(1)
     )
+    if pooling == SPATIAL_FLATTEN_POOLING:
+        if output.ndim != 4:
+            raise ValueError(
+                f"{SPATIAL_FLATTEN_POOLING} requires 2D output [B,T,J,D], "
+                f"got {tuple(output.shape)}"
+            )
+        weights = valid_frames[:, :, None, None].to(dtype=output.dtype)
+        temporal_mean = (output * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(
+            1.0
+        )
+        return temporal_mean.flatten(start_dim=1)
+    if pooling != GLOBAL_MEAN_POOLING:
+        raise ValueError(f"Unknown linear-probe pooling: {pooling!r}")
     if output.ndim == 3:
         weights = valid_frames.unsqueeze(-1).to(dtype=output.dtype)
         return (output * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
@@ -214,8 +237,16 @@ def build_cache_metadata(
     stats_root: Path,
     model_info: dict[str, Any],
     class_names: list[str],
+    pooling: str = GLOBAL_MEAN_POOLING,
 ) -> dict[str, Any]:
-    return {
+    feature_dim = int(model_info["feature_dim"])
+    if pooling == SPATIAL_FLATTEN_POOLING:
+        if model_info.get("kind") != "2d":
+            raise ValueError(f"{SPATIAL_FLATTEN_POOLING} is only valid for 2D encoders")
+        feature_dim *= int(model_info["token_num_joints"])
+    elif pooling != GLOBAL_MEAN_POOLING:
+        raise ValueError(f"Unknown linear-probe pooling: {pooling!r}")
+    metadata = {
         "format_version": CACHE_FORMAT_VERSION,
         "split": split,
         "checkpoint_sha256": _sha256_file(checkpoint_path),
@@ -227,14 +258,18 @@ def build_cache_metadata(
         "num_frames": model_info["num_frames"],
         "motion_dim": model_info["motion_dim"],
         "fps": model_info["fps"],
-        "feature_dim": model_info["feature_dim"],
+        "feature_dim": feature_dim,
         "token_num_frames": model_info["token_num_frames"],
         "temporal_patch_size": model_info["temporal_patch_size"],
         "patchified": model_info["patchified"],
         "kind": model_info["kind"],
-        "pooling": "valid_token_mean",
+        "pooling": pooling,
         "class_names": class_names,
     }
+    for key in ("token_num_joints", "spatial_grouping", "spatial_pooling"):
+        if key in model_info:
+            metadata[key] = model_info[key]
+    return metadata
 
 
 def _validate_feature_cache(payload: dict[str, Any], expected: dict[str, Any]) -> None:
@@ -267,6 +302,8 @@ def extract_features(
     batch_size: int,
     num_workers: int,
     use_bfloat16: bool,
+    show_progress: bool = True,
+    pooling: str = GLOBAL_MEAN_POOLING,
 ) -> dict[str, Any]:
     loader = DataLoader(
         dataset,
@@ -280,7 +317,11 @@ def extract_features(
     label_batches = []
     sample_ids: list[str] = []
     with torch.inference_mode():
-        for motion, fps, length, labels, ids in tqdm(loader, desc="Extract features"):
+        for motion, fps, length, labels, ids in tqdm(
+            loader,
+            desc="Extract features",
+            disable=not show_progress,
+        ):
             motion = motion.to(device=device, dtype=torch.float32, non_blocking=True)
             fps = fps.to(device=device, dtype=torch.float32, non_blocking=True)
             length = length.to(device=device, non_blocking=True)
@@ -295,7 +336,9 @@ def extract_features(
             )
             with amp_context:
                 encoded = encoder(motion, fps, valid_frames=valid_frames)
-                pooled = pool_encoder_output(encoded, length, encoder.token_layout)
+                pooled = pool_encoder_output(
+                    encoded, length, encoder.token_layout, pooling=pooling
+                )
             feature_batches.append(pooled.float().cpu())
             label_batches.append(labels.to(dtype=torch.long).cpu())
             sample_ids.extend(list(ids))
@@ -320,6 +363,7 @@ def load_or_extract_split(
     num_workers: int,
     use_bfloat16: bool,
     recompute: bool,
+    pooling: str = GLOBAL_MEAN_POOLING,
 ) -> dict[str, Any]:
     if cache_path.is_file() and not recompute:
         payload = torch.load(cache_path, map_location="cpu", weights_only=False)
@@ -332,6 +376,7 @@ def load_or_extract_split(
         batch_size=batch_size,
         num_workers=num_workers,
         use_bfloat16=use_bfloat16,
+        pooling=pooling,
     )
     payload["metadata"] = metadata
     _validate_feature_cache(payload, metadata)
@@ -341,9 +386,11 @@ def load_or_extract_split(
 
 __all__ = [
     "CACHE_FORMAT_VERSION",
+    "GLOBAL_MEAN_POOLING",
     "Metrics",
     "PROJECT_ROOT",
     "SPLITS",
+    "SPATIAL_FLATTEN_POOLING",
     "build_cache_metadata",
     "extract_features",
     "load_frozen_encoder",

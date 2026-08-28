@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 from dataclasses import asdict
@@ -18,6 +19,8 @@ from .dataset import build_style_datasets, load_style_label_index
 from .features import (
     PROJECT_ROOT,
     SPLITS,
+    GLOBAL_MEAN_POOLING,
+    SPATIAL_FLATTEN_POOLING,
     Metrics,
     _atomic_json_save,
     _atomic_torch_save,
@@ -92,8 +95,8 @@ def evaluate_classifier(
 def train_linear_probe(
     caches: dict[str, dict[str, Any]],
     *,
-    output: Path,
-    checkpoint_path: Path,
+    output: Path | None,
+    checkpoint_path: Path | None,
     checkpoint_key: str,
     class_names: list[str],
     device: torch.device,
@@ -125,8 +128,8 @@ def train_linear_probe(
         shuffle=True,
         generator=generator,
     )
-    metrics_path = output / "metrics.csv"
-    best_path = output / "linear-probe-best.pth.tar"
+    metrics_path = None if output is None else output / "metrics.csv"
+    best_path = None if output is None else output / "linear-probe-best.pth.tar"
     best_accuracy = -1.0
     best_epoch = 0
     fields = [
@@ -141,9 +144,16 @@ def train_linear_probe(
         "val_macro_accuracy",
         "val_top5_accuracy",
     ]
-    with metrics_path.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=fields)
-        writer.writeheader()
+    file = (
+        None
+        if metrics_path is None
+        else metrics_path.open("w", encoding="utf-8", newline="")
+    )
+    try:
+        writer = None if file is None else csv.DictWriter(file, fieldnames=fields)
+        if writer is not None:
+            writer.writeheader()
+        best = None
         for epoch in range(1, epochs + 1):
             classifier.train()
             current_lr = float(optimizer.param_groups[0]["lr"])
@@ -176,29 +186,35 @@ def train_linear_probe(
                 **{f"train_{key}": value for key, value in asdict(train_metrics).items()},
                 **{f"val_{key}": value for key, value in asdict(val_metrics).items()},
             }
-            writer.writerow(row)
-            file.flush()
+            if writer is not None:
+                writer.writerow(row)
+                file.flush()
             if val_metrics.top1_accuracy > best_accuracy:
                 best_accuracy = val_metrics.top1_accuracy
                 best_epoch = epoch
-                _atomic_torch_save(
-                    {
-                        "format_version": 1,
-                        "classifier": classifier.state_dict(),
-                        "feature_dim": feature_dim,
-                        "num_classes": num_classes,
-                        "class_names": class_names,
-                        "epoch": epoch,
-                        "val_metrics": asdict(val_metrics),
-                        "checkpoint": str(checkpoint_path),
-                        "checkpoint_key": checkpoint_key,
-                        "run_args": run_args,
-                    },
-                    best_path,
-                )
+                best = {
+                    "format_version": 1,
+                    "classifier": copy.deepcopy(classifier.state_dict()),
+                    "feature_dim": feature_dim,
+                    "num_classes": num_classes,
+                    "class_names": class_names,
+                    "epoch": epoch,
+                    "val_metrics": asdict(val_metrics),
+                    "checkpoint": None if checkpoint_path is None else str(checkpoint_path),
+                    "checkpoint_key": checkpoint_key,
+                    "run_args": run_args,
+                }
+                if best_path is not None:
+                    _atomic_torch_save(best, best_path)
             scheduler.step()
+    finally:
+        if file is not None:
+            file.close()
 
-    best = torch.load(best_path, map_location=device, weights_only=False)
+    if best_path is not None:
+        best = torch.load(best_path, map_location=device, weights_only=False)
+    if best is None:
+        raise RuntimeError("Linear probe did not produce a validation-best head")
     classifier.load_state_dict(best["classifier"], strict=True)
     test_metrics = evaluate_classifier(
         classifier,
@@ -234,8 +250,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--num-workers must be non-negative")
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
     dataset_root = Path(args.dataset_root).expanduser().resolve()
+    pooling = str(getattr(args, "pooling", GLOBAL_MEAN_POOLING))
     output = (
-        checkpoint_path.parent / "linear-probe"
+        checkpoint_path.parent
+        / ("linear-probe-2d" if pooling == SPATIAL_FLATTEN_POOLING else "linear-probe")
         if args.output is None
         else Path(args.output).expanduser().resolve()
     )
@@ -257,6 +275,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.checkpoint_key,
         device,
     )
+    if pooling == SPATIAL_FLATTEN_POOLING and model_info["kind"] != "2d":
+        raise ValueError(
+            f"{SPATIAL_FLATTEN_POOLING} requires a 2D encoder, "
+            f"got {model_info['model_name']}"
+        )
     stats_root = resolve_pretraining_stats(config, args.stats_path)
     label_index = load_style_label_index(dataset_root)
     class_names = list(label_index.class_names)
@@ -287,6 +310,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             stats_root=stats_root,
             model_info=model_info,
             class_names=class_names,
+            pooling=pooling,
         )
         caches[split] = load_or_extract_split(
             split=split,
@@ -299,6 +323,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             num_workers=args.num_workers,
             use_bfloat16=model_info["use_bfloat16"],
             recompute=args.recompute_features,
+            pooling=pooling,
         )
 
     if any(parameter.grad is not None for parameter in encoder.parameters()):
@@ -325,7 +350,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "dataset_root": str(dataset_root),
             "stats_root": str(stats_root),
             "model_name": model_info["model_name"],
-            "pooling": "valid_token_mean",
+            "pooling": pooling,
             "seed": args.seed,
         }
     )
@@ -347,7 +372,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Linear-probe result directory "
-            "(default: <checkpoint directory>/linear-probe)"
+            "(default: <checkpoint directory>/linear-probe, or linear-probe-2d "
+            "for temporal_mean_spatial_flatten)"
         ),
     )
     parser.add_argument(
@@ -365,6 +391,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--pooling",
+        choices=(GLOBAL_MEAN_POOLING, SPATIAL_FLATTEN_POOLING),
+        default=GLOBAL_MEAN_POOLING,
+        help=(
+            "Feature pooling before the linear head. temporal_mean_spatial_flatten "
+            "is the group-aware 2D probe."
+        ),
+    )
     parser.add_argument("--recompute-features", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser

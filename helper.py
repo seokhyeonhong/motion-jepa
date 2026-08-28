@@ -13,6 +13,8 @@ from model import (
     PATCH_PREDICTOR_NAMES,
     PREDICTOR_FACTORIES,
     PREDICTOR_KINDS,
+    get_spatial_grouping,
+    spatial_patch_signature,
 )
 from utils.schedulers import CosineWDSchedule, WarmupCosineSchedule
 
@@ -28,6 +30,8 @@ def init_mjepa_model(
     model_name: str,
     predictor_name: str,
     temporal_patch_size: int = 1,
+    spatial_grouping: str = "fine11",
+    spatial_pooling: str = "graph_mean",
 ):
     try:
         factory = MODEL_FACTORIES[model_name]
@@ -40,6 +44,11 @@ def init_mjepa_model(
         encoder_kwargs["temporal_patch_size"] = int(temporal_patch_size)
     if MODEL_KINDS[model_name] == "2d":
         encoder_kwargs["num_joints"] = num_joints
+        if is_patch_model:
+            encoder_kwargs.update(
+                spatial_grouping=str(spatial_grouping),
+                spatial_pooling=str(spatial_pooling),
+            )
     encoder = factory(**encoder_kwargs)
 
     try:
@@ -53,6 +62,11 @@ def init_mjepa_model(
         predictor_kwargs["temporal_patch_size"] = int(temporal_patch_size)
     if PREDICTOR_KINDS[predictor_name] == "2d":
         predictor_kwargs["num_joints"] = num_joints
+        if is_patch_predictor:
+            predictor_kwargs.update(
+                spatial_grouping=str(spatial_grouping),
+                spatial_pooling=str(spatial_pooling),
+            )
     predictor = pred_factory(**predictor_kwargs)
     if encoder.token_layout != predictor.token_layout:
         raise ValueError(
@@ -67,10 +81,21 @@ def patch_size_from_config(config: dict) -> int:
     return int(patch.get("temporal_patch_size", 1)) if isinstance(patch, dict) else 1
 
 
+def spatial_patch_from_config(config: dict) -> tuple[str, str]:
+    patch = config.get("patch")
+    if not isinstance(patch, dict):
+        return "fine11", "graph_mean"
+    return (
+        str(patch.get("spatial_grouping", "fine11")),
+        str(patch.get("spatial_pooling", "graph_mean")),
+    )
+
+
 def init_mjepa_model_from_config(config: dict, device: torch.device):
     data = config["data"]
     meta = config["meta"]
-    return init_mjepa_model(
+    grouping, pooling = spatial_patch_from_config(config)
+    encoder, predictor = init_mjepa_model(
         device=device,
         num_frames=int(data["num_frames"]),
         motion_dim=int(data["motion_dim"]),
@@ -78,7 +103,15 @@ def init_mjepa_model_from_config(config: dict, device: torch.device):
         model_name=str(meta["model_name"]),
         predictor_name=str(meta["predictor_name"]),
         temporal_patch_size=patch_size_from_config(config),
+        spatial_grouping=grouping,
+        spatial_pooling=pooling,
     )
+    if hasattr(predictor, "_packed_spatial_disjoint"):
+        mask = config.get("mask")
+        predictor._packed_spatial_disjoint = (
+            isinstance(mask, dict) and not bool(mask.get("allow_overlap", False))
+        )
+    return encoder, predictor
 
 
 def init_mjepa_encoder_from_config(config: dict, device: torch.device):
@@ -100,6 +133,9 @@ def init_mjepa_encoder_from_config(config: dict, device: torch.device):
         kwargs["temporal_patch_size"] = patch_size_from_config(config)
     if MODEL_KINDS[model_name] == "2d":
         kwargs["num_joints"] = int(data["num_joints"])
+        if model_name in PATCH_MODEL_NAMES:
+            grouping, pooling = spatial_patch_from_config(config)
+            kwargs.update(spatial_grouping=grouping, spatial_pooling=pooling)
     return factory(**kwargs).to(device)
 
 
@@ -111,13 +147,27 @@ def architecture_signature(
     predictor_name: str,
     motion_dim: int,
 ) -> dict:
-    return {
+    signature = {
         "model_name": str(model_name),
         "predictor_name": str(predictor_name),
         "motion_dim": int(motion_dim),
         "encoder_layout": encoder.token_layout.signature(),
         "predictor_layout": predictor.token_layout.signature(),
     }
+    encoder_spatial = getattr(encoder, "spatial_patch_signature", None)
+    predictor_spatial = getattr(predictor, "spatial_patch_signature", None)
+    if encoder_spatial is not None or predictor_spatial is not None:
+        if encoder_spatial is None or predictor_spatial is None:
+            raise ValueError("Encoder and predictor spatial patch configurations differ")
+        encoder_signature = encoder_spatial()
+        predictor_signature = predictor_spatial()
+        if encoder_signature != predictor_signature:
+            raise ValueError(
+                "Encoder and predictor spatial patch configurations differ: "
+                f"encoder={encoder_signature}, predictor={predictor_signature}"
+            )
+        signature["spatial_patch"] = encoder_signature
+    return signature
 
 
 def architecture_signature_from_config(config: dict) -> dict:
@@ -132,9 +182,20 @@ def architecture_signature_from_config(config: dict) -> dict:
     raw_frames = int(data["num_frames"])
     kind = MODEL_KINDS[model_name]
     predictor_kind = PREDICTOR_KINDS[predictor_name]
+    grouping, pooling = spatial_patch_from_config(config)
+    has_spatial_patch = (
+        (kind == "2d" and patchified)
+        or (predictor_kind == "2d" and predictor_patchified)
+    )
+    if has_spatial_patch and pooling != "graph_mean":
+        raise ValueError("Patchified 2D models support only graph_mean pooling")
+    token_joints = len(get_spatial_grouping(grouping)) if has_spatial_patch else None
 
     def layout_signature(layout_kind: str, is_patch: bool, size: int) -> dict:
         joints = int(data["num_joints"]) if layout_kind == "2d" else None
+        pooled_joints = (
+            int(token_joints) if layout_kind == "2d" and is_patch else joints
+        )
         return {
             "kind": layout_kind,
             "patchified": is_patch,
@@ -142,10 +203,10 @@ def architecture_signature_from_config(config: dict) -> dict:
             "token_num_frames": raw_frames // size,
             "temporal_patch_size": size,
             "raw_num_joints": joints,
-            "token_num_joints": joints,
+            "token_num_joints": pooled_joints,
         }
 
-    return {
+    signature = {
         "model_name": model_name,
         "predictor_name": predictor_name,
         "motion_dim": int(data["motion_dim"]),
@@ -154,6 +215,9 @@ def architecture_signature_from_config(config: dict) -> dict:
             predictor_kind, predictor_patchified, predictor_patch_size
         ),
     }
+    if kind == "2d" and patchified:
+        signature["spatial_patch"] = spatial_patch_signature(grouping)
+    return signature
 
 
 def init_opt(
@@ -210,4 +274,5 @@ __all__ = [
     "init_mjepa_model_from_config",
     "init_opt",
     "patch_size_from_config",
+    "spatial_patch_from_config",
 ]

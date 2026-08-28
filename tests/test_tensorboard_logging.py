@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from train import _write_tensorboard_interval
+from train import _write_tensorboard_interval, _write_tensorboard_linear_probe
 
 
 class _Writer:
@@ -54,6 +54,32 @@ class TensorBoardLoggingTest(unittest.TestCase):
             grad_last=0.0,
             grad_average=0.0,
         )
+
+    def test_linear_probe_values_are_emitted_at_the_pretraining_step(self):
+        writer = _Writer()
+        _write_tensorboard_linear_probe(
+            writer,
+            global_step=300,
+            summary={
+                "best_epoch": 17,
+                "best_val": {"top1_accuracy": 0.8},
+                "test": {"top1_accuracy": 0.75},
+            },
+            best_val_top1=0.82,
+        )
+        self.assertEqual(
+            writer.scalars["linear_probe/val_top1_accuracy"], (0.8, 300)
+        )
+        self.assertEqual(
+            writer.scalars["linear_probe/test_top1_accuracy"], (0.75, 300)
+        )
+        self.assertEqual(
+            writer.scalars["linear_probe/best_val_top1_accuracy"], (0.82, 300)
+        )
+        self.assertEqual(
+            writer.scalars["linear_probe/probe_best_epoch"], (17.0, 300)
+        )
+        self.assertEqual(writer.flush_count, 1)
 
 
 if __name__ == "__main__":

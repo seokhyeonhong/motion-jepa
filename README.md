@@ -127,6 +127,31 @@ Visualize processed clips with:
 python visualize_dataset.py dataset/bones-seed-processed --split train --mesh
 ```
 
+Visualize the exact mask collator output for any raw or patchified 1D/2D
+configuration with:
+
+```bash
+python visualize_mask.py \
+  --config configs/mjepa_patch_2d_base_fine11.yaml \
+  --output output/mask-patch-2d-fine11.png \
+  --seed 0 \
+  --valid-length 90
+```
+
+The renderer automatically uses a timeline for 1D layouts and a
+time-by-joint/body-group grid for 2D layouts. Patch timelines annotate both
+token indices and their corresponding raw-frame spans.
+
+For coarse7, set `mask.strategy: body_region_segment` to predict one
+graph-connected body region over a contiguous time segment. Configure the
+temporal extent with `pred_frame_mask_ratio` and the number of connected body
+groups with `graph_mask_ratio`. `num_regions` samples that many cell-disjoint
+segments and trains on their union; the encoder observes the exact complement
+of the target over valid tokens. See
+`configs/mjepa_patch_2d_tiny_coarse7_body_region_segment.yaml` for the default
+2–3 group, 30–60% temporal setup. Omitting `mask.strategy` preserves the
+original multiblock behavior.
+
 ## Model variants
 
 `_1d` uses one token per 366-D frame and temporal transformer attention. Its
@@ -215,13 +240,26 @@ python -m experiment.linear_probe \
   --output output/linear-probe/<run>
 ```
 
+For a 2D encoder, preserve anatomical token identity with the group-aware
+linear probe. It averages only over valid time tokens, flattens the spatial
+tokens, and trains one biased `nn.Linear` head:
+
+```bash
+python -m experiment.linear_probe.train_probe_2d \
+  --checkpoint output/<run>/motion-jepa-patch-2d-p3-coarse7-latest.pth.tar \
+  --dataset-root dataset/100style-soma77-processed
+```
+
+Its default output and feature-cache directory is
+`<checkpoint directory>/linear-probe-2d`, separate from the global-mean probe.
+
 `--output` may be omitted; in that case results are written under
 `<checkpoint directory>/linear-probe`. Supplying it explicitly selects a
 different linear-probe result directory.
 
 The encoder is reconstructed from the checkpoint config and uses the
 pretraining mean and standard deviation, not the 100STYLE statistics. Its
-valid output tokens are globally averaged and cached as `float32` under
+selected pooled features are cached as `float32` under
 `<output>/features`. The probe is a bias-enabled `nn.Linear` trained with
 ordinary cross-entropy and momentum SGD. Use `--overwrite` to rerun the head
 while retaining valid feature caches, or `--recompute-features` when the
@@ -230,6 +268,38 @@ checkpoint, dataset index, statistics, or extraction setup has changed.
 Per-epoch train and validation metrics are written to `metrics.csv`. The head
 with the best validation top-1 accuracy is restored for the single final test
 evaluation recorded in `summary.json`.
+
+To monitor representation quality during pretraining, opt a training config into
+an in-memory 100STYLE probe:
+
+```yaml
+linear_probe:
+  enabled: true
+  # Probe cadence is independent of logging.checkpoint_freq:
+  frequency: 10
+  dataset_root: ./dataset/100style-soma77-processed
+  epochs: 50
+  feature_batch_size: 256
+  batch_size: 256
+  num_workers: 8
+  lr: 0.3
+  momentum: 0.9
+  weight_decay: 0.0
+  seed: 42
+  # Use this for 2D encoders to retain spatial token identity:
+  pooling: temporal_mean_spatial_flatten
+```
+
+The EMA target encoder is evaluated before the first training epoch, at every
+`linear_probe.frequency` epoch, and at the final epoch. When `frequency` is
+omitted, it defaults to `logging.checkpoint_freq` for backward compatibility.
+This cadence does not create additional named epoch checkpoints. Features
+remain in memory rather than being cached per checkpoint. Validation and test
+top-1 are written under the `linear_probe/`
+TensorBoard namespace, while only validation top-1 selects
+`<write_tag>-best-accuracy.pth.tar`. That file is a full resumable training
+checkpoint. Linear probing is disabled when the section is absent or
+`enabled: false`.
 
 Sweep every direct-child latest checkpoint with:
 

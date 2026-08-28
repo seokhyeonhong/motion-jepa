@@ -11,7 +11,9 @@ from .dataset import (
 from .cnn import MotionCNNClassifier
 from .features import (
     CACHE_FORMAT_VERSION,
+    GLOBAL_MEAN_POOLING,
     SPLITS,
+    SPATIAL_FLATTEN_POOLING,
     Metrics,
     _validate_feature_cache,
     build_cache_metadata,
@@ -26,7 +28,9 @@ from .transformer import MotionTransformerClassifier
 
 __all__ = [
     "CACHE_FORMAT_VERSION",
+    "GLOBAL_MEAN_POOLING",
     "SPLITS",
+    "SPATIAL_FLATTEN_POOLING",
     "Metrics",
     "MotionCNNClassifier",
     "MotionTransformerClassifier",
