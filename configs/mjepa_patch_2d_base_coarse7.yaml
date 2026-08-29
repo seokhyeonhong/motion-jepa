@@ -27,6 +27,11 @@ logging:
   tensorboard_folder: tensorboard
   checkpoint_freq: 50
 
+linear_probe:
+  enabled: true
+  frequency: 10
+  pooling: temporal_mean_spatial_flatten
+
 mask:
   allow_overlap: false
   num_enc_masks: 1
