@@ -199,6 +199,32 @@ RoPE settings, and removed model variants fail explicitly. Archived experiment
 outputs and findings remain historical records. Downstream prediction,
 generation, and TMR heads retain their own positional embeddings.
 
+## Online representation metrics
+
+The default config evaluates a fixed, seeded subset of up to 1,024 validation
+clips at iteration 0, every 1,000 iterations, and at the final iteration.
+Control this with `online_metrics.enabled`, `interval`, `meta_file`,
+`num_samples`, `batch_size`, `num_workers`, and `seed`. Metrics are written only
+to TensorBoard under `online_metrics/`; no feature caches or CSV/JSON logs are
+created. Regular `train/` metrics retain their separate 100-iteration interval.
+
+Representation diagnostics use valid-frame mean-pooled EMA encoder features:
+RankMe (uncentered singular values), mean channel standard deviation, average
+pairwise cosine similarity, covariance effective rank, largest eigenvalue share,
+condition number, and off-diagonal covariance magnitude. Raw and per-channel
+standardized features are reported separately, along with temporal variation,
+near-zero channel counts, sample count, and rank ceilings. Rank is a collapse
+diagnostic, not evidence of semantic quality on its own.
+
+Held-out JEPA diagnostics compare the online encoder/predictor against the
+normalized EMA target using fixed independent masks: Smooth L1, MSE, cosine
+similarity, and MSE gain relative to the validation targets' constant mean.
+Smooth L1 weights each mask/sample equally, matching training; MSE and cosine
+weight valid target tokens equally. Padding is excluded everywhere. Evaluation
+runs on rank zero; other ranks wait. Training model modes, RNG state, and the
+training mask stream are preserved. Obsolete spatial-token diagnostics do not
+apply to the current frame-token model.
+
 ## Training
 
 Training is controlled by optimizer iterations, independent of dataset size:

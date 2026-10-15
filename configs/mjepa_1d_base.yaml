@@ -46,9 +46,18 @@ optimization:
   ema: [0.99925, 0.99925]
   iterations: 200000
   final_lr: 1.0e-6
-  final_weight_decay: 0.4
+  final_weight_decay: 0.04
   lr: 0.0005
   start_lr: 0.0001
   warmup_iterations: 20000
   weight_decay: 0.04
   clip_grad: 1.0
+
+online_metrics:
+  enabled: true
+  interval: 1000  # Iterations; also evaluates at initialization and completion.
+  meta_file: val.txt
+  num_samples: 1024
+  batch_size: 64
+  num_workers: 0
+  seed: 42

@@ -20,6 +20,7 @@ import yaml
 from torch.nn.parallel import DistributedDataParallel
 
 from dataset import make_motion_dataset
+from experiment.online_metrics import OnlineRepresentationMetrics, evaluation_interval, tensorboard_metrics
 from helper import (
     architecture_signature,
     architecture_signature_from_config,
@@ -122,6 +123,29 @@ def restore_rng_state(state: dict) -> None:
     torch.set_rng_state(state["torch"])
     if "cuda" in state and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _evaluate_online_metrics(evaluator, encoder, predictor, target_encoder, writer, global_step):
+    """Run on rank zero without changing training modes or stochastic state."""
+    models = (_unwrapped(encoder), _unwrapped(predictor), target_encoder)
+    modes = [model.training for model in models]
+    rng = capture_rng_state()
+    try:
+        for model in models:
+            model.eval()
+        summary = evaluator.evaluate(*models)
+        if writer is not None:
+            for name, value in tensorboard_metrics(summary).items():
+                writer.add_scalar(f"online_metrics/{name}", value, global_step)
+            writer.flush()
+        logger.info("online_metrics iteration=%d rankme=%.3f heldout_loss=%.6f",
+                    global_step, summary["representation"]["raw"]["rankme"],
+                    summary["heldout_jepa"]["smooth_l1"])
+        return summary
+    finally:
+        for model, mode in zip(models, modes):
+            model.train(mode)
+        restore_rng_state(rng)
 
 
 def _run_rank_zero(function, *, is_main: bool):
@@ -363,6 +387,7 @@ def _seed_all(seed: int, device: torch.device) -> None:
 
 def main(args: dict, resume_preempt: bool = False, device=None):
     total_steps, warmup_steps, checkpoint_frequency, log_frequency = _iteration_settings(args)
+    metric_interval = evaluation_interval(args.get("online_metrics", {}))
     if "context" in args.get("loss", {}):
         raise ValueError("loss.context has been removed; training uses masked prediction loss only")
     device = _resolve_device(device)
@@ -525,6 +550,22 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16 if use_float16 else None
     clip_grad = float(opt_args["clip_grad"]) if opt_args.get("clip_grad") is not None else None
 
+    online_metrics = None
+    if metric_interval:
+        def initialize_online_metrics():
+            nonlocal online_metrics
+            online_metrics = OnlineRepresentationMetrics(
+                args, args["online_metrics"], device=device,
+                collator=_build_mask_collator(args, layout),
+            )
+        _run_rank_zero(initialize_online_metrics, is_main=distributed.is_main)
+        if not should_load:
+            _run_rank_zero(
+                lambda: _evaluate_online_metrics(online_metrics, encoder, predictor,
+                                                  target_encoder, tensorboard_writer, global_step),
+                is_main=distributed.is_main,
+            )
+
     # These meters span data passes and reset only after a log event, so
     # every TensorBoard point summarizes exactly the steps since the prior one.
     interval_loss_meter = AverageMeter()
@@ -645,6 +686,13 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                         torch.cuda.reset_peak_memory_stats(device)
             if not np.isfinite(reported_loss):
                 raise FloatingPointError(f"Non-finite loss at step {global_step}: {reported_loss}")
+
+            if metric_interval and (global_step % metric_interval == 0 or global_step == total_steps):
+                _run_rank_zero(
+                    lambda: _evaluate_online_metrics(online_metrics, encoder, predictor,
+                                                      target_encoder, tensorboard_writer, global_step),
+                    is_main=distributed.is_main,
+                )
 
             if global_step % checkpoint_frequency == 0 or global_step == total_steps:
                 _save_checkpoint(
