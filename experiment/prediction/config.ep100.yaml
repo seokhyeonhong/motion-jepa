@@ -1,5 +1,5 @@
 # Downstream reconstruction with the baseline JEPA encoder at pretraining epoch 100.
-jepa_checkpoint: output/mot_patch_base_1d-p3-bs.512-ep.300-nframes150/motion-jepa-patch-1d-p3-ep100.pth.tar
+jepa_checkpoint: output/mot_base_1d-v2-rope-bs.512-ep.300-nframes60-150/motion-jepa-1d-v2-rope-ep100.pth.tar
 cache_root: output/prediction/cache/baseline-ep100
 output: output/prediction/baseline-ep100/seed-42
 epochs: 100

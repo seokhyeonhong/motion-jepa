@@ -14,11 +14,6 @@ data:
   normalize: true
   stats_path: stats
 
-position_encoding:
-  temporal: rope
-  rope_theta: 100.0
-  rope_time_scale: 1.0
-
 logging:
   folder: ./output/mot_small_1d-v2-rope-bs.512-ep.300-nframes60-150
   write_tag: motion-jepa-small-1d-v2-rope

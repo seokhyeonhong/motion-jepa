@@ -8,24 +8,6 @@ import torch
 import torch.nn as nn
 
 
-def normalize_position_encoding(
-    position_encoding: str = "absolute",
-    rope_theta: float = 100.0,
-    rope_time_scale: float = 1.0,
-) -> dict:
-    """Canonical positional settings, including parameter-free model semantics."""
-    if position_encoding not in {"absolute", "rope"}:
-        raise ValueError("position_encoding must be 'absolute' or 'rope'")
-    if position_encoding == "absolute":
-        return {"temporal": "absolute"}
-    theta, time_scale = float(rope_theta), float(rope_time_scale)
-    if not math.isfinite(theta) or theta <= 0:
-        raise ValueError("rope_theta must be finite and positive")
-    if not math.isfinite(time_scale) or time_scale <= 0:
-        raise ValueError("rope_time_scale must be finite and positive")
-    return {"temporal": "rope", "rope_theta": theta, "rope_time_scale": time_scale}
-
-
 def temporal_token_positions(
     num_frames: int,
     fps: torch.Tensor,
@@ -61,10 +43,11 @@ class RotaryPosEmbed1D(nn.Module):
         super().__init__()
         if head_dim <= 0 or head_dim % 2:
             raise ValueError(f"RoPE head_dim must be positive and even, got {head_dim}")
-        settings = normalize_position_encoding("rope", theta, time_scale)
+        if not math.isfinite(theta) or theta <= 0 or not math.isfinite(time_scale) or time_scale <= 0:
+            raise ValueError("RoPE theta and time_scale must be finite and positive")
         self.head_dim = int(head_dim)
-        self.theta = settings["rope_theta"]
-        self.time_scale = settings["rope_time_scale"]
+        self.theta = float(theta)
+        self.time_scale = float(time_scale)
 
     def forward(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Convert ``[B,T]`` timestamps to FP32 ``[B,1,T,D/2]`` cosine/sine."""

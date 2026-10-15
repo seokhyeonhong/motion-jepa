@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from helper import init_mjepa_encoder_from_config  # noqa: E402
+from helper import init_mjepa_encoder_from_config, model_config_from_checkpoint  # noqa: E402
 
 SPLITS = ("train", "val", "test")
 CACHE_FORMAT_VERSION = 1
@@ -139,6 +139,7 @@ def load_frozen_encoder(
         num_joints = int(data_config["num_joints"])
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"Invalid model config in checkpoint: {checkpoint_path}") from error
+    config = model_config_from_checkpoint(checkpoint)
     encoder = init_mjepa_encoder_from_config(config, torch.device("cpu"))
     encoder.load_state_dict(checkpoint[checkpoint_key], strict=True)
     encoder.to(device).eval().requires_grad_(False)

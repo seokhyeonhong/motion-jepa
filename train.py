@@ -1,4 +1,4 @@
-"""MotionJEPA pretraining loop shared by the 1D and 2D variants."""
+"""Frame-token 1D MotionJEPA pretraining loop."""
 
 from __future__ import annotations
 
@@ -27,18 +27,10 @@ from helper import (
     init_mjepa_model_from_config,
     init_opt,
     normalize_architecture_signature,
+    model_config_from_checkpoint,
+    position_encoding_from_model,
 )
-from mask import (
-    MaskCollator1D,
-    MaskCollator1DV2,
-    MaskCollator2D,
-    PatchBodyRegionSegmentMaskCollator2D,
-    PatchMaskCollator1D,
-    PatchMaskCollator1DV2,
-    PatchMaskCollator2D,
-    PatchRandomBodySegmentMaskCollator2D,
-    PatchRandomSpatialSegmentMaskCollator2D,
-)
+from mask import MaskCollator1D, MaskCollator1DV2
 from model import MODEL_FACTORIES, PREDICTOR_FACTORIES, TokenLayout
 from model.context_loss import (
     context_loss_config,
@@ -48,7 +40,6 @@ from model.context_loss import (
 )
 from mask.utils import (
     apply_index_masks,
-    gather_grid_masks,
     index_mask_validity,
     repeat_mask_blocks,
 )
@@ -435,6 +426,7 @@ def _save_checkpoint(
         "world_size": int(world_size),
         "loss": float(loss),
         "config": config,
+        "position_encoding": position_encoding_from_model(_unwrapped(encoder)),
         "linear_probe_latest": linear_probe_latest,
         "best_probe_val_top1": float(best_probe_val_top1),
         "best_probe_epoch": best_probe_epoch,
@@ -482,10 +474,11 @@ def _load_checkpoint(
         raise ValueError(
             f"Exact resume requires world_size={checkpoint['world_size']}, got {world_size}"
         )
+    saved_config = model_config_from_checkpoint(checkpoint)
     if architecture is not None:
         saved_architecture = checkpoint.get("architecture")
         if saved_architecture is None:
-            saved_architecture = architecture_signature_from_config(checkpoint["config"])
+            saved_architecture = architecture_signature_from_config(saved_config)
         if normalize_architecture_signature(saved_architecture) != normalize_architecture_signature(architecture):
             raise ValueError(
                 "Checkpoint architecture differs from the requested run: "
@@ -537,161 +530,27 @@ def _load_checkpoint(
 
 
 def _build_mask_collator(args: dict, layout: TokenLayout):
+    if layout.kind != "1d" or layout.patchified:
+        raise ValueError("Masking supports only 1D frame tokens")
     mask = args["mask"]
     version = str(mask.get("version", "v1"))
     if version not in ("v1", "v2"):
         raise ValueError("mask.version must be 'v1' or 'v2'")
-    if version == "v2" and layout.kind != "1d":
-        raise ValueError("mask.version='v2' currently supports only 1D masks")
+    if mask.get("strategy", "multiblock") != "multiblock":
+        raise ValueError("mask.strategy must be 'multiblock'")
     context_selection = str(mask.get("context_selection", "all" if version == "v2" else "prefix"))
     choices = ("all", "prefix", "random") if version == "v2" else ("prefix", "random")
     if context_selection not in choices:
         raise ValueError(f"mask.context_selection must be one of {choices}")
-    if layout.kind != "1d" and context_selection != "prefix":
-        raise ValueError("mask.context_selection='random' requires a 1D multiblock mask")
-    strategy = str(mask.get("strategy", "multiblock"))
-    if version == "v2" and strategy != "multiblock":
-        raise ValueError("mask.version='v2' requires mask.strategy='multiblock'")
-    if strategy == "random_spatial_segment":
-        if layout.kind != "2d" or not layout.patchified:
-            raise ValueError(
-                "mask.strategy='random_spatial_segment' requires patchified 2D tokens"
-            )
-        patch = args["patch"]
-        if int(mask["num_enc_masks"]) != 1:
-            raise ValueError(
-                "mask.strategy='random_spatial_segment' requires one encoder mask"
-            )
-        if not bool(mask.get("allow_target_overlap", False)):
-            raise ValueError(
-                "random_spatial_segment requires allow_target_overlap=true"
-            )
-        if bool(mask.get("allow_context_target_overlap", False)):
-            raise ValueError(
-                "random_spatial_segment requires allow_context_target_overlap=false"
-            )
-        return PatchRandomSpatialSegmentMaskCollator2D(
-            raw_num_frames=layout.raw_num_frames,
-            raw_num_joints=int(layout.raw_num_joints),
-            token_num_joints=int(layout.token_num_joints),
-            temporal_patch_size=layout.temporal_patch_size,
-            spatial_grouping=str(patch["spatial_grouping"]),
-            spatial_pooling=str(patch["spatial_pooling"]),
-            pred_frame_mask_ratio=tuple(mask["pred_frame_mask_ratio"]),
-            pred_spatial_mask_count=int(mask["pred_spatial_mask_count"]),
-            target_union_ratio=tuple(mask["target_union_ratio"]),
-            npred=int(mask["num_pred_masks"]),
-        )
-    if strategy == "random_body_segment":
-        if layout.kind != "2d" or not layout.patchified:
-            raise ValueError(
-                "mask.strategy='random_body_segment' requires patchified 2D tokens"
-            )
-        patch = args["patch"]
-        if str(patch["spatial_grouping"]) != "coarse7":
-            raise ValueError(
-                "mask.strategy='random_body_segment' requires spatial_grouping='coarse7'"
-            )
-        if int(mask["num_enc_masks"]) != 1:
-            raise ValueError(
-                "mask.strategy='random_body_segment' requires one encoder mask"
-            )
-        if bool(mask["allow_overlap"]):
-            raise ValueError(
-                "mask.strategy='random_body_segment' requires allow_overlap=false"
-            )
-        return PatchRandomBodySegmentMaskCollator2D(
-            raw_num_frames=layout.raw_num_frames,
-            raw_num_joints=int(layout.raw_num_joints),
-            token_num_joints=int(layout.token_num_joints),
-            temporal_patch_size=layout.temporal_patch_size,
-            spatial_grouping=str(patch["spatial_grouping"]),
-            spatial_pooling=str(patch["spatial_pooling"]),
-            pred_frame_mask_ratio=tuple(mask["pred_frame_mask_ratio"]),
-            body_mask_ratio=tuple(mask["body_mask_ratio"]),
-            npred=int(mask["num_pred_masks"]),
-        )
-    if strategy == "body_region_segment":
-        if layout.kind != "2d" or not layout.patchified:
-            raise ValueError(
-                "mask.strategy='body_region_segment' requires patchified 2D tokens"
-            )
-        patch = args["patch"]
-        if str(patch["spatial_grouping"]) != "coarse7":
-            raise ValueError(
-                "mask.strategy='body_region_segment' requires spatial_grouping='coarse7'"
-            )
-        if int(mask["num_enc_masks"]) != 1 or int(mask["num_pred_masks"]) != 1:
-            raise ValueError(
-                "mask.strategy='body_region_segment' requires one encoder and one target mask"
-            )
-        if bool(mask["allow_overlap"]):
-            raise ValueError(
-                "mask.strategy='body_region_segment' requires allow_overlap=false"
-            )
-        return PatchBodyRegionSegmentMaskCollator2D(
-            raw_num_frames=layout.raw_num_frames,
-            raw_num_joints=int(layout.raw_num_joints),
-            token_num_joints=int(layout.token_num_joints),
-            temporal_patch_size=layout.temporal_patch_size,
-            spatial_grouping=str(patch["spatial_grouping"]),
-            spatial_pooling=str(patch["spatial_pooling"]),
-            pred_frame_mask_ratio=tuple(mask["pred_frame_mask_ratio"]),
-            graph_mask_ratio=tuple(mask["graph_mask_ratio"]),
-            num_regions=int(mask.get("num_regions", 1)),
-        )
-    if strategy != "multiblock":
-        raise ValueError(
-            f"Unknown mask.strategy {strategy!r}; choose one of: "
-            "body_region_segment, random_body_segment, random_spatial_segment, multiblock"
-        )
-    common = dict(
-        enc_frame_mask_ratio=tuple(mask["enc_frame_mask_ratio"]),
-        pred_frame_mask_ratio=tuple(mask["pred_frame_mask_ratio"]),
-        nenc=int(mask["num_enc_masks"]),
-        npred=int(mask["num_pred_masks"]),
-        allow_overlap=bool(mask["allow_overlap"]),
-    )
-    if layout.kind == "1d":
-        if version == "v2":
-            common["min_context_tokens"] = int(mask.get("min_context_tokens", 1))
-            common["min_context_ratio"] = float(mask.get("min_context_ratio", 0.2))
-            common["context_selection"] = context_selection
-            if layout.patchified:
-                return PatchMaskCollator1DV2(
-                    raw_num_frames=layout.raw_num_frames,
-                    temporal_patch_size=layout.temporal_patch_size,
-                    **common,
-                )
-            return MaskCollator1DV2(num_frames=layout.token_num_frames, **common)
-        common["context_selection"] = context_selection
-        if layout.patchified:
-            return PatchMaskCollator1D(
-                raw_num_frames=layout.raw_num_frames,
-                temporal_patch_size=layout.temporal_patch_size,
-                **common,
-            )
-        return MaskCollator1D(num_frames=layout.token_num_frames, **common)
-    if layout.patchified:
-        patch = args["patch"]
-        return PatchMaskCollator2D(
-            raw_num_frames=layout.raw_num_frames,
-            raw_num_joints=int(layout.raw_num_joints),
-            token_num_joints=int(layout.token_num_joints),
-            temporal_patch_size=layout.temporal_patch_size,
-            spatial_grouping=str(patch["spatial_grouping"]),
-            spatial_pooling=str(patch["spatial_pooling"]),
-            enc_joint_mask_ratio=tuple(mask["enc_joint_mask_ratio"]),
-            pred_joint_mask_ratio=tuple(mask["pred_joint_mask_ratio"]),
-            **common,
-        )
-    return MaskCollator2D(
-        num_frames=layout.token_num_frames,
-        num_joints=int(layout.token_num_joints),
-        enc_joint_mask_ratio=tuple(mask["enc_joint_mask_ratio"]),
-        pred_joint_mask_ratio=tuple(mask["pred_joint_mask_ratio"]),
-        **common,
-    )
+    common = dict(num_frames=layout.token_num_frames,
+                  enc_frame_mask_ratio=tuple(mask["enc_frame_mask_ratio"]),
+                  pred_frame_mask_ratio=tuple(mask["pred_frame_mask_ratio"]),
+                  nenc=int(mask["num_enc_masks"]), npred=int(mask["num_pred_masks"]),
+                  allow_overlap=bool(mask["allow_overlap"]), context_selection=context_selection)
+    if version == "v2":
+        return MaskCollator1DV2(**common, min_context_tokens=int(mask.get("min_context_tokens", 1)),
+                               min_context_ratio=float(mask.get("min_context_ratio", 0.2)))
+    return MaskCollator1D(**common)
 
 
 def _prediction_loss(
@@ -1400,10 +1259,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                         context_target = apply_index_masks(target, masks_enc).repeat(
                             len(masks_pred), 1, 1
                         )
-                    if layout.kind == "1d":
-                        target = apply_index_masks(target, masks_pred)
-                    else:
-                        target = gather_grid_masks(target, masks_pred)
+                    target = apply_index_masks(target, masks_pred)
                     target = repeat_mask_blocks(target, len(motion), len(masks_enc))
                 context = encoder(motion, fps, masks_enc, valid_frames=valid_frames)
                 if context_weight > 0:

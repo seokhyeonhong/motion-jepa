@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render MotionJEPA raw or patchified 1D/2D masks as a PNG."""
+"""Render MotionJEPA frame-token 1D masks as a PNG."""
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from PIL import Image, ImageDraw, ImageFont
 
 from helper import architecture_signature_from_config
 from model import TokenLayout
-from skeleton import SOMASkeleton30
 from train import _build_mask_collator
 
 
@@ -77,17 +76,6 @@ def _mask_to_numpy(
     layout: TokenLayout,
     sample_index: int,
 ) -> np.ndarray:
-    if layout.kind == "2d":
-        expected = (
-            layout.token_num_frames,
-            int(layout.token_num_joints),
-        )
-        selected = mask[sample_index].detach().cpu().numpy().astype(bool)
-        if selected.shape != expected:
-            raise ValueError(
-                f"Expected a 2D mask with shape {expected}, got {selected.shape}"
-            )
-        return selected
     selected = mask[sample_index].detach().cpu().numpy().astype(np.int64)
     if np.any(selected < -1) or np.any(selected >= layout.token_num_frames):
         raise ValueError("1D mask contains an invalid token index")
@@ -134,14 +122,6 @@ def sample_masks(
     ]
     _, context_masks, target_masks = collator(batch)
     spatial_labels: tuple[str, ...] = ()
-    if layout.kind == "2d":
-        spatial_patch = architecture.get("spatial_patch")
-        if spatial_patch is None:
-            spatial_labels = tuple(SOMASkeleton30(load=False).names)
-        else:
-            spatial_labels = tuple(
-                spatial_patch.get("spatial_token_names", spatial_patch["group_names"])
-            )
     valid_tokens = int(
         layout.valid_token_lengths(torch.tensor([valid_raw_frames]))[0]
     )
@@ -305,97 +285,9 @@ def _render_1d(sampled: SampledMasks, *, seed: int) -> Image.Image:
     return image
 
 
-def _render_2d(sampled: SampledMasks, *, seed: int) -> Image.Image:
-    context_union = np.logical_or.reduce(sampled.contexts)
-    target_union = np.logical_or.reduce(sampled.targets)
-    target_count = np.stack(sampled.targets).sum(axis=0)
-    panels: list[tuple[str, np.ndarray, tuple[int, int, int] | None]] = []
-    panels.extend(
-        (f"ENC {index + 1}", mask, CONTEXT_COLORS[index % len(CONTEXT_COLORS)])
-        for index, mask in enumerate(sampled.contexts)
-    )
-    panels.extend(
-        (f"PRED {index + 1}", mask, TARGET_COLORS[index % len(TARGET_COLORS)])
-        for index, mask in enumerate(sampled.targets)
-    )
-    panels.extend(
-        (("ENC union", context_union, CONTEXT_COLORS[0]),
-         ("PRED union", target_union, (196, 55, 72)),
-         ("PRED count", target_count, None))
-    )
-    frames = sampled.layout.token_num_frames
-    joints = int(sampled.layout.token_num_joints)
-    cell_width = max(6, min(80, 1260 // frames))
-    cell_height = 14 if joints > 15 else 22
-    left, right, header, panel_gap, footer = 235, 150, 135, 48, 105
-    plot_width = frames * cell_width
-    panel_height = joints * cell_height
-    width = left + plot_width + right
-    height = header + len(panels) * (panel_height + panel_gap) + footer
-    image = Image.new("RGB", (width, height), BACKGROUND)
-    draw = ImageDraw.Draw(image)
-    _header(draw, sampled, seed=seed, left=left)
-
-    for panel_index, (label, values, color) in enumerate(panels):
-        top = header + panel_index * (panel_height + panel_gap)
-        draw.text((left, top - 24), label, fill=TEXT, font=_font(17, True))
-        for joint, spatial_label in enumerate(sampled.spatial_labels):
-            y0 = top + joint * cell_height
-            draw.text(
-                (left - 10, y0 + cell_height // 2),
-                spatial_label,
-                fill=TEXT,
-                font=_font(11 if joints > 15 else 13),
-                anchor="rm",
-            )
-            for frame in range(frames):
-                x0 = left + frame * cell_width
-                if frame >= sampled.valid_token_frames:
-                    fill = PADDED
-                elif color is not None:
-                    fill = color if bool(values[frame, joint]) else EMPTY
-                else:
-                    count = int(values[frame, joint])
-                    fill = EMPTY if count == 0 else TARGET_COLORS[min(count - 1, 3)]
-                draw.rectangle(
-                    (x0, y0, x0 + cell_width, y0 + cell_height),
-                    fill=fill,
-                    outline=GRID,
-                )
-        valid_values = values[: sampled.valid_token_frames]
-        draw.text(
-            (left + plot_width + 12, top + panel_height // 2),
-            f"{int(np.count_nonzero(valid_values))}\ncells",
-            fill=MUTED,
-            font=_font(13),
-            anchor="lm",
-        )
-
-    axis_y = header + len(panels) * (panel_height + panel_gap) + 5
-    step = max(1, frames // 9)
-    ticks = list(range(0, frames, step))
-    if frames - 1 not in ticks:
-        ticks.append(frames - 1)
-    for token in ticks:
-        x = left + token * cell_width + cell_width // 2
-        draw.text(
-            (x, axis_y),
-            _time_annotation(sampled.layout, token),
-            fill=MUTED,
-            font=_font(11),
-            anchor="ma",
-            spacing=2,
-        )
-    return image
-
-
 def render_mask_png(output: Path, sampled: SampledMasks, *, seed: int = 0) -> dict[str, Any]:
     """Render sampled masks and return their machine-readable summary."""
-    image = (
-        _render_1d(sampled, seed=seed)
-        if sampled.layout.kind == "1d"
-        else _render_2d(sampled, seed=seed)
-    )
+    image = _render_1d(sampled, seed=seed)
     output.parent.mkdir(parents=True, exist_ok=True)
     image.save(output)
     return mask_statistics(sampled)
@@ -406,7 +298,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/mjepa_patch_2d_tiny_coarse7.yaml"),
+        default=Path("configs/mjepa_1d_base_v2.yaml"),
     )
     parser.add_argument("--output", type=Path, default=Path("output/mask.png"))
     parser.add_argument("--seed", type=int, default=0, help="Mask collator step/seed.")

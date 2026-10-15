@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from helper import init_mjepa_encoder_from_config
+from helper import init_mjepa_encoder_from_config, model_config_from_checkpoint
 from model.motion_transformer_1d import MotionTransformer1D
 from model.specs import MODEL_SPECS
 from experiment.linear_probe.features import (
@@ -42,7 +42,7 @@ def load_motion_initialization(checkpoint_path, checkpoint_key, provenance, requ
     source = _torch_load_checkpoint(path)
     if source.get("format_version") != 1 or checkpoint_key not in source:
         raise ValueError("Unsupported JEPA checkpoint or missing encoder key")
-    config = source["config"]
+    config = model_config_from_checkpoint(source)
     name = config["meta"]["model_name"]
     sizes = {f"mot_{size}_1d": size for size in MODEL_SPECS}
     if name not in sizes:
@@ -62,8 +62,7 @@ def load_motion_initialization(checkpoint_path, checkpoint_key, provenance, requ
         if _sha256_file(stats / filename) != provenance[field]:
             raise ValueError("Raw normalization differs from JEPA pretraining statistics")
     encoder = init_mjepa_encoder_from_config(config, torch.device("cpu"))
-    if (not isinstance(encoder, MotionTransformer1D) or encoder.position_encoding != "rope"
-            or encoder.rope_theta != 100.0 or encoder.rope_time_scale != 1.0):
+    if not isinstance(encoder, MotionTransformer1D):
         raise ValueError("TMR LoRA requires JEPA RoPE theta=100 and time_scale=1")
     encoder.load_state_dict(source[checkpoint_key], strict=True)
     if not all(torch.isfinite(p).all() for p in encoder.parameters()):

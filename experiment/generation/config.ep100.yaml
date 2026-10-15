@@ -1,5 +1,5 @@
 # Downstream flow matching with the same epoch-100 JEPA features as prediction.
-jepa_checkpoint: output/mot_patch_base_1d-p3-bs.512-ep.300-nframes150/motion-jepa-patch-1d-p3-ep100.pth.tar
+jepa_checkpoint: output/mot_base_1d-v2-rope-bs.512-ep.300-nframes60-150/motion-jepa-1d-v2-rope-ep100.pth.tar
 cache_root: output/prediction/cache/baseline-ep100
 output: output/generation/baseline-ep100/seed-42
 epochs: 100

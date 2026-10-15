@@ -1,5 +1,8 @@
 # Deterministic motion reconstruction from JEPA features
 
+Use a frame-token 1D RoPE JEPA checkpoint (theta 100, time scale 1).
+Patch and 2D JEPA backbones are no longer available for feature extraction.
+
 This experiment trains a frame-query Transformer decoder to reconstruct raw
 motion from a frozen JEPA EMA encoder. It measures how much motion information
 the learned representation preserves. Predictor training and future prediction
@@ -17,8 +20,8 @@ paths are resolved against the repository root.
 | Data | BONES-SEED, `dataset/bones-seed-processed-nframes150` |
 | Splits | Existing train / val / test; 191,062 / 6,606 / 13,067 clips |
 | Motion | 150 frames at 30 FPS; 366 channels; SOMA30 skeleton |
-| JEPA checkpoint | `output/mot_patch_base_1d-p3-bs.512-ep.300-nframes150/motion-jepa-patch-1d-p3-ep300.pth.tar` |
-| Features | EMA `target_encoder`, `[B, 50, 384]`, functional LayerNorm |
+| JEPA checkpoint | `output/mot_base_1d-v2-rope-bs.512-ep.300-nframes60-150/motion-jepa-1d-v2-rope-ep300.pth.tar` |
+| Features | EMA `target_encoder`, `[B, 150, 384]`, functional LayerNorm |
 | Decoder | Hidden 384, 4 pre-norm blocks, 6 heads, FFN 1536, GELU, dropout 0.1 |
 | Objective | MSE over all valid normalized frame/channel values |
 | Training | Seed 42, 100 epochs, batch 256, AdamW |

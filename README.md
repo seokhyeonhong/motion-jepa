@@ -26,8 +26,8 @@ Public imports are intentionally top-level:
 
 ```python
 from dataset import MotionDataset, make_motion_dataset
-from mask import MaskCollator1D, MaskCollator2D
-from model import MotionTransformer1D, MotionTransformer2D
+from mask import MaskCollator1D
+from model import MotionTransformer1D
 from motion_rep import MotionJEPAMotionRep
 from skeleton import SOMASkeleton30, SOMASkeleton77, parse_bvh_motion
 from visualization import MotionJEPADatasetViewer, SOMASkin
@@ -131,22 +131,13 @@ Visualize processed clips with:
 python visualize_dataset.py dataset/bones-seed-processed --split train --mesh
 ```
 
-Visualize the exact mask collator output for any raw or patchified 1D/2D
-configuration with:
+Visualize the frame-token mask timeline with:
 
 ```bash
-python visualize_mask.py \
-  --config configs/mjepa_patch_2d_tiny_coarse7.yaml \
-  --output output/mask-patch-2d-trajectory-coarse7.png \
-  --seed 0 \
-  --valid-length 90
+python visualize_mask.py --config configs/mjepa_1d_base_v2.yaml --output output/mask.png --seed 0 --valid-length 90
 ```
 
-The renderer automatically uses a timeline for 1D layouts and a
-time-by-joint/body-group grid for 2D layouts. Patch timelines annotate both
-token indices and their corresponding raw-frame spans.
-
-For 1D multiblock masks (including 1D patches), choose how context candidates
+For V1 frame-token multiblock masks, choose how context candidates
 are trimmed to the batch's minimum count:
 
 ```yaml
@@ -160,82 +151,37 @@ sample's remaining context candidates, then sorts their original time indices.
 Both modes keep the same context count and target masks for a given collator
 step; this option changes only context trimming. It does not change block
 sampling, target exclusion, or guarantee uniform coverage of the full timeline.
-2D masks do not use this minimum-count trimming; `random` is rejected for them.
 
 The mode is saved in mask checkpoint state for deterministic resume. Old
 checkpoints without this field are interpreted as `prefix`. Exact resume
 requires the same mode; switching modes requires a separate training experiment.
-The base and nmask2 configs explicitly retain `prefix`; select `random` to opt in.
+V2 supports `all`, `prefix`, and `random`; the active V2 configs use `random`.
 
-The active `random_spatial_segment` strategy samples four target masks. Each
-mask spans a contiguous 40–60% of the patch timeline and exactly four of the
-eight trajectory/body tokens. Targets may overlap, but their union is
-constrained to 55–65% and the encoder receives its exact complement. Historical
-mask experiments remain under `configs/_depr_experiments/`.
+## Frame-token JEPA
 
-## Model variants
+JEPA uses one token per motion frame and temporal transformer attention.
+Factories are available in `tiny`, `small`, `base`, `large`, `huge`, and `giant`
+sizes, for example `mot_base_1d` and `mot_predictor_base_1d`. The 2D and temporal
+patch transformers and their masking strategies have been removed.
 
-`_1d` uses one token per 366-D frame and temporal transformer attention. It
-samples contiguous temporal blocks; target exclusion and context trimming can
-leave a non-contiguous set of context tokens.
-
-Patchified `_2d` routes canonical root x/z and heading to a trajectory token,
-then appends the configured body groups. Coarse7 therefore produces a
-`[patches,8]` grid. Root height, rotation, and velocity stay in the pelvis body
-token. Separate trajectory/body patch projections and learned spatial
-positions identify the streams; there is no token-type embedding. Encoder
-blocks apply temporal attention per spatial token followed by spatial
-attention per patch. Non-patch `_2d` retains the original 30-joint routing.
-
-Named factories are available for `tiny`, `small`, `base`, `large`, `huge`,
-and `giant`, for example `mot_base_1d` and `mot_base_2d`. There are no
-unsuffixed compatibility aliases.
-
-### Temporal RoPE for 1D models
-
-Frame-token and temporal-patch `_1d` encoders and predictors can use rotary
-position embeddings instead of additive absolute sinusoidal embeddings:
-
-```yaml
-position_encoding:
-  temporal: rope  # absolute (default) | rope
-  rope_theta: 100.0
-  rope_time_scale: 1.0
-```
-
-RoPE rotates queries and keys in every attention layer using the original
-token times. Frame positions are `frame_index / fps`; patch positions are
-`(patch_index * patch_size + (patch_size - 1) / 2) / fps`. Positions are gathered
-with the same masks as context and target tokens, so removing target tokens
-preserves the elapsed time between visible tokens. Predictor context and target
-positions use the same timeline even though their tokens are concatenated.
-The EMA target encoder uses the full timeline. Padding remains excluded from
-attention and loss.
-
-`rope_time_scale` multiplies these times before rotation; its default retains
-seconds. `rope_theta` controls the frequency spectrum. Both must be finite and
-positive. RoPE currently supports 1D models only and does not change the
-configured input length or masking policy. Matching V2 configs are provided for
-frame tokens (150 tokens per full clip) and three-frame patches (50 tokens).
-They use the same RoPE, data, masking ratios, optimization, and evaluation
-settings, with separate output directories. Run either experiment with:
+RoPE is built into every encoder and predictor attention layer with theta 100
+and a time scale of 1. Positions are physical seconds (`frame_index / fps`).
+Masking gathers the original positions, preserving gaps between visible frames;
+predictor context and target tokens share the same timeline. The EMA target
+encoder uses the full timeline, and padding is excluded from attention and loss.
+There is no positional-embedding selector or `position_encoding` configuration
+section. Remove that section and any `patch` section from training configs.
 
 ```bash
-# One token per frame.
-python main.py --config configs/mjepa_1d_base_v2_rope.yaml --devices cuda:0
-# One token per three-frame patch.
-python main.py --config configs/mjepa_patch_1d_base_v2_rope.yaml --devices cuda:0
+python main.py --config configs/mjepa_1d_base_v2.yaml --devices cuda:0
 ```
 
-For simultaneous independent runs, use separate GPUs. Concurrent multi-GPU
-runs also need different `--master-port` values (for example `40112` and `40113`). Batch size is per GPU;
-the frame-token variant has a longer attention sequence and may need a smaller
-`data.batch_size` on the same hardware.
-
-Omitting `position_encoding` retains the existing absolute behavior, including
-old checkpoints. Exact resume requires the same positional mode, theta, and
-time scale; use a separate training run when changing them. Frozen downstream
-encoders reconstruct these settings from the saved pretraining configuration.
+Checkpoints record fixed positional semantics as architecture metadata. Existing
+frame-token RoPE checkpoints with theta 100 and time scale 1 remain loadable.
+Absolute-position checkpoints, checkpoints without positional metadata, custom
+RoPE settings, and removed model variants fail explicitly. Archived experiment
+outputs and findings remain historical records. Downstream prediction,
+generation, and TMR heads retain their own positional embeddings.
 
 ## Training
 
@@ -244,14 +190,14 @@ Batch size is per rank. Learning rates are not automatically scaled.
 Single GPU:
 
 ```bash
-python main.py --config configs/mjepa_patch_2d_tiny_coarse7.yaml --devices cuda:0
+python main.py --config configs/mjepa_1d_base_v2.yaml --devices cuda:0
 ```
 
 Local multi-GPU:
 
 ```bash
 python main.py \
-  --config configs/mjepa_patch_2d_tiny_coarse7.yaml \
+  --config configs/mjepa_1d_base_v2.yaml \
   --devices cuda:0 cuda:1 cuda:2 cuda:3
 ```
 
@@ -262,7 +208,7 @@ Standard torchrun launch:
 
 ```bash
 torchrun --standalone --nproc-per-node=4 main.py \
-  --config configs/mjepa_patch_2d_tiny_coarse7.yaml
+  --config configs/mjepa_1d_base_v2.yaml
 ```
 
 `main.py` honors `RANK`, `WORLD_SIZE`, and `LOCAL_RANK`. CUDA training uses
@@ -317,19 +263,6 @@ python -m experiment.linear_probe \
   --output output/linear-probe/<run>
 ```
 
-For a 2D encoder, preserve anatomical token identity with the group-aware
-linear probe. It averages only over valid time tokens, flattens the spatial
-tokens, and trains one biased `nn.Linear` head:
-
-```bash
-python -m experiment.linear_probe.train_probe_2d \
-  --checkpoint output/<run>/motion-jepa-patch-2d-p3-coarse7-latest.pth.tar \
-  --dataset-root dataset/100style-soma77-processed
-```
-
-Its default output and feature-cache directory is
-`<checkpoint directory>/linear-probe-2d`, separate from the global-mean probe.
-
 `--output` may be omitted; in that case results are written under
 `<checkpoint directory>/linear-probe`. Supplying it explicitly selects a
 different linear-probe result directory.
@@ -375,8 +308,7 @@ linear_probe:
   weight_decay: 0.0
   seed: 42
   standardize: true
-  # Use this for 2D encoders to retain spatial token identity:
-  pooling: temporal_mean_spatial_flatten
+  pooling: global_mean
 ```
 
 The EMA target encoder is evaluated before the first training epoch, at every
@@ -390,8 +322,8 @@ checkpoint; use latest or a named epoch checkpoint for final comparison.
 Linear probing is disabled when the section is absent or `enabled: false`.
 
 For BABEL-60 and BABEL-120 online probing, use `linear_probe.datasets` instead
-of `dataset_root`. The active `configs/mjepa_patch_1d_base.yaml` evaluates both
-datasets before training, every 10 epochs, and at the final epoch. Each probe
+of `dataset_root`. This evaluates both datasets before training, at the configured frequency,
+and at the final epoch. Each probe
 fits a fresh 50-epoch SGD linear head on frozen EMA features with multi-label
 BCE, selects the head by validation mAP, and records validation metrics under
 `linear_probe/babel-60/*` and `linear_probe/babel-120/*`. BABEL has no labeled
@@ -401,8 +333,7 @@ test split. The best pretraining checkpoints are saved separately as
 resume from the latest checkpoint. The existing single-dataset `dataset_root`
 configuration continues to use the 100STYLE probe.
 
-Both `mjepa_patch_1d_base.yaml` and `mjepa_patch_1d_base_nmask2.yaml` also enable
-an attentive probe alongside the standardized linear probe:
+Enable an attentive probe alongside the standardized linear probe with:
 
 ```yaml
 attentive_probe:
@@ -456,22 +387,6 @@ python -m experiment.linear_probe.lr_sweep --device cuda:0
 LR sweeps and validation-selected reports reject validation-free datasets.
 They are retained only for legacy datasets with a genuine non-empty validation
 split, preventing `FW` test results from becoming an implicit tuning set.
-
-For an explicitly diagnostic LR-sensitivity check on immutable 2D checkpoints,
-use `--diagnostic-no-validation`, list the checkpoints, and retain spatial token
-identity with `temporal_mean_spatial_flatten`. This reports every FW result but
-does not make it a valid LR-selection criterion:
-
-```bash
-python -m experiment.linear_probe.lr_sweep \
-  --checkpoints output/<run>/*-ep*.pth.tar \
-  --pooling temporal_mean_spatial_flatten \
-  --diagnostic-no-validation \
-  --lrs 0.1 0.3 0.5 0.7 1.0 \
-  --seeds 42 \
-  --findings-root findings/<diagnostic-name> \
-  --device cuda:0
-```
 
 Features are extracted once per checkpoint and reused across learning rates.
 Completed probe runs resume from their summaries unless `--overwrite-runs` is
@@ -546,7 +461,7 @@ python -m unittest discover -s tests -v
 ```
 
 The suite covers preprocessing, representation parity, data validation,
-semantic 2D routing, both encoder/predictor variants, masking and overlap,
+frame-token encoders and predictors, RoPE coordinates, masking and overlap,
 checkpoint restoration, launch dispatch, single-process resume, and a real
 two-process Gloo DDP run. This checkout exposes one GPU, so NCCL multi-GPU
 execution cannot be exercised locally.
@@ -571,7 +486,7 @@ The JEPA training design is based on Meta's I-JEPA implementation and paper:
 ## Optional context prediction loss
 
 
-Non-patchified 1D models (absolute positions or RoPE) can additionally predict the
+Frame-token 1D models can additionally predict the
 full-view EMA teacher features at visible context frames. Multi-level prediction
 is not included. Configure:
 
@@ -584,8 +499,7 @@ loss:
 ```
 
 These are also the defaults when settings are omitted. Weight and warmup must be
-finite and nonnegative, and distance weighting must be a YAML boolean. Positive
-weights are rejected for patchified and 2D models.
+finite and nonnegative, and distance weighting must be a YAML boolean.
 
 The total objective is `masked_loss + effective_weight * context_loss`; the
 existing masked Smooth-L1 objective is unchanged. Context predictions reuse the

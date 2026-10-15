@@ -25,8 +25,7 @@ class JEPASegmentationTransformer(nn.Module):
             "num_frames":num_frames,"position_encoding":"rope","rope_theta":100.,
             "rope_time_scale":1.,"mlp_ratio":4.,"dropout":0.,"pretrained":False}
         self.encoder=MotionTransformer1D(in_chans=input_dim,num_frames=num_frames,
-            **MODEL_SPECS[model_size],position_encoding="rope",
-            rope_theta=100.,rope_time_scale=1.)
+            **MODEL_SPECS[model_size])
         self.head=nn.Linear(MODEL_SPECS[model_size]["embed_dim"],num_classes)
         self.head.apply(initialize_transformer)
 

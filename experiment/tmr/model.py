@@ -223,8 +223,6 @@ class TextMotionAlignmentV2(TextMotionAlignment):
         self.motion_encoder = MotionTransformer1D(
             in_chans=config.motion_dim, num_frames=config.num_frames,
             **MODEL_SPECS[config.model_size],
-            position_encoding=config.position_encoding,
-            rope_theta=config.rope_theta, rope_time_scale=config.rope_time_scale,
         )
 
     def encode_motion(self, tokens: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:

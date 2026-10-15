@@ -1,5 +1,8 @@
 # JEPA-conditioned raw-motion generation
 
+Use a frame-token 1D RoPE JEPA checkpoint (theta 100, time scale 1).
+Patch and 2D JEPA backbones are no longer available for feature extraction.
+
 This experiment learns a conditional rectified flow from Gaussian noise to raw
 motion. Frozen JEPA tokens supply the condition; generation takes place in
 normalized 366-channel motion space. The JEPA encoder, predictor, existing
@@ -16,7 +19,7 @@ The baseline uses BONES-SEED clips with 150 frames at 30 FPS, SOMA30, and 366 ra
 feature channels. Conditions are complete `[B,50,384]` EMA encoder tokens from:
 
 ```text
-output/mot_patch_base_1d-p3-bs.512-ep.300-nframes150/motion-jepa-patch-1d-p3-ep300.pth.tar
+output/mot_base_1d-v2-rope-bs.512-ep.300-nframes60-150/motion-jepa-1d-v2-rope-ep300.pth.tar
 ```
 
 The frozen encoder uses its pretraining normalization statistics and evaluation
