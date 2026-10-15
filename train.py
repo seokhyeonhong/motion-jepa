@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import logging
 import os
 import random
@@ -39,11 +38,10 @@ from mask.utils import (
 )
 from utils.distributed import (
     all_gather_objects,
-    barrier,
     init_distributed,
     reduce_mean,
 )
-from utils.logging import AverageMeter, CSVLogger, grad_logger
+from utils.logging import AverageMeter, grad_logger
 from utils.schedulers import LinearMomentumSchedule
 
 
@@ -71,7 +69,6 @@ def _write_tensorboard_interval(
     writer,
     *,
     global_step: int,
-    epoch: int,
     loss: float,
     learning_rate: float,
     weight_decay: float,
@@ -92,135 +89,9 @@ def _write_tensorboard_interval(
         "train/gradient_first_layer": grad_first,
         "train/gradient_last_layer": grad_last,
         "train/gradient_average": grad_average,
-        "train/epoch": float(epoch),
     }
     for name, value in scalars.items():
         writer.add_scalar(name, value, global_step)
-    writer.flush()
-
-
-def _write_tensorboard_linear_probe(
-    writer,
-    *,
-    global_step: int,
-    summary: dict,
-    best_val_top1: float | None,
-) -> None:
-    if writer is None:
-        return
-    scalars = {
-        f"linear_probe/test_{name}": float(summary["test"][name])
-        for name in ("loss", "top1_accuracy", "macro_accuracy", "top5_accuracy")
-        if name in summary["test"]
-    }
-    if summary.get("validation_used", True):
-        scalars["linear_probe/val_top1_accuracy"] = float(
-            summary["best_val"]["top1_accuracy"]
-        )
-        assert best_val_top1 is not None
-        scalars["linear_probe/best_val_top1_accuracy"] = float(best_val_top1)
-        scalars["linear_probe/probe_best_epoch"] = float(summary["best_epoch"])
-    for name, value in scalars.items():
-        writer.add_scalar(name, value, global_step)
-    writer.flush()
-
-
-def _write_tensorboard_babel_probes(
-    writer,
-    *,
-    global_step: int,
-    summaries: dict[str, dict],
-    state: dict[str, dict],
-    probe_name: str = "linear_probe",
-) -> None:
-    if writer is None:
-        return
-    for name, summary in summaries.items():
-        prefix = f"{probe_name}/{name}"
-        for metric in ("loss", "mean_average_precision", "top1_hit",
-                       "top1_label_row_accuracy", "top5_hit"):
-            if metric in summary["best_val"]:
-                writer.add_scalar(f"{prefix}/val_{metric}",
-                                  float(summary["best_val"][metric]), global_step)
-        writer.add_scalar(
-            f"{prefix}/best_val_mean_average_precision",
-            float(state[name]["best_val_map"]), global_step,
-        )
-        writer.add_scalar(
-            f"{prefix}/probe_best_epoch", float(summary["best_epoch"]), global_step,
-        )
-        writer.add_scalar(
-            f"{prefix}/pretrain_best_epoch", float(state[name]["best_epoch"]), global_step,
-        )
-    writer.flush()
-
-
-def _flatten_numeric_metrics(prefix: str, values: dict) -> dict[str, float]:
-    flattened: dict[str, float] = {}
-    for name, value in values.items():
-        key = f"{prefix}/{name}" if prefix else str(name)
-        if isinstance(value, dict):
-            flattened.update(_flatten_numeric_metrics(key, value))
-        elif isinstance(value, (int, float)):
-            flattened[key] = float(value)
-    return flattened
-
-
-def _write_tensorboard_online_metrics(
-    writer,
-    *,
-    global_step: int,
-    summary: dict,
-) -> None:
-    if writer is None:
-        return
-    if "retrieval" in summary:
-        from experiment.motion_online_metrics import tensorboard_metrics
-
-        scalars = tensorboard_metrics(summary)
-    else:
-        # Legacy 2D evaluator: numeric metadata is not a learning curve.
-        metric_names = {
-            "rankme", "mean_std", "mean_cosine", "mean_off_diagonal_cosine",
-            "effective_rank", "largest_eigenvalue_ratio", "off_diagonal_abs_mean",
-            "mse", "smooth_l1", "cosine_similarity", "prediction_gain",
-            "baseline_mse", "trajectory_reliance", "body_temporal_std",
-            "body_joint_std", "trajectory_temporal_std",
-        }
-        scalars = {
-            key: value for key, value in _flatten_numeric_metrics("", summary).items()
-            if key.rsplit("/", 1)[-1] in metric_names
-        }
-    for name, value in scalars.items():
-        writer.add_scalar(f"online_metrics/{name}", value, global_step)
-    if summary.get("overhead_percent") is not None:
-        writer.add_scalar("online_metrics/timing/overhead_percent",
-                          float(summary["overhead_percent"]), global_step)
-    writer.flush()
-
-
-def _write_tensorboard_segmentation_probe(writer, *, global_step, summary, state):
-    if writer is None:
-        return
-    for dataset in ("babel-120", "babel-60"):
-        for metric in ("frame_map", "bce", "micro_f1"):
-            value = summary["best_val"][dataset][metric]
-            if value is not None:
-                writer.add_scalar(f"segmentation_probe/{dataset}/val_{metric}",
-                                  float(value), global_step)
-    prefix = "segmentation_probe/babel-120"
-    writer.add_scalar(f"{prefix}/best_val_frame_map", float(state["best_val_map"]), global_step)
-    writer.add_scalar(f"{prefix}/probe_best_epoch", float(summary["best_epoch"]), global_step)
-    writer.add_scalar(f"{prefix}/pretrain_best_epoch", float(state["best_epoch"]), global_step)
-    timing_tags = {
-        "feature_extraction_or_cache_load_seconds": "feature_extraction_seconds",
-        "head_seconds": "head_training_seconds",
-        "evaluation_call_seconds": "total_seconds",
-    }
-    for key, tag in timing_tags.items():
-        if key in summary.get("timings", {}):
-            writer.add_scalar(f"segmentation_probe/timing/{tag}",
-                              float(summary["timings"][key]), global_step)
     writer.flush()
 
 
@@ -253,32 +124,6 @@ def restore_rng_state(state: dict) -> None:
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
-def _evaluate_online_probe_preserving_rng(evaluator, encoder) -> dict:
-    rng_state = capture_rng_state()
-    try:
-        return evaluator.evaluate(encoder)
-    finally:
-        restore_rng_state(rng_state)
-
-
-def _evaluate_frozen_encoder_preserving_rng(evaluator, encoder, **kwargs) -> dict:
-    """Fit heads or run inference without changing the pretraining state."""
-    rng_state = capture_rng_state()
-    modes = [(module, module.training) for module in encoder.modules()]
-    flags = [(parameter, parameter.requires_grad) for parameter in encoder.parameters()]
-    try:
-        encoder.eval()
-        for parameter, _ in flags:
-            parameter.requires_grad_(False)
-        return evaluator.evaluate(encoder, **kwargs)
-    finally:
-        for parameter, flag in flags:
-            parameter.requires_grad_(flag)
-        for module, mode in modes:
-            module.training = mode
-        restore_rng_state(rng_state)
-
-
 def _run_rank_zero(function, *, is_main: bool):
     """Propagate rank-zero failures before other ranks enter later collectives."""
     result = None
@@ -291,56 +136,6 @@ def _run_rank_zero(function, *, is_main: bool):
     if result["error"] is not None:
         raise RuntimeError(f"Rank-zero evaluation failed:\n{result['error']}")
     return result["value"]
-
-
-def _attentive_probe_args(config: dict) -> dict:
-    attentive = config.get("attentive_probe", {})
-    if not isinstance(attentive, dict):
-        raise ValueError("attentive_probe config must be a mapping")
-    linear = config.get("linear_probe", {})
-    if not isinstance(linear, dict):
-        raise ValueError("linear_probe config must be a mapping")
-    return {
-        "datasets": linear.get("datasets"),
-        "frequency": linear.get("frequency", config.get("logging", {}).get("checkpoint_freq", 50)),
-        **attentive,
-    }
-
-
-def _probe_protocols(config: dict, *, legacy: bool = False) -> dict:
-    """Identify comparable scores; frequency does not affect a fresh probe fit."""
-    shared = {key: config.get("data", {}).get(key) for key in
-              ("root_path", "stats_path", "num_frames", "motion_dim", "fps")}
-    shared["use_bfloat16"] = config.get("meta", {}).get("use_bfloat16", False)
-    common = dict(epochs=50, batch_size=256, feature_batch_size=256, seed=42)
-    defaults = {
-        "linear_probe": {**common, "lr": 0.3, "momentum": 0.9, "weight_decay": 0.0,
-                         "pooling": "valid_token_mean", "standardize": not legacy},
-        "attentive_probe": {**common, "lr": 3e-4, "weight_decay": 0.05,
-                            "warmup_epochs": 5, "final_lr": 1e-6,
-                            "gradient_clip": 1.0, "num_heads": 6},
-    }
-    protocols = {}
-    for kind, values in defaults.items():
-        options = _attentive_probe_args(config) if kind == "attentive_probe" else config.get(kind, {})
-        protocols[kind] = {**shared, **{key: options.get(key, value) for key, value in values.items()},
-                           "datasets": options.get("datasets"),
-                           "dataset_root": options.get("dataset_root", "dataset/100style-soma77-processed")}
-    return protocols
-
-
-def _evaluate_online_metrics_preserving_rng(evaluator, encoder, predictor) -> dict:
-    rng_state = capture_rng_state()
-    encoder_training = encoder.training
-    predictor_training = predictor.training
-    try:
-        encoder.eval()
-        predictor.eval()
-        return evaluator.evaluate(encoder, predictor)
-    finally:
-        encoder.train(encoder_training)
-        predictor.train(predictor_training)
-        restore_rng_state(rng_state)
 
 
 def _atomic_torch_save(payload: dict, path: Path) -> None:
@@ -356,17 +151,35 @@ def _atomic_copy(source: Path, destination: Path) -> None:
     os.replace(temporary, destination)
 
 
-def _upsert_epoch_jsonl(path: Path, summary: dict) -> None:
-    """Replace a retried evaluation without duplicating its learning-curve point."""
-    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
-    key = (summary["pretrain_epoch"], summary.get("protocol_hash"))
-    records = [record for record in records
-               if (record["pretrain_epoch"], record.get("protocol_hash")) != key]
-    records.append(summary)
-    records.sort(key=lambda record: record["pretrain_epoch"])
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in records))
-    os.replace(temporary, path)
+def _iteration_settings(args: dict) -> tuple[int, int, int, int]:
+    optimization, logging_config = args["optimization"], args["logging"]
+    removed = {"epochs", "warmup", "ipe_scale"}.intersection(optimization)
+    if removed or "checkpoint_freq" in logging_config:
+        raise ValueError("Epoch-based settings were removed; use optimization.iterations, "
+                         "warmup_iterations, and logging.checkpoint_interval (all in iterations)")
+    def integer(settings, key, minimum):
+        value = settings.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"{key} must be an integer >= {minimum}")
+        return value
+    total = integer(optimization, "iterations", 1)
+    warmup = integer(optimization, "warmup_iterations", 0)
+    if warmup >= total:
+        raise ValueError("warmup_iterations must be smaller than iterations")
+    return (total, warmup, integer(logging_config, "checkpoint_interval", 1),
+            integer(logging_config, "log_freq", 1))
+
+
+def _resume_signature(args: dict, batches_per_pass: int) -> dict:
+    data = args["data"]
+    return {
+        "optimization": args["optimization"],
+        "data": {key: data.get(key) for key in (
+            "root_path", "meta_files", "batch_size", "num_frames", "fps",
+            "motion_dim", "normalize", "stats_path", "drop_last")},
+        "meta": {key: args["meta"].get(key) for key in ("seed", "use_bfloat16", "use_float16")},
+        "batches_per_pass": batches_per_pass,
+    }
 
 
 def _save_checkpoint(
@@ -381,27 +194,20 @@ def _save_checkpoint(
     wd_scheduler,
     momentum_scheduler,
     mask_collator,
-    next_epoch: int,
+    data_pass: int,
+    batch_in_pass: int,
+    batches_per_pass: int,
     global_step: int,
     loss: float,
     world_size: int,
     rank: int,
     config: dict,
     architecture: dict | None = None,
-    linear_probe_latest: dict | None = None,
-    best_probe_val_top1: float = float("-inf"),
-    best_probe_epoch: int | None = None,
-    babel_probe_state: dict[str, dict] | None = None,
-    attentive_probe_state: dict[str, dict] | None = None,
-    online_metrics_latest: dict | None = None,
-    segmentation_probe_state: dict | None = None,
 ) -> None:
     rng_states = all_gather_objects(capture_rng_state())
     mask_states = all_gather_objects(mask_collator.state_dict())
-    if rank != 0:
-        return
     payload = {
-        "format_version": 1,
+        "format_version": 2,
         "encoder": _unwrapped(encoder).state_dict(),
         "predictor": _unwrapped(predictor).state_dict(),
         "target_encoder": target_encoder.state_dict(),
@@ -412,24 +218,18 @@ def _save_checkpoint(
         "momentum_scheduler": momentum_scheduler.state_dict(),
         "mask_states": mask_states,
         "rng_states": rng_states,
-        "next_epoch": int(next_epoch),
+        "data_pass": int(data_pass),
+        "batch_in_pass": int(batch_in_pass),
+        "resume_signature": _resume_signature(config, batches_per_pass),
         "global_step": int(global_step),
         "world_size": int(world_size),
         "loss": float(loss),
         "config": config,
         "position_encoding": position_encoding_from_model(_unwrapped(encoder)),
-        "linear_probe_latest": linear_probe_latest,
-        "best_probe_val_top1": float(best_probe_val_top1),
-        "best_probe_epoch": best_probe_epoch,
-        "babel_probe_state": babel_probe_state,
-        "attentive_probe_state": attentive_probe_state,
-        "probe_protocols": _probe_protocols(config),
-        "online_metrics_latest": online_metrics_latest,
-        "segmentation_probe_state": segmentation_probe_state,
     }
     if architecture is not None:
         payload["architecture"] = architecture
-    _atomic_torch_save(payload, path)
+    _run_rank_zero(lambda: _atomic_torch_save(payload, path), is_main=rank == 0)
 
 
 def _load_checkpoint(
@@ -447,20 +247,26 @@ def _load_checkpoint(
     mask_collator,
     rank: int,
     world_size: int,
+    config: dict,
+    batches_per_pass: int,
     architecture: dict | None = None,
-    linear_probe_state: dict | None = None,
-    babel_probe_state: dict[str, dict] | None = None,
-    attentive_probe_state: dict[str, dict] | None = None,
-    probe_protocols: dict | None = None,
-    online_metrics_state: dict | None = None,
-    segmentation_probe_state: dict | None = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     # Full training checkpoints contain trusted local Python/NumPy RNG state,
     # optimizer state, and scheduler state in addition to tensor weights.
     # PyTorch 2.6 defaults weights_only=True, which cannot restore that payload.
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    if checkpoint.get("format_version") != 1:
-        raise ValueError(f"Unsupported MotionJEPA checkpoint format: {path}")
+    if checkpoint.get("format_version") != 2:
+        raise ValueError("Iteration-based resume requires a new training checkpoint; "
+                         "legacy epoch checkpoints cannot be resumed with the new schedules")
+    if checkpoint.get("resume_signature") != _resume_signature(config, batches_per_pass):
+        raise ValueError("Resume requires the same iteration schedule, dataset, batch size, seed, and precision")
+    data_pass = int(checkpoint["data_pass"])
+    batch_in_pass = int(checkpoint["batch_in_pass"])
+    global_step = int(checkpoint["global_step"])
+    if (data_pass < 0 or not 0 <= batch_in_pass < batches_per_pass
+            or data_pass * batches_per_pass + batch_in_pass != global_step
+            or not 0 <= global_step <= config["optimization"]["iterations"]):
+        raise ValueError("Invalid checkpoint iteration/data position")
     if int(checkpoint["world_size"]) != world_size:
         raise ValueError(
             f"Exact resume requires world_size={checkpoint['world_size']}, got {world_size}"
@@ -488,36 +294,7 @@ def _load_checkpoint(
     momentum_scheduler.load_state_dict(checkpoint["momentum_scheduler"])
     mask_collator.load_state_dict(checkpoint["mask_states"][rank])
     restore_rng_state(checkpoint["rng_states"][rank])
-    if linear_probe_state is not None:
-        linear_probe_state.update(
-            latest=checkpoint.get("linear_probe_latest"),
-            best_val_top1=float(checkpoint.get("best_probe_val_top1", float("-inf"))),
-            best_epoch=checkpoint.get("best_probe_epoch"),
-        )
-    if babel_probe_state is not None:
-        saved = checkpoint.get("babel_probe_state") or {}
-        for name, state in babel_probe_state.items():
-            state.update(saved.get(name, {}))
-    if attentive_probe_state is not None:
-        saved = checkpoint.get("attentive_probe_state") or {}
-        for name, state in attentive_probe_state.items():
-            state.update(saved.get(name, {}))
-    if probe_protocols is not None:
-        saved_protocols = checkpoint.get("probe_protocols") or _probe_protocols(checkpoint["config"], legacy=True)
-        for kind, states in (("linear_probe", babel_probe_state), ("attentive_probe", attentive_probe_state)):
-            if saved_protocols.get(kind) == probe_protocols[kind]:
-                continue
-            logger.info("Resetting %s best scores: probe protocol changed", kind)
-            if states is not None:
-                for state in states.values():
-                    state.update(latest=None, best_val_map=float("-inf"), best_epoch=None)
-            if kind == "linear_probe" and linear_probe_state is not None:
-                linear_probe_state.update(latest=None, best_val_top1=float("-inf"), best_epoch=None)
-    if online_metrics_state is not None:
-        online_metrics_state["latest"] = checkpoint.get("online_metrics_latest")
-    if segmentation_probe_state is not None:
-        segmentation_probe_state.update(checkpoint.get("segmentation_probe_state") or {})
-    return int(checkpoint["next_epoch"]), int(checkpoint["global_step"])
+    return data_pass, batch_in_pass, global_step
 
 
 def _build_mask_collator(args: dict, layout: TokenLayout):
@@ -585,25 +362,11 @@ def _seed_all(seed: int, device: torch.device) -> None:
 
 
 def main(args: dict, resume_preempt: bool = False, device=None):
+    total_steps, warmup_steps, checkpoint_frequency, log_frequency = _iteration_settings(args)
     if "context" in args.get("loss", {}):
         raise ValueError("loss.context has been removed; training uses masked prediction loss only")
     device = _resolve_device(device)
-    probe_configuration = args.get("linear_probe", {})
-    attentive_args = _attentive_probe_args(args)
-    attentive_enabled = bool(attentive_args.get("enabled", False))
-    segmentation_args = args.get("segmentation_probe", {})
-    if not isinstance(segmentation_args, dict):
-        raise ValueError("segmentation_probe config must be a mapping")
-    segmentation_enabled = bool(segmentation_args.get("enabled", False))
-    babel_probe_requested = (
-        isinstance(probe_configuration, dict)
-        and bool(probe_configuration.get("enabled", False))
-        and "datasets" in probe_configuration
-    )
-    distributed = init_distributed(
-        device, timeout_seconds=4 * 60 * 60
-        if (babel_probe_requested or attentive_enabled or segmentation_enabled) else None
-    )
+    distributed = init_distributed(device)
     rank, world_size = distributed.rank, distributed.world_size
     if rank != 0:
         logger.setLevel(logging.ERROR)
@@ -618,34 +381,6 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     meta_args = args["meta"]
     opt_args = args["optimization"]
     log_args = args["logging"]
-    probe_args = args.get("linear_probe", {})
-    if not isinstance(probe_args, dict):
-        raise ValueError("linear_probe config must be a mapping")
-    probe_enabled = bool(probe_args.get("enabled", False))
-    babel_probe_enabled = probe_enabled and "datasets" in probe_args
-    metric_args = args.get("online_metrics", {})
-    if not isinstance(metric_args, dict):
-        raise ValueError("online_metrics config must be a mapping")
-    metrics_enabled = bool(metric_args.get("enabled", False))
-    probe_frequency = int(
-        probe_args.get("frequency", log_args.get("checkpoint_freq", 50))
-    )
-    if probe_enabled and probe_frequency <= 0:
-        raise ValueError("linear_probe.frequency must be positive")
-    metrics_frequency = int(metric_args.get("frequency", probe_frequency))
-    if metrics_enabled and metrics_frequency <= 0:
-        raise ValueError("online_metrics.frequency must be positive")
-    metrics_kind = str(metric_args.get("kind", "legacy"))
-    if metrics_enabled and metrics_kind not in {"legacy", "motion"}:
-        raise ValueError("online_metrics.kind must be legacy or motion")
-    segmentation_frequency = int(segmentation_args.get("frequency", 30))
-    if segmentation_enabled and segmentation_frequency <= 0:
-        raise ValueError("segmentation_probe.frequency must be positive")
-    attentive_frequency = int(attentive_args["frequency"])
-    if attentive_enabled and attentive_frequency <= 0:
-        raise ValueError("attentive_probe.frequency must be positive")
-    if attentive_enabled and not isinstance(attentive_args.get("datasets"), dict):
-        raise ValueError("attentive_probe requires BABEL datasets (or linear_probe.datasets)")
     model_name = str(meta_args["model_name"])
     if model_name not in MODEL_FACTORIES:
         raise ValueError(f"Unknown MotionJEPA model_name: {model_name!r}")
@@ -670,7 +405,6 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     encoder, predictor = init_mjepa_model_from_config(args, device)
     layout = encoder.token_layout
     mask_collator = _build_mask_collator(args, layout)
-    _run_rank_zero(initialize_output, is_main=distributed.is_main)
     architecture = architecture_signature(
         encoder,
         predictor,
@@ -689,14 +423,17 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         stats_path=data_args.get("stats_path"),
         rank=rank,
         world_size=world_size,
-        collator=mask_collator,
+        collator=None,
         drop_last=bool(data_args.get("drop_last", True)),
         num_workers=int(data_args.get("num_workers", 8)),
         pin_mem=bool(data_args.get("pin_mem", True)),
         persistent_workers=bool(data_args.get("persistent_workers", True)),
+        seed=seed,
     )
     if len(loader) == 0:
         raise ValueError("Data loader has no batches; reduce batch_size or disable drop_last")
+
+    batches_per_pass = len(loader)
 
     target_encoder = copy.deepcopy(encoder).to(device)
     target_encoder.requires_grad_(False)
@@ -705,56 +442,30 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     optimizer, scaler, lr_scheduler, wd_scheduler = init_opt(
         encoder=encoder,
         predictor=predictor,
-        iterations_per_epoch=len(loader),
+        total_steps=total_steps,
         start_lr=float(opt_args["start_lr"]),
         ref_lr=float(opt_args["lr"]),
         final_lr=float(opt_args["final_lr"]),
-        warmup=float(opt_args["warmup"]),
-        num_epochs=int(opt_args["epochs"]),
+        warmup_steps=warmup_steps,
         wd=float(opt_args["weight_decay"]),
         final_wd=float(opt_args["final_weight_decay"]),
         use_float16=bool(meta_args.get("use_float16", False)),
-        ipe_scale=float(opt_args.get("ipe_scale", 1.0)),
-    )
-    total_steps = int(
-        len(loader) * int(opt_args["epochs"]) * float(opt_args.get("ipe_scale", 1.0))
     )
     momentum_scheduler = LinearMomentumSchedule(
         opt_args["ema"][0], opt_args["ema"][1], total_steps
     )
 
-    start_epoch = 0
+    data_pass = 0
+    batch_in_pass = 0
     global_step = 0
-    linear_probe_state = {
-        "latest": None,
-        "best_val_top1": float("-inf"),
-        "best_epoch": None,
-    }
-    babel_probe_state = (
-        {
-            name: {"latest": None, "best_val_map": float("-inf"), "best_epoch": None}
-            for name in ("babel-60", "babel-120")
-        }
-        if babel_probe_enabled else None
-    )
-    online_metrics_state = {"latest": None}
-    segmentation_probe_state = {
-        "latest": None, "best_val_map": float("-inf"), "best_epoch": None,
-        "protocol_hash": None,
-    }
-    attentive_probe_state = (
-        {name: {"latest": None, "best_val_map": float("-inf"), "best_epoch": None}
-         for name in ("babel-60", "babel-120")} if attentive_enabled else None
-    )
     latest_path = output / f"{log_args['write_tag']}-latest.pth.tar"
-    best_accuracy_path = output / f"{log_args['write_tag']}-best-accuracy.pth.tar"
     should_load = resume_requested
     if should_load:
         read_name = meta_args.get("read_checkpoint")
         load_path = output / read_name if read_name else latest_path
         if not load_path.is_file():
             raise FileNotFoundError(f"Checkpoint requested but not found: {load_path}")
-        start_epoch, global_step = _load_checkpoint(
+        data_pass, batch_in_pass, global_step = _load_checkpoint(
             load_path,
             device=device,
             encoder=encoder,
@@ -769,14 +480,10 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             rank=rank,
             world_size=world_size,
             architecture=architecture,
-            linear_probe_state=linear_probe_state,
-            babel_probe_state=babel_probe_state,
-            attentive_probe_state=attentive_probe_state,
-            probe_protocols=_probe_protocols(args),
-            online_metrics_state=online_metrics_state,
-            segmentation_probe_state=segmentation_probe_state,
+            config=args,
+            batches_per_pass=batches_per_pass,
         )
-        logger.info("Resumed %s at epoch=%d global_step=%d", load_path, start_epoch, global_step)
+        logger.info("Resumed %s at iteration=%d", load_path, global_step)
 
     if distributed.distributed:
         ddp_kwargs = {"broadcast_buffers": False}
@@ -800,111 +507,13 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         predictor_params / 1.0e6,
     )
 
-    csv_logger = None
+    _run_rank_zero(initialize_output, is_main=distributed.is_main)
+
     tensorboard_writer = None
     if distributed.is_main:
-        csv_logger = CSVLogger(
-            str(output / f"{log_args['write_tag']}.csv"),
-            ("%d", "epoch"),
-            ("%d", "iteration"),
-            ("%d", "global_step"),
-            ("%.7f", "loss"),
-            ("%.7e", "learning_rate"),
-            ("%.7e", "weight_decay"),
-            ("%.3f", "time_ms"),
-        )
-        # A committed checkpoint already includes its evaluation at global_step.
-        # Purge only later, uncommitted events; compatible resume skips that
-        # completed evaluation and therefore will not write its scalar again.
+        # Purge only events after the resumed checkpoint's global step.
         tensorboard_writer = _make_tensorboard_writer(
             log_args, output, global_step + 1 if should_load else global_step
-        )
-
-    online_attentive_probe = None
-    if attentive_enabled and distributed.is_main:
-        from experiment.linear_probe.online_attentive import OnlineAttentiveBabelProbes
-
-        online_attentive_probe = OnlineAttentiveBabelProbes(args, attentive_args, device=device)
-        logger.info("Enabled online attentive BABEL probes (epochs=%d, lr=%.3g, frequency=%d)",
-                    online_attentive_probe.epochs, online_attentive_probe.learning_rate, attentive_frequency)
-    online_linear_probe = None
-    if probe_enabled and distributed.is_main:
-        if babel_probe_enabled:
-            from experiment.linear_probe.online import OnlineBabelProbes
-
-            online_linear_probe = OnlineBabelProbes(args, probe_args, device=device)
-            logger.info(
-                "Enabled online BABEL-60 and BABEL-120 probes "
-                "(epochs=%d, lr=%.3g, frequency=%d)",
-                online_linear_probe.epochs,
-                online_linear_probe.learning_rate,
-                probe_frequency,
-            )
-        else:
-            from experiment.linear_probe.online import OnlineLinearProbe
-
-            online_linear_probe = OnlineLinearProbe(args, probe_args, device=device)
-            logger.info(
-                "Enabled online linear probe on %s (epochs=%d, lr=%.3g, frequency=%d)",
-                online_linear_probe.dataset_root,
-                online_linear_probe.epochs,
-                online_linear_probe.learning_rate,
-                probe_frequency,
-            )
-
-    online_segmentation_probe = None
-    if segmentation_enabled:
-        def initialize_segmentation():
-            nonlocal online_segmentation_probe
-            from experiment.segmentation_probe import OnlineSegmentationProbe
-
-            rng_state = capture_rng_state()
-            try:
-                online_segmentation_probe = OnlineSegmentationProbe(
-                    args, segmentation_args, device=device
-                )
-            finally:
-                restore_rng_state(rng_state)
-            return online_segmentation_probe.protocol_hash
-
-        protocol_hash = _run_rank_zero(initialize_segmentation, is_main=distributed.is_main)
-        if segmentation_probe_state["protocol_hash"] != protocol_hash:
-            segmentation_probe_state.update(latest=None, best_val_map=float("-inf"),
-                                            best_epoch=None, protocol_hash=protocol_hash)
-        logger.info("Enabled BABEL segmentation linear probe (frequency=%d)", segmentation_frequency)
-
-    online_metrics = None
-    if metrics_enabled and metrics_kind == "motion":
-        def initialize_motion_metrics():
-            nonlocal online_metrics
-            from experiment.motion_online_metrics import MotionOnlineMetrics
-
-            rng_state = capture_rng_state()
-            try:
-                online_metrics = MotionOnlineMetrics(args, metric_args, device=device)
-            finally:
-                restore_rng_state(rng_state)
-            return online_metrics.protocol_hash
-
-        protocol_hash = _run_rank_zero(initialize_motion_metrics, is_main=distributed.is_main)
-        saved = online_metrics_state["latest"] or {}
-        if saved.get("protocol_hash") != protocol_hash:
-            online_metrics_state["latest"] = None
-        logger.info("Enabled online motion metrics (frequency=%d)", metrics_frequency)
-    elif metrics_enabled and distributed.is_main:
-        from experiment.online_metrics import OnlineRepresentationMetrics
-
-        online_metrics = OnlineRepresentationMetrics(
-            args,
-            metric_args,
-            device=device,
-            collator=_build_mask_collator(args, layout),
-        )
-        logger.info(
-            "Enabled online representation metrics on %d fixed validation samples "
-            "(frequency=%d)",
-            len(online_metrics.indices),
-            metrics_frequency,
         )
 
     use_bfloat16 = bool(meta_args.get("use_bfloat16", False))
@@ -914,293 +523,22 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     if use_float16 and device.type != "cuda":
         raise ValueError("Float16 training requires CUDA; use bfloat16 or float32 on CPU")
     amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16 if use_float16 else None
-    epochs = int(opt_args["epochs"])
-    checkpoint_frequency = int(log_args.get("checkpoint_freq", 50))
-    log_frequency = int(log_args.get("log_freq", 10))
-    if checkpoint_frequency <= 0:
-        raise ValueError("logging.checkpoint_freq must be positive")
-    if log_frequency <= 0:
-        raise ValueError("logging.log_freq must be positive")
-    warmup = float(opt_args["warmup"])
     clip_grad = float(opt_args["clip_grad"]) if opt_args.get("clip_grad") is not None else None
 
-    def record_babel_probes(pretrain_epoch: int, summaries: dict, state: dict, kind: str) -> set[str]:
-        improved = set()
-        for name, summary in summaries.items():
-            score = float(summary["best_val"]["mean_average_precision"])
-            current = state[name]
-            current["latest"] = {"pretrain_epoch": pretrain_epoch, "global_step": global_step, **summary}
-            if score > float(current["best_val_map"]):
-                current.update(best_val_map=score, best_epoch=pretrain_epoch)
-                improved.add(name)
-            logger.info("epoch=%d %s %s val_mAP=%.4f best_val_mAP=%.4f best_epoch=%s",
-                        pretrain_epoch, kind, name, score, current["best_val_map"], current["best_epoch"])
-        _write_tensorboard_babel_probes(tensorboard_writer, global_step=global_step,
-            summaries=summaries, state=state, probe_name=kind)
-        return improved
-
-    def run_online_attentive_probe(pretrain_epoch: int) -> set[str]:
-        if not distributed.is_main:
-            return set()
-        if online_attentive_probe is None or attentive_probe_state is None:
-            raise RuntimeError("Online attentive probe was not initialized on rank 0")
-        summaries = _evaluate_online_probe_preserving_rng(online_attentive_probe, target_encoder)
-        return record_babel_probes(pretrain_epoch, summaries, attentive_probe_state, "attentive_probe")
-
-    def run_online_linear_probe(pretrain_epoch: int) -> tuple[bool, set[str]]:
-        if not distributed.is_main:
-            return False, set()
-        if online_linear_probe is None:
-            raise RuntimeError("Online linear probe was not initialized on rank 0")
-        probe_summary = _evaluate_online_probe_preserving_rng(
-            online_linear_probe, target_encoder
-        )
-        if babel_probe_enabled:
-            assert babel_probe_state is not None
-            return False, record_babel_probes(pretrain_epoch, probe_summary, babel_probe_state, "linear_probe")
-        test_top1 = float(probe_summary["test"]["top1_accuracy"])
-        linear_probe_state["latest"] = {
-            "pretrain_epoch": pretrain_epoch,
-            "global_step": global_step,
-            **probe_summary,
-        }
-        validation_used = bool(probe_summary.get("validation_used", True))
-        val_top1 = (
-            float(probe_summary["best_val"]["top1_accuracy"])
-            if validation_used
-            else None
-        )
-        improved = validation_used and val_top1 > float(linear_probe_state["best_val_top1"])
-        if improved:
-            linear_probe_state["best_val_top1"] = val_top1
-            linear_probe_state["best_epoch"] = pretrain_epoch
-        _write_tensorboard_linear_probe(
-            tensorboard_writer,
-            global_step=global_step,
-            summary=probe_summary,
-            best_val_top1=(
-                float(linear_probe_state["best_val_top1"])
-                if validation_used
-                else None
-            ),
-        )
-        if validation_used:
-            logger.info(
-                "epoch=%d linear_probe val_top1=%.4f test_top1=%.4f "
-                "best_val_top1=%.4f best_epoch=%s",
-                pretrain_epoch,
-                val_top1,
-                test_top1,
-                float(linear_probe_state["best_val_top1"]),
-                linear_probe_state["best_epoch"],
-            )
-        else:
-            logger.info(
-                "epoch=%d linear_probe test_top1=%.4f selection=fixed_last_epoch "
-                "(diagnostic only)",
-                pretrain_epoch,
-                test_top1,
-            )
-        return improved, set()
-
-    def run_online_segmentation_probe(pretrain_epoch: int) -> bool:
-        summary = _run_rank_zero(
-            lambda: _evaluate_frozen_encoder_preserving_rng(
-                online_segmentation_probe, target_encoder, pretrain_epoch=pretrain_epoch
-            ), is_main=distributed.is_main,
-        )
-        summary = {**summary, "pretrain_epoch": int(pretrain_epoch),
-                   "global_step": int(global_step)}
-        score = float(summary["best_val"]["babel-120"]["frame_map"])
-        if not np.isfinite(score):
-            raise FloatingPointError("Segmentation probe returned non-finite validation mAP")
-        improved = score > segmentation_probe_state["best_val_map"]
-        segmentation_probe_state["latest"] = summary
-        if improved:
-            segmentation_probe_state.update(best_val_map=score, best_epoch=pretrain_epoch)
-        if distributed.is_main:
-            _write_tensorboard_segmentation_probe(
-                tensorboard_writer, global_step=global_step, summary=summary,
-                state=segmentation_probe_state,
-            )
-            _upsert_epoch_jsonl(output / "segmentation-probe.jsonl", summary)
-            logger.info("epoch=%d segmentation frame_mAP120=%.5f frame_mAP60=%s best_epoch=%s",
-                        pretrain_epoch, score, summary["best_val"]["babel-60"]["frame_map"],
-                        segmentation_probe_state["best_epoch"])
-        return improved
-
-    def run_online_representation_metrics(pretrain_epoch: int) -> None:
-        if metrics_kind == "motion":
-            summary = _run_rank_zero(
-                lambda: _evaluate_frozen_encoder_preserving_rng(online_metrics, target_encoder),
-                is_main=distributed.is_main,
-            )
-        else:
-            if not distributed.is_main:
-                return
-            if online_metrics is None:
-                raise RuntimeError("Online representation metrics were not initialized")
-            summary = _evaluate_online_metrics_preserving_rng(
-                online_metrics, target_encoder, _unwrapped(predictor)
-            )
-        summary = {
-            "pretrain_epoch": int(pretrain_epoch),
-            "global_step": int(global_step),
-            **summary,
-        }
-        if metrics_kind == "motion" and distributed.is_main:
-            previous = online_metrics_state["latest"] or {}
-            previous_epoch = int(previous.get("pretrain_epoch", 0))
-            epoch_path = output / "training-epochs.jsonl"
-            epoch_records = ([json.loads(line) for line in epoch_path.read_text().splitlines()]
-                             if epoch_path.exists() else [])
-            training_seconds = sum(record["training_wall_seconds"] for record in epoch_records
-                                   if previous_epoch < record["pretrain_epoch"] <= pretrain_epoch)
-            summary["training_interval_seconds"] = training_seconds
-            summary["overhead_percent"] = (
-                100 * float(summary["elapsed_seconds"]) / training_seconds
-                if training_seconds > 0 else None
-            )
-        online_metrics_state["latest"] = summary
-        if not distributed.is_main:
-            return
-        _write_tensorboard_online_metrics(
-            tensorboard_writer, global_step=global_step, summary=summary
-        )
-        _upsert_epoch_jsonl(output / "online-metrics.jsonl", summary)
-        if metrics_kind == "motion":
-            logger.info("epoch=%d online_motion %s", pretrain_epoch,
-                        json.dumps(summary["retrieval"], sort_keys=True))
-            return
-        heldout = summary["heldout_jepa"]
-        logger.info(
-            "epoch=%d online_metrics rankme=%.3f body_std=%.4g "
-            "prediction_gain=%.4f trajectory_reliance=%.4f",
-            pretrain_epoch,
-            summary["representation"]["body"]["rankme"],
-            summary["representation"]["body"]["mean_std"],
-            heldout["prediction_gain"],
-            heldout["trajectory_ablation"]["trajectory_reliance"],
-        )
-
-    # Establish a baseline for new or changed probe protocols. Compatible
-    # resumed results are retained without repeating the expensive evaluation.
-    needs_initial_probe = (
-        probe_enabled and (
-            any(state["latest"] is None for state in babel_probe_state.values())
-            if babel_probe_state is not None
-            else linear_probe_state["latest"] is None
-        )
-    )
-    needs_initial_metrics = (
-        metrics_enabled and online_metrics_state["latest"] is None
-    )
-    needs_initial_attentive = attentive_enabled and any(
-        state["latest"] is None for state in attentive_probe_state.values()
-    )
-    needs_initial_segmentation = segmentation_enabled and segmentation_probe_state["latest"] is None
-    if needs_initial_probe or needs_initial_metrics or needs_initial_attentive or needs_initial_segmentation:
-        if not should_load:
-            # A baseline head can take many epochs. Persist the untouched
-            # pretraining state first so a failure can resume that head instead
-            # of leaving an existing output directory with no latest checkpoint.
-            # Every rank participates in the RNG/mask-state collectives.
-            _save_checkpoint(
-                latest_path,
-                encoder=encoder,
-                predictor=predictor,
-                target_encoder=target_encoder,
-                optimizer=optimizer,
-                scaler=scaler,
-                lr_scheduler=lr_scheduler,
-                wd_scheduler=wd_scheduler,
-                momentum_scheduler=momentum_scheduler,
-                mask_collator=mask_collator,
-                next_epoch=start_epoch,
-                global_step=global_step,
-                loss=float("nan"),
-                world_size=world_size,
-                rank=rank,
-                config=args,
-                architecture=architecture,
-                linear_probe_latest=linear_probe_state["latest"],
-                best_probe_val_top1=float(linear_probe_state["best_val_top1"]),
-                best_probe_epoch=linear_probe_state["best_epoch"],
-                babel_probe_state=babel_probe_state,
-                attentive_probe_state=attentive_probe_state,
-                online_metrics_latest=online_metrics_state["latest"],
-                segmentation_probe_state=segmentation_probe_state,
-            )
-        initial_probe_improved, initial_babel_improved = (
-            run_online_linear_probe(pretrain_epoch=start_epoch)
-            if needs_initial_probe else (False, set())
-        )
-        initial_attentive_improved = (
-            run_online_attentive_probe(pretrain_epoch=start_epoch) if needs_initial_attentive else set()
-        )
-        initial_segmentation_improved = (
-            run_online_segmentation_probe(pretrain_epoch=start_epoch)
-            if needs_initial_segmentation else False
-        )
-        if needs_initial_metrics:
-            run_online_representation_metrics(pretrain_epoch=start_epoch)
-        _save_checkpoint(
-            latest_path,
-            encoder=encoder,
-            predictor=predictor,
-            target_encoder=target_encoder,
-            optimizer=optimizer,
-            scaler=scaler,
-            lr_scheduler=lr_scheduler,
-            wd_scheduler=wd_scheduler,
-            momentum_scheduler=momentum_scheduler,
-            mask_collator=mask_collator,
-            next_epoch=start_epoch,
-            global_step=global_step,
-            loss=float("nan"),
-            world_size=world_size,
-            rank=rank,
-            config=args,
-            architecture=architecture,
-            linear_probe_latest=linear_probe_state["latest"],
-            best_probe_val_top1=float(linear_probe_state["best_val_top1"]),
-            best_probe_epoch=linear_probe_state["best_epoch"],
-            babel_probe_state=babel_probe_state,
-            attentive_probe_state=attentive_probe_state,
-            online_metrics_latest=online_metrics_state["latest"],
-            segmentation_probe_state=segmentation_probe_state,
-        )
-        if distributed.is_main and initial_probe_improved:
-            _atomic_copy(latest_path, best_accuracy_path)
-        if distributed.is_main:
-            for name in initial_babel_improved:
-                _atomic_copy(
-                    latest_path,
-                    output / f"{log_args['write_tag']}-best-{name}-map.pth.tar",
-                )
-        if distributed.is_main:
-            for name in initial_attentive_improved:
-                _atomic_copy(latest_path, output / f"{log_args['write_tag']}-best-attentive-{name}-map.pth.tar")
-            if initial_segmentation_improved:
-                _atomic_copy(latest_path, output / f"{log_args['write_tag']}-best-segmentation-map.pth.tar")
-            if start_epoch == 0:
-                _atomic_copy(latest_path, output / "initial-checkpoint.pth.tar")
-        barrier()
-
-    # These meters span epoch boundaries and reset only after a log event, so
+    # These meters span data passes and reset only after a log event, so
     # every TensorBoard point summarizes exactly the steps since the prior one.
     interval_loss_meter = AverageMeter()
     interval_time_meter = AverageMeter()
     interval_lr_meter = AverageMeter()
     interval_wd_meter = AverageMeter()
-    for epoch in range(start_epoch, epochs):
-        epoch_started = time.perf_counter()
-        sampler.set_epoch(epoch)
-        encoder.train()
-        predictor.train()
-        loss_meter = AverageMeter()
-        time_meter = AverageMeter()
-        for iteration, (batch, masks_enc, masks_pred) in enumerate(loader):
+    encoder.train()
+    predictor.train()
+    loss_meter = AverageMeter()
+    while global_step < total_steps:
+        sampler.set_epoch(data_pass)
+        sampler.start_index = batch_in_pass * int(data_args["batch_size"])
+        for batch in loader:
+            masks_enc, masks_pred = mask_collator.sample_masks(batch[2].tolist())
             started = time.perf_counter()
             motion = batch[0].to(device=device, dtype=torch.float32, non_blocking=True)
             fps = batch[1].to(device=device, dtype=torch.float32, non_blocking=True)
@@ -1235,7 +573,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             # full precision
             if scaler is None:
                 loss.backward()
-                if (epoch > warmup) and (clip_grad is not None):
+                if (global_step >= warmup_steps) and (clip_grad is not None):
                     torch.nn.utils.clip_grad_norm_(encoder.parameters(), clip_grad)
                     torch.nn.utils.clip_grad_norm_(predictor.parameters(), clip_grad)
                 optimizer.step()
@@ -1244,7 +582,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             else:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                if (epoch > warmup) and (clip_grad is not None):
+                if (global_step >= warmup_steps) and (clip_grad is not None):
                     torch.nn.utils.clip_grad_norm_(encoder.parameters(), clip_grad)
                     torch.nn.utils.clip_grad_norm_(predictor.parameters(), clip_grad)
                 scaler.step(optimizer)
@@ -1253,27 +591,21 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             momentum = momentum_scheduler.step()
             update_ema(encoder, target_encoder, momentum)
             global_step += 1
+            batch_in_pass += 1
+            if batch_in_pass == batches_per_pass:
+                data_pass += 1
+                batch_in_pass = 0
             reported_loss = float(reduce_mean(loss).cpu())
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             loss_meter.update(reported_loss)
-            time_meter.update(elapsed_ms)
             interval_loss_meter.update(reported_loss)
             interval_time_meter.update(elapsed_ms)
             interval_lr_meter.update(learning_rate)
             interval_wd_meter.update(weight_decay)
             if distributed.is_main:
-                csv_logger.log(
-                    epoch + 1,
-                    iteration,
-                    global_step,
-                    reported_loss,
-                    learning_rate,
-                    weight_decay,
-                    elapsed_ms,
-                )
-                if global_step % log_frequency == 0:
+                if global_step % log_frequency == 0 or global_step == total_steps:
                     stats = grad_logger(_unwrapped(encoder).named_parameters())
                     memory = (
                         torch.cuda.max_memory_allocated(device) / 1024.0**2
@@ -1281,10 +613,10 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                         else 0.0
                     )
                     logger.info(
-                        "epoch=%d iteration=%d loss=%.5f lr=%.3e wd=%.3e "
+                        "iteration=%d/%d loss=%.5f lr=%.3e wd=%.3e "
                         "time=%.1fms memory=%.0fMiB grad=[%.2e, %.2e]",
-                        epoch + 1,
-                        iteration,
+                        global_step,
+                        total_steps,
                         interval_loss_meter.avg,
                         interval_lr_meter.avg,
                         interval_wd_meter.avg,
@@ -1296,7 +628,6 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                     _write_tensorboard_interval(
                         tensorboard_writer,
                         global_step=global_step,
-                        epoch=epoch + 1,
                         loss=interval_loss_meter.avg,
                         learning_rate=interval_lr_meter.avg,
                         weight_decay=interval_wd_meter.avg,
@@ -1315,90 +646,40 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             if not np.isfinite(reported_loss):
                 raise FloatingPointError(f"Non-finite loss at step {global_step}: {reported_loss}")
 
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        if distributed.is_main:
-            _upsert_epoch_jsonl(output / "training-epochs.jsonl", {
-                "pretrain_epoch": epoch + 1, "global_step": global_step,
-                "training_wall_seconds": time.perf_counter() - epoch_started,
-                "step_compute_seconds": time_meter.sum / 1000,
-                "loss": loss_meter.avg,
-            })
-        should_probe = probe_enabled and (
-            (epoch + 1) % probe_frequency == 0 or (epoch + 1) == epochs
-        )
-        probe_improved = False
-        babel_improved: set[str] = set()
-        if should_probe and distributed.is_main:
-            probe_improved, babel_improved = run_online_linear_probe(pretrain_epoch=epoch + 1)
-        attentive_improved: set[str] = set()
-        if attentive_enabled and distributed.is_main and (
-            (epoch + 1) % attentive_frequency == 0 or (epoch + 1) == epochs
-        ):
-            attentive_improved = run_online_attentive_probe(pretrain_epoch=epoch + 1)
-        segmentation_improved = False
-        if segmentation_enabled and (
-            (epoch + 1) % segmentation_frequency == 0 or (epoch + 1) == epochs
-        ):
-            segmentation_improved = run_online_segmentation_probe(pretrain_epoch=epoch + 1)
-        should_measure = metrics_enabled and (
-            (epoch + 1) % metrics_frequency == 0 or (epoch + 1) == epochs
-        )
-        if should_measure:
-            run_online_representation_metrics(pretrain_epoch=epoch + 1)
-
-        _save_checkpoint(
-            latest_path,
-            encoder=encoder,
-            predictor=predictor,
-            target_encoder=target_encoder,
-            optimizer=optimizer,
-            scaler=scaler,
-            lr_scheduler=lr_scheduler,
-            wd_scheduler=wd_scheduler,
-            momentum_scheduler=momentum_scheduler,
-            mask_collator=mask_collator,
-            next_epoch=epoch + 1,
-            global_step=global_step,
-            loss=loss_meter.avg,
-            world_size=world_size,
-            rank=rank,
-            config=args,
-            architecture=architecture,
-            linear_probe_latest=linear_probe_state["latest"],
-            best_probe_val_top1=float(linear_probe_state["best_val_top1"]),
-            best_probe_epoch=linear_probe_state["best_epoch"],
-            babel_probe_state=babel_probe_state,
-            attentive_probe_state=attentive_probe_state,
-            online_metrics_latest=online_metrics_state["latest"],
-            segmentation_probe_state=segmentation_probe_state,
-        )
-        if distributed.is_main and ((epoch + 1) % checkpoint_frequency == 0 or (epoch + 1) == epochs):
-            checkpoint_path = output / f"{log_args['write_tag']}-ep{epoch + 1}.pth.tar"
-            # The latest checkpoint is already complete and atomically written.
-            # Copy its bytes instead of loading arbitrary pickle content merely
-            # to create the named epoch snapshot.
-            _atomic_copy(latest_path, checkpoint_path)
-        if distributed.is_main and probe_improved:
-            _atomic_copy(latest_path, best_accuracy_path)
-        if distributed.is_main:
-            for name in babel_improved:
-                _atomic_copy(
+            if global_step % checkpoint_frequency == 0 or global_step == total_steps:
+                _save_checkpoint(
                     latest_path,
-                    output / f"{log_args['write_tag']}-best-{name}-map.pth.tar",
+                    encoder=encoder,
+                    predictor=predictor,
+                    target_encoder=target_encoder,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    lr_scheduler=lr_scheduler,
+                    wd_scheduler=wd_scheduler,
+                    momentum_scheduler=momentum_scheduler,
+                    mask_collator=mask_collator,
+                    data_pass=data_pass,
+                    batch_in_pass=batch_in_pass,
+                    batches_per_pass=batches_per_pass,
+                    global_step=global_step,
+                    loss=loss_meter.avg,
+                    world_size=world_size,
+                    rank=rank,
+                    config=args,
+                    architecture=architecture,
                 )
-        if distributed.is_main:
-            for name in attentive_improved:
-                _atomic_copy(latest_path, output / f"{log_args['write_tag']}-best-attentive-{name}-map.pth.tar")
-            if segmentation_improved:
-                _atomic_copy(latest_path, output / f"{log_args['write_tag']}-best-segmentation-map.pth.tar")
-        barrier()
-        logger.info("epoch=%d average_loss=%.6f", epoch + 1, loss_meter.avg)
+                checkpoint_path = output / f"{log_args['write_tag']}-it{global_step}.pth.tar"
+                _run_rank_zero(
+                    lambda: _atomic_copy(latest_path, checkpoint_path),
+                    is_main=distributed.is_main,
+                )
+                loss_meter.reset()
+            if global_step == total_steps:
+                break
 
     if tensorboard_writer is not None:
         tensorboard_writer.close()
     return {
-        "next_epoch": epochs,
         "global_step": global_step,
         "checkpoint": str(latest_path),
     }

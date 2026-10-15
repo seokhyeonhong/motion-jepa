@@ -1,3 +1,4 @@
+# Frame-token JEPA with built-in RoPE and length-aware masking.
 data:
   batch_size: 512  # Per rank; global batch is batch_size * world_size.
   root_path: ./dataset/bones-seed-processed-nframes150-min60
@@ -15,34 +16,17 @@ data:
   stats_path: stats
 
 logging:
-  folder: ./output/mot_base_1d-bs.512-ep.300
+  folder: ./output/mot_base_1d-bs.512-it.200000-nframes60-150
   write_tag: motion-jepa-1d
   log_freq: 100
   tensorboard: true
   tensorboard_folder: tensorboard
-  checkpoint_freq: 100
-
-linear_probe:
-  enabled: false
-
-segmentation_probe:
-  enabled: true
-  frequency: 30
-  dataset_root: ./dataset/babel-segmentation-120-processed-nframes30-150
-  epochs: 50
-  feature_batch_size: 256
-  batch_size: 256
-  num_workers: 8
-  lr: 0.3
-  momentum: 0.9
-  weight_decay: 0.0
-  seed: 42
-  standardize: true
-
-attentive_probe:
-  enabled: false
+  checkpoint_interval: 10000  # Iterations; also saves at the final iteration.
 
 mask:
+  context_selection: random  # all | prefix | random
+  min_context_tokens: 1
+  min_context_ratio: 0.2  # Minimum valid context fraction for each sample.
   allow_overlap: false
   num_enc_masks: 1
   num_pred_masks: 4
@@ -59,13 +43,12 @@ meta:
   use_float16: false
 
 optimization:
-  ema: [0.996, 1.0]
-  epochs: 300
+  ema: [0.99925, 0.99925]
+  iterations: 200000
   final_lr: 1.0e-6
   final_weight_decay: 0.4
-  ipe_scale: 1.0
   lr: 0.0005
   start_lr: 0.0001
-  warmup: 40
+  warmup_iterations: 20000
   weight_decay: 0.04
   clip_grad: 1.0

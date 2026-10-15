@@ -6,27 +6,24 @@ import gc
 import json
 import os
 import shutil
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from dataset import MotionDataset
-from experiment.linear_probe.features import (
-    _atomic_json_save, _sha256_file, load_frozen_encoder,
-    resolve_pretraining_stats,
+from experiment.utils import (
+    _atomic_json_save, _sha256_file,
 )
 from .utils import resolve_device
 from .dataset import (
     DEFAULT_ANNOTATIONS_PATH, DEFAULT_CACHE_ROOT, DEFAULT_DATASET_ROOT,
-    DEFAULT_TEXT_MODEL, SPLITS, PreparedPairDataset, RaggedTokenBank,
+    DEFAULT_TEXT_MODEL, DEFAULT_TEXT_ADAPTER, SPLITS, PreparedPairDataset, RaggedTokenBank,
     build_paired_index, json_digest, select_training_subset,
 )
-from .normalization import ensure_feature_statistics
 
 
 CACHE_FORMAT_VERSION = 2
@@ -44,13 +41,16 @@ def _model_source_signature(model: str) -> dict[str, Any]:
     return {"model": str(path), "local_files": {file.name: _sha256_file(file) for file in files}}
 
 
-def _text_signature(paired, model, revision, max_length):
+def _text_signature(paired, model, revision, max_length, adapter=None, adapter_revision=None):
     return {
         "format_version": CACHE_FORMAT_VERSION, "dtype": "bfloat16_uint16",
         "dataset": paired["provenance"], "catalog_sha256": paired["catalog_sha256"],
         "model_source": _model_source_signature(str(model)),
         "text_revision": revision, "max_text_length": int(max_length),
-        "feature": "encoder_last_hidden_state_valid_tokens",
+        "feature": "llm2vec_sentence_mean_bidirectional_v1",
+        "adapter_source": _model_source_signature(str(adapter or DEFAULT_TEXT_ADAPTER)),
+        "adapter_revision": adapter_revision,
+        "extraction_batch_size": 1, "doc_max_length": 400,
     }
 
 
@@ -59,15 +59,6 @@ def _stats_signature(root: Path):
         "stats_root": str(root.resolve()),
         "stats_mean_sha256": _sha256_file(root / "mean.npy"),
         "stats_std_sha256": _sha256_file(root / "std.npy"),
-    }
-
-
-def _motion_signature(paired, stats, jepa_source):
-    return {
-        "format_version": CACHE_FORMAT_VERSION, "dtype": "bfloat16_uint16",
-        "dataset": paired["provenance"], "paired_index_sha256": paired["paired_index_sha256"],
-        **stats, "jepa_source": jepa_source,
-        "pooling": "spatial_mean_preserve_temporal",
     }
 
 
@@ -126,70 +117,34 @@ def write_ragged_bank(path, keys, lengths, feature_dim, signature, batches, extr
     return RaggedTokenBank(path, signature)
 
 
-def load_text_backbone(model_name, revision, device):
-    """Load a frozen T5Gemma or DistilBERT encoder using the environment HF cache."""
-    # Deliberately deferred: cache-only training has no Transformers dependency.
+def load_text_backbone(model_name, revision, device, adapter=None, adapter_revision=None):
+    """Load the frozen LLM2Vec backbone; training only needs its cached features."""
+    adapter = str(adapter or DEFAULT_TEXT_ADAPTER)
     try:
-        from transformers import AutoConfig, AutoTokenizer, DistilBertModel, T5GemmaEncoderModel
-    except ImportError as error:
-        raise RuntimeError(
-            f"Cannot extract {model_name!r}: install the text dependencies with "
-            "pip install -r experiment/tmr/requirements.txt"
-        ) from error
-    try:
-        config = AutoConfig.from_pretrained(model_name, revision=revision)
-        if config.model_type == "t5gemma":
-            config.is_encoder_decoder = False
-            model_class = T5GemmaEncoderModel
-            feature_dim = int(config.encoder.hidden_size)
-        elif config.model_type == "distilbert":
-            model_class = DistilBertModel
-            feature_dim = int(config.dim)
-        else:
-            raise ValueError(
-                f"Text model {model_name!r} must use model_type='t5gemma' or "
-                f"'distilbert', got {config.model_type!r}"
-            )
-        # Leave cache_dir unset: honor HF_HOME/HF_HUB_CACHE from motion-jepa.
-        resolved_revision = getattr(config, "_commit_hash", None) or revision
-        tokenizer = AutoTokenizer.from_pretrained(model_name, revision=resolved_revision)
-        model, loading = model_class.from_pretrained(
-            model_name, revision=resolved_revision, config=config,
-            dtype=torch.bfloat16, output_loading_info=True,
+        from .llm2vec import load_llm2vec
+        model, tokenizer, info = load_llm2vec(
+            model_name, revision, adapter, adapter_revision, device,
         )
+    except ImportError as error:
+        raise RuntimeError("Install text dependencies: pip install -r experiment/tmr/requirements.txt") from error
     except OSError as error:
         raise RuntimeError(
-            f"Cannot load text model {model_name!r}. Check the model ID/revision or local files. "
-            "For Google's gated Gemma weights, accept the model's Hugging Face access terms "
-            "and authenticate with hf auth login before running prepare_cache."
+            "Cannot load LLM2Vec. Check the MNTP/supervised adapter paths and "
+            "Hugging Face access to meta-llama/Meta-Llama-3-8B-Instruct."
         ) from error
-    if loading.get("missing_keys") or loading.get("mismatched_keys"):
-        raise ValueError(f"Text encoder weights did not load completely: {loading}")
-    model.to(device).eval().requires_grad_(False)
-    if hasattr(model, "decoder") or hasattr(model, "lm_head"):
-        raise ValueError("Text feature extraction must load the encoder only")
-    tokenizer_hash = json_digest({
+    info["tokenizer_sha256"] = json_digest({
         "backend": tokenizer.backend_tokenizer.to_str(),
         "special_tokens": {key: str(value) for key, value in tokenizer.special_tokens_map.items()},
     })
-    info = {
-        "model": str(model_name), "revision": revision,
-        "resolved_revision": getattr(config, "_commit_hash", None),
-        "tokenizer_sha256": tokenizer_hash,
-        "feature_dim": feature_dim, "dtype": "bfloat16",
-        "model_class": model_class.__name__,
-    }
-    if config.model_type == "distilbert":
-        info["max_position_embeddings"] = int(config.max_position_embeddings)
     return model, tokenizer, info
 
 
-def _prepare_text(path, paired, *, model_name, revision, max_length, device, batch_size, recompute):
-    signature = _text_signature(paired, model_name, revision, max_length)
+def _prepare_text(path, paired, *, model_name, revision, max_length, device, batch_size, recompute, adapter=None, adapter_revision=None):
+    signature = _text_signature(paired, model_name, revision, max_length, adapter, adapter_revision)
     existing = _existing_bank(path, signature, recompute)
     if existing is not None:
         return existing
-    model, tokenizer, info = load_text_backbone(model_name, revision, device)
+    model, tokenizer, info = load_text_backbone(model_name, revision, device, adapter, adapter_revision)
     position_limit = info.get("max_position_embeddings")
     if position_limit is not None and max_length > position_limit:
         raise ValueError(
@@ -198,29 +153,18 @@ def _prepare_text(path, paired, *, model_name, revision, max_length, device, bat
         )
     keys = list(paired["catalog"])
     texts = [paired["catalog"][key] for key in keys]
-    lengths, truncated = [], 0
-    for start in range(0, len(texts), batch_size):
-        tokenized = tokenizer(texts[start:start + batch_size], padding=False, truncation=False)
-        sizes = [len(ids) for ids in tokenized["input_ids"]]
-        lengths.extend(min(size, max_length) for size in sizes)
-        truncated += sum(size > max_length for size in sizes)
-    if not keys or any(length < 1 for length in lengths):
-        raise ValueError("Text cache requires nonempty captions and valid token sequences")
-    info.update(max_text_length=max_length, truncated_captions=truncated)
+    info.update(
+        max_text_length=max_length,
+        truncated_captions=sum(model.token_length(text, max_length) > max_length for text in texts),
+    )
 
-    def batches():
-        with torch.inference_mode():
-            for start in tqdm(range(0, len(texts), batch_size), desc=f"Cache {info['model_class']} tokens"):
-                encoded = tokenizer(
-                    texts[start:start + batch_size], padding=True, truncation=True,
-                    max_length=max_length, return_tensors="pt",
-                )
-                inputs = {key: value.to(device) for key, value in encoded.items() if key in {"input_ids", "attention_mask"}}
-                output = model(**inputs).last_hidden_state
-                mask = inputs["attention_mask"].bool()
-                yield [output[row, mask[row]] for row in range(len(output))]
+    def sentence_batches():
+        for start in tqdm(range(0, len(texts), batch_size), desc="Cache LLM2Vec sentences"):
+            yield model.encode(texts[start:start + batch_size], max_length, device)
     try:
-        return write_ragged_bank(path, keys, lengths, info["feature_dim"], signature, batches(), info)
+        return write_ragged_bank(
+            path, keys, [1] * len(keys), 4096, signature, sentence_batches(), info,
+        )
     finally:
         del model
         gc.collect()
@@ -253,174 +197,61 @@ def _raw_dataset(root, split, paired, stats_root):
     )
 
 
-def _prepare_motion(path, paired, records, base, encoder, source, stats, *, device, batch_size, num_workers, recompute):
-    signature = _motion_signature(paired, stats, source)
-    existing = _existing_bank(path, signature, recompute)
-    if existing is not None:
-        return existing
-    lengths = [int(encoder.token_layout.valid_token_lengths(torch.tensor(record["length"]))) for record in records]
-    if any(length < 1 for length in lengths):
-        raise ValueError("A motion clip has zero valid JEPA tokens")
-    loader = DataLoader(
-        _MotionRows(base, records), batch_size=batch_size, num_workers=num_workers,
-        shuffle=False, pin_memory=device.type == "cuda",
-    )
-
-    def batches():
-        with torch.inference_mode():
-            for motion, fps, length in tqdm(loader, desc="Cache JEPA tokens"):
-                motion = motion.to(device=device, dtype=torch.float32)
-                fps = fps.to(device=device, dtype=torch.float32)
-                length = length.to(device=device, dtype=torch.long)
-                active = torch.arange(motion.shape[1], device=device)[None] < length[:, None]
-                amp = torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
-                with amp:
-                    encoded = encoder(motion, fps, valid_frames=active)
-                if encoded.ndim == 4:
-                    encoded = encoded.mean(dim=2)
-                if encoded.ndim != 3:
-                    raise ValueError("JEPA must return [B,T,D] or [B,T,J,D]")
-                token_lengths = encoder.token_layout.valid_token_lengths(length)
-                yield [encoded[row, :int(token_lengths[row])] for row in range(len(encoded))]
-    return write_ragged_bank(
-        path, [record["sample_id"] for record in records], lengths,
-        source["model_info"]["feature_dim"], signature, batches(), source["model_info"],
-    )
-
-
 def prepare_caches(
     *, dataset_root=DEFAULT_DATASET_ROOT, annotations_path=DEFAULT_ANNOTATIONS_PATH,
-    cache_root=DEFAULT_CACHE_ROOT, input_source="raw", jepa_checkpoint=None,
-    checkpoint_key="target_encoder", stats_path=None, text_model=DEFAULT_TEXT_MODEL,
-    text_revision=None, max_text_length=256, device="auto", feature_batch_size=64,
-    text_batch_size=8, num_workers=0, recompute_features=False, max_samples_per_split=None,
+    cache_root=DEFAULT_CACHE_ROOT, stats_path=None, text_model=DEFAULT_TEXT_MODEL,
+    text_revision=None, text_adapter=None, text_adapter_revision=None, max_text_length=256, device="auto", text_batch_size=8, recompute_features=False, max_samples_per_split=None,
 ):
-    if input_source not in {"raw", "jepa"}:
-        raise ValueError("input_source must be raw or jepa")
-    if min(max_text_length, feature_batch_size, text_batch_size) < 1 or num_workers < 0:
-        raise ValueError("Lengths/batch sizes must be positive and num_workers nonnegative")
-    if checkpoint_key not in {"encoder", "target_encoder"}:
-        raise ValueError("checkpoint_key must be encoder or target_encoder")
-    if input_source == "jepa" and jepa_checkpoint is None:
-        raise ValueError("JEPA input requires --jepa-checkpoint")
+    if min(max_text_length, text_batch_size) < 1:
+        raise ValueError("Lengths and batch sizes must be positive")
     root, cache = Path(dataset_root).expanduser().resolve(), Path(cache_root).expanduser().resolve()
     target_device = resolve_device(str(device))
     paired = build_paired_index(root, annotations_path, max_samples_per_split)
     if not paired["split_counts"]["train"]:
         raise ValueError("TMR has no captioned training samples")
-    encoder, source = None, None
-    if input_source == "jepa":
-        checkpoint = Path(jepa_checkpoint).expanduser().resolve()
-        # Keep JEPA on CPU until the text model has finished and released VRAM.
-        encoder, config, info = load_frozen_encoder(checkpoint, checkpoint_key, torch.device("cpu"))
-        for key, expected in (("num_frames", paired["provenance"]["num_frames"]), ("fps", paired["provenance"]["fps"]), ("motion_dim", paired["provenance"]["raw_motion_dim"])):
-            if info[key] != expected:
-                raise ValueError(f"JEPA checkpoint {key}={info[key]} does not match dataset {expected}")
-        stats_root = resolve_pretraining_stats(config, Path(stats_path) if stats_path is not None else None)
-        source = {
-            "checkpoint_path": str(checkpoint), "checkpoint_sha256": _sha256_file(checkpoint),
-            "checkpoint_key": checkpoint_key, "layout": encoder.token_layout.signature(),
-            "model_info": info,
-        }
-    else:
-        stats_root = Path(stats_path).expanduser().resolve() if stats_path is not None else root / "stats"
+    stats_root = Path(stats_path).expanduser().resolve() if stats_path is not None else root / "stats"
     stats = _stats_signature(stats_root)
     raw_datasets = {split: _raw_dataset(root, split, paired, stats_root) for split in SPLITS}
     for split, base in raw_datasets.items():
         records = [record for record in paired["records"] if record["split"] == split]
         _MotionRows(base, records)
-    if encoder is not None:
-        lengths = encoder.token_layout.valid_token_lengths(torch.tensor([record["length"] for record in paired["records"]]))
-        if (lengths < 1).any():
-            raise ValueError("A motion clip has zero valid JEPA tokens")
     # Validate motion/statistics before an expensive text-model download or run.
     text_bank = _prepare_text(
         cache / "text", paired, model_name=str(text_model), revision=text_revision,
         max_length=max_text_length, device=target_device,
         batch_size=text_batch_size, recompute=recompute_features,
+        adapter=text_adapter, adapter_revision=text_adapter_revision,
     )
-    if encoder is not None:
-        encoder.to(target_device)
-    for split in SPLITS:
-        base = raw_datasets[split]
-        if encoder is not None:
-            _prepare_motion(
-                cache / "jepa" / split, paired,
-                [record for record in paired["records"] if record["split"] == split],
-                base, encoder, source, stats, device=target_device,
-                batch_size=feature_batch_size, num_workers=num_workers, recompute=recompute_features,
-            )
     metadata = {
-        "format_version": CACHE_FORMAT_VERSION, "input_source": input_source,
-        "motion_dim": paired["provenance"]["raw_motion_dim"] if source is None else source["model_info"]["feature_dim"],
-        "motion_num_tokens": paired["provenance"]["num_frames"] if source is None else source["model_info"]["token_num_frames"],
+        "format_version": CACHE_FORMAT_VERSION, "input_source": "raw",
+        "motion_dim": paired["provenance"]["raw_motion_dim"],
+        "motion_num_tokens": paired["provenance"]["num_frames"],
         "text_dim": text_bank.metadata["feature_dim"],
         "text_source": text_bank.metadata["model_info"], "text_signature": text_bank.metadata["signature"],
-        "jepa_source": source, **stats,
+        **stats,
         "paired_index_sha256": paired["paired_index_sha256"], "catalog_sha256": paired["catalog_sha256"],
         "split_counts": paired["split_counts"], "filtered_counts": paired["filtered_counts"],
         "provenance": paired["provenance"],
     }
-    directory = cache / input_source
+    directory = cache / "raw"
     directory.mkdir(parents=True, exist_ok=True)
-    if input_source == "jepa":
-        _, _, metadata["jepa_feature_stats"] = _jepa_statistics(
-            cache, paired, metadata, recompute=recompute_features,
-        )
     _atomic_json_save(paired, directory / "paired-index.json")
     _atomic_json_save(metadata, directory / "prepared.json")
     return metadata
 
 
-def _jepa_statistics(cache, paired, metadata, *, recompute=False, sample_ids=None):
-    stats = {key: metadata[key] for key in ("stats_root", "stats_mean_sha256", "stats_std_sha256")}
-    bank = RaggedTokenBank(cache / "jepa/train", _motion_signature(paired, stats, metadata["jepa_source"]))
-    keys = [record["sample_id"] for record in paired["records"] if record["split"] == "train"]
-    if bank.keys != keys:
-        raise ValueError("JEPA statistics must use exactly the captioned training samples")
-    return ensure_feature_statistics(bank, recompute=recompute, sample_ids=sample_ids)
-
-
-def prepare_jepa_statistics(
-    cache_root=DEFAULT_CACHE_ROOT, *, recompute=False, train_fraction=1.0, train_subset_seed=42,
-):
-    """Upgrade a completed JEPA cache without loading either frozen backbone."""
-    cache = Path(cache_root).expanduser().resolve()
-    marker = cache / "jepa/prepared.json"
-    metadata = json.loads(marker.read_text())
-    if metadata.get("format_version") != CACHE_FORMAT_VERSION or metadata.get("input_source") != "jepa":
-        raise ValueError("JEPA statistics require a completed format-2 JEPA cache")
-    paired = json.loads((cache / "jepa/paired-index.json").read_text())
-    for key in ("paired_index_sha256", "catalog_sha256", "provenance", "split_counts", "filtered_counts"):
-        if paired[key] != metadata[key]:
-            raise ValueError("Prepared JEPA paired index is stale; run prepare_cache")
-    records, subset = select_training_subset(
-        [record for record in paired["records"] if record["split"] == "train"],
-        train_fraction, train_subset_seed,
-    )
-    sample_ids = [record["sample_id"] for record in records] if subset is not None else None
-    _, _, stats = _jepa_statistics(cache, paired, metadata, recompute=recompute, sample_ids=sample_ids)
-    if subset is None:
-        metadata["jepa_feature_stats"] = stats
-        _atomic_json_save(metadata, marker)
-    return stats
-
-
 def load_prepared_datasets(
-    dataset_root, annotations_path, cache_root, input_source,
-    jepa_checkpoint=None, checkpoint_key="target_encoder", stats_path=None,
+    dataset_root, annotations_path, cache_root, stats_path=None,
     text_model=DEFAULT_TEXT_MODEL, text_revision=None, max_text_length=256,
-    train_fraction=1.0, train_subset_seed=42,
+    train_fraction=1.0, train_subset_seed=42, text_adapter=None, text_adapter_revision=None,
 ):
-    """Validate provenance without instantiating or deserializing either backbone."""
+    """Validate provenance without instantiating or deserializing a backbone."""
     root, cache = Path(dataset_root).expanduser().resolve(), Path(cache_root).expanduser().resolve()
-    if input_source not in {"raw", "jepa"}:
-        raise ValueError("input_source must be raw or jepa")
-    marker = cache / input_source / "prepared.json"
+    marker = cache / "raw" / "prepared.json"
     if not marker.is_file():
         raise FileNotFoundError(f"Prepared TMR cache is missing: {marker}; run prepare_cache")
     metadata = json.loads(marker.read_text())
-    if metadata.get("format_version") != CACHE_FORMAT_VERSION:
+    if metadata.get("format_version") != CACHE_FORMAT_VERSION or metadata.get("input_source") != "raw":
         raise ValueError(
             "Unsupported prepared TMR cache format; rebuild with prepare_cache "
             "--recompute-features to cache individual caption candidates"
@@ -433,53 +264,24 @@ def load_prepared_datasets(
         [record for record in paired["records"] if record["split"] == "train"],
         train_fraction, train_subset_seed,
     )
-    signature = _text_signature(paired, text_model, text_revision, max_text_length)
+    signature = _text_signature(paired, text_model, text_revision, max_text_length, text_adapter, text_adapter_revision)
     text_bank = RaggedTokenBank(cache / "text", signature)
     if metadata["text_signature"] != signature or metadata["text_source"] != text_bank.metadata["model_info"]:
         raise ValueError("Prepared text cache metadata is stale; use --recompute-features")
-    stats_root = Path(stats_path).expanduser().resolve() if stats_path is not None else (
-        root / "stats" if input_source == "raw" else Path(metadata["stats_root"])
-    )
+    stats_root = Path(stats_path).expanduser().resolve() if stats_path is not None else root / "stats"
     stats = _stats_signature(stats_root)
     if any(metadata[key] != value for key, value in stats.items()):
         raise ValueError("Prepared normalization statistics are stale; use --recompute-features")
-    source = metadata["jepa_source"]
-    if input_source == "jepa":
-        if source is None:
-            raise ValueError("JEPA cache is missing checkpoint provenance")
-        checkpoint = Path(jepa_checkpoint or source["checkpoint_path"]).expanduser().resolve()
-        if _sha256_file(checkpoint) != source["checkpoint_sha256"] or checkpoint_key != source["checkpoint_key"]:
-            raise ValueError("JEPA checkpoint cache is stale; use --recompute-features")
-    motion_banks = {}
-    if input_source == "jepa":
-        for split in SPLITS:
-            motion_banks[split] = RaggedTokenBank(cache / "jepa" / split, _motion_signature(paired, stats, source))
-        sample_ids = [record["sample_id"] for record in train_records] if subset is not None else None
-        mean, std, feature_stats = _jepa_statistics(cache, paired, metadata, sample_ids=sample_ids)
-        if subset is None and "jepa_feature_stats" in metadata and metadata["jepa_feature_stats"] != feature_stats:
-            raise ValueError("Prepared JEPA feature statistics are stale; run prepare_stats --recompute")
-        if subset is None and "jepa_feature_stats" not in metadata:
-            # Existing format-2 features can gain train-only statistics without re-extraction.
-            metadata["jepa_feature_stats"] = feature_stats
-            _atomic_json_save(metadata, marker)
-        if subset is not None:
-            metadata["jepa_feature_stats"] = feature_stats
     if subset is not None:
         metadata["train_subset"] = subset
     datasets = {}
     for split in SPLITS:
         records = train_records if split == "train" else [record for record in paired["records"] if record["split"] == split]
-        if input_source == "raw":
-            datasets[split] = PreparedPairDataset(
-                records, text_bank, raw_dataset=_raw_dataset(root, split, paired, stats_root),
-                sample_captions=split == "train",
-            )
-        else:
-            datasets[split] = PreparedPairDataset(
-                records, text_bank, motion_bank=motion_banks[split], sample_captions=split == "train",
-                motion_mean=mean, motion_std=std,
-            )
+        datasets[split] = PreparedPairDataset(
+            records, text_bank, raw_dataset=_raw_dataset(root, split, paired, stats_root),
+            sample_captions=split == "train",
+        )
     return datasets, metadata
 
 
-__all__ = ["prepare_caches", "prepare_jepa_statistics", "load_prepared_datasets", "load_text_backbone", "write_ragged_bank"]
+__all__ = ["prepare_caches", "load_prepared_datasets", "load_text_backbone", "write_ragged_bank"]

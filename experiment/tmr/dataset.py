@@ -13,16 +13,17 @@ import torch
 from torch.utils.data import Dataset
 
 from dataset import MotionDataset
-from experiment.linear_probe.features import _sha256_file
+from experiment.utils import _sha256_file
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATASET_ROOT = PROJECT_ROOT / "dataset/bones-seed-processed-nframes150"
+DEFAULT_DATASET_ROOT = PROJECT_ROOT / "dataset/bones-seed-processed-nframes150-min60"
 DEFAULT_ANNOTATIONS_PATH = (
     PROJECT_ROOT / "dataset/bones-seed/metadata/seed_metadata_v002_temporal_labels.jsonl"
 )
-DEFAULT_CACHE_ROOT = PROJECT_ROOT / "output/tmr-cache"
-DEFAULT_TEXT_MODEL = "google/t5gemma-2b-2b-ul2"
+DEFAULT_CACHE_ROOT = PROJECT_ROOT / "output/tmr-cache-llm2vec"
+DEFAULT_TEXT_MODEL = "McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp"
+DEFAULT_TEXT_ADAPTER = "McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised"
 SPLITS = ("train", "val", "test")
 CAPTION_POLICY = "floor_halfopen_overlap_chronological_unique_candidates_v2"
 
@@ -218,26 +219,12 @@ class RaggedTokenBank:
 
 class PreparedPairDataset(Dataset):
     def __init__(
-        self, records, text_bank, *, motion_bank=None, raw_dataset=None,
-        sample_captions=False, motion_mean=None, motion_std=None,
+        self, records, text_bank, *, raw_dataset, sample_captions=False,
     ):
         self.records = records
         self.text_bank = text_bank
-        self.motion_bank = motion_bank
         self.raw_dataset = raw_dataset
         self.sample_captions = sample_captions
-        if (motion_mean is None) != (motion_std is None):
-            raise ValueError("Motion normalization requires both mean and std")
-        self.motion_mean = motion_mean
-        self.motion_std = motion_std
-        if motion_mean is not None:
-            dim = int(motion_bank.metadata["feature_dim"]) if motion_bank is not None else None
-            if (
-                motion_mean.shape != (dim,) or motion_std.shape != (dim,)
-                or not torch.isfinite(motion_mean).all() or not torch.isfinite(motion_std).all()
-                or (motion_std <= 0).any()
-            ):
-                raise ValueError("Motion normalization must match the JEPA feature channels")
         self.sample_ids = [record["sample_id"] for record in records]
         self.caption_ids = [record["caption_id"] for record in records]
         self.caption_candidates = [record["caption_ids"] for record in records]
@@ -251,8 +238,6 @@ class PreparedPairDataset(Dataset):
                 raise ValueError("Paired captions must be a nonempty list of unique candidates")
             if any(caption_id not in text_bank.key_to_row for caption_id in candidates):
                 raise ValueError("Paired caption is missing from the text cache")
-            if motion_bank is not None and record["sample_id"] not in motion_bank.key_to_row:
-                raise ValueError("Paired sample is missing from the JEPA cache")
             if raw_dataset is not None and record["sample_id"] not in self.raw_rows:
                 raise ValueError("Paired sample is missing from the raw split index")
             if raw_dataset is not None:
@@ -271,13 +256,8 @@ class PreparedPairDataset(Dataset):
         candidates = record["caption_ids"]
         selected = int(torch.randint(len(candidates), ()).item()) if self.sample_captions and len(candidates) > 1 else 0
         caption_id = candidates[selected]
-        if self.motion_bank is not None:
-            motion = self.motion_bank[record["sample_id"]]
-            if self.motion_mean is not None:
-                motion = (motion - self.motion_mean) / self.motion_std
-        else:
-            values, _, length = self.raw_dataset[self.raw_rows[record["sample_id"]]]
-            motion = torch.from_numpy(values[:length].copy())
+        values, _, length = self.raw_dataset[self.raw_rows[record["sample_id"]]]
+        motion = torch.from_numpy(values[:length].copy())
         return {
             "motion_tokens": motion, "text_tokens": self.text_bank[caption_id],
             "caption_id": caption_id, "caption_candidate_ids": candidates,

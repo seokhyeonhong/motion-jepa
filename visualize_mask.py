@@ -298,7 +298,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/mjepa_1d_base_v2.yaml"),
+        default=Path("configs/mjepa_1d_base.yaml"),
     )
     parser.add_argument("--output", type=Path, default=Path("output/mask.png"))
     parser.add_argument("--seed", type=int, default=0, help="Mask collator step/seed.")

@@ -1,1 +1,1 @@
-"""Downstream experiments for MotionJEPA representations."""
+"""Standalone supervised and contrastive experiments on raw motion."""

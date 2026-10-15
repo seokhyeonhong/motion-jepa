@@ -261,8 +261,14 @@ class MaskCollator1D(_StatefulMaskCollator):
             self._pack(targets_by_sample, self.npred),
         )
 
+    def sample_masks(self, valid_lengths: list[int]):
+        """Sample in the training process so worker prefetch cannot advance state."""
+        if not valid_lengths or any(length < 1 or length > self.num_frames for length in valid_lengths):
+            raise ValueError(f"Valid lengths must be in [1, {self.num_frames}]")
+        return self._masks(valid_lengths)
+
     def __call__(self, batch):
-        contexts, targets = self._masks(_valid_lengths(batch, self.num_frames))
+        contexts, targets = self.sample_masks(_valid_lengths(batch, self.num_frames))
         return torch.utils.data.default_collate(batch), contexts, targets
 
 

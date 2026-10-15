@@ -21,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config", "--fname",
         dest="config",
-        default="configs/mjepa_1d_base_v2.yaml",
+        default="configs/mjepa_1d_base.yaml",
         help="YAML config",
     )
     parser.add_argument(

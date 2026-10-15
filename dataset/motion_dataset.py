@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from itertools import islice
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -229,6 +230,18 @@ class MotionDataset(torch.utils.data.Dataset):
         return self._normalize_and_pad(motion, entry.length), entry.fps, entry.length
 
 
+class OffsetDistributedSampler(torch.utils.data.distributed.DistributedSampler):
+    """Resume within a shuffled data pass without loading already consumed samples."""
+
+    start_index = 0
+
+    def __iter__(self):
+        return islice(super().__iter__(), self.start_index, None)
+
+    def __len__(self):
+        return max(0, super().__len__() - self.start_index)
+
+
 def make_motion_dataset(
     root_path,
     meta_files,
@@ -245,6 +258,7 @@ def make_motion_dataset(
     num_workers=10,
     pin_mem=True,
     persistent_workers=True,
+    seed=0,
 ):
     dataset = MotionDataset(
         root_path=root_path,
@@ -257,14 +271,17 @@ def make_motion_dataset(
     )
     if not dataset:
         raise ValueError(f"No valid MotionJEPA samples found under {root_path}")
-    sampler = torch.utils.data.distributed.DistributedSampler(
+    sampler = OffsetDistributedSampler(
         dataset,
         num_replicas=world_size,
         rank=rank,
         shuffle=True,
+        seed=seed,
     )
     loader = torch.utils.data.DataLoader(
         dataset,
+        # Iterator creation must not consume the model/dropout RNG on resume.
+        generator=torch.Generator().manual_seed(seed + rank),
         collate_fn=collator,
         sampler=sampler,
         batch_size=batch_size,

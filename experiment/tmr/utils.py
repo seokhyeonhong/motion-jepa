@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 
-from experiment.linear_probe.features import resolve_device as _resolve_device
+from experiment.utils import resolve_device as _resolve_device
 
 
 def resolve_device(value: str) -> torch.device:

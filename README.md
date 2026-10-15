@@ -18,6 +18,7 @@ skeleton/         BVH parsing, SOMA skeletons, kinematics, and assets
 visualization/    viser dataset viewer, skeleton renderer, and skinning
 utils/            distributed, logging, scheduler, and tensor helpers
 configs/          active pretraining config and `_depr_experiments/` archive
+experiment/       raw-motion classification, segmentation, and text-motion retrieval
 train.py          shared JEPA training loop
 main.py           local-device and torchrun entry point
 ```
@@ -133,7 +134,7 @@ checked strictly. Metadata records window limits, split seed, proportions,
 CSV SHA256, and trim/resampling convention; incompatible output is not reused.
 
 Workers convert and save source motions directly, avoiding transfer of large
-feature arrays back to the parent process. Training uses global per-epoch
+feature arrays back to the parent process. Training uses global per-pass
 randomization through `DistributedSampler`; each loader worker lazily opens
 only the NPY files selected for its current batch. NPY is the supported
 processed dataset format for training and visualization.
@@ -147,7 +148,7 @@ python visualize_dataset.py dataset/bones-seed-processed --split train --mesh
 Visualize the frame-token mask timeline with:
 
 ```bash
-python visualize_mask.py --config configs/mjepa_1d_base_v2.yaml --output output/mask.png --seed 0 --valid-length 90
+python visualize_mask.py --config configs/mjepa_1d_base.yaml --output output/mask.png --seed 0 --valid-length 90
 ```
 
 The sole `MaskCollator1D` samples temporal blocks using each sample's valid
@@ -168,9 +169,9 @@ minimum context guard. Target blocks keep their original lengths.
 
 There is no `mask.version` selector. Remove it from existing configs. Saved
 state from the former V2 collator migrates to the unversioned name and resumes
-the same masks when settings match; legacy collator state is rejected. The
-`v2` suffix in dataset paths and experiment config filenames still identifies
-the preprocessing dataset variant.
+the same masks when settings match; legacy collator state is rejected.
+The default training config is `configs/mjepa_1d_base.yaml`, using the
+`bones-seed-processed-nframes150-min60` dataset without version selectors.
 
 ## Frame-token JEPA
 
@@ -188,11 +189,11 @@ There is no positional-embedding selector or `position_encoding` configuration
 section. Remove that section and any `patch` section from training configs.
 
 ```bash
-python main.py --config configs/mjepa_1d_base_v2.yaml --devices cuda:0
+python main.py --config configs/mjepa_1d_base.yaml --devices cuda:0
 ```
 
 Checkpoints record fixed positional semantics as architecture metadata. Existing
-frame-token RoPE checkpoints with theta 100 and time scale 1 remain loadable.
+frame-token RoPE model weights with theta 100 and time scale 1 remain loadable.
 Absolute-position checkpoints, checkpoints without positional metadata, custom
 RoPE settings, and removed model variants fail explicitly. Archived experiment
 outputs and findings remain historical records. Downstream prediction,
@@ -200,19 +201,37 @@ generation, and TMR heads retain their own positional embeddings.
 
 ## Training
 
-Batch size is per rank. Learning rates are not automatically scaled.
+Training is controlled by optimizer iterations, independent of dataset size:
+
+```yaml
+optimization:
+  iterations: 200000
+  warmup_iterations: 20000
+logging:
+  checkpoint_interval: 10000
+  log_freq: 100
+```
+
+One iteration processes one batch per rank. The loader reshuffles and starts
+another data pass as necessary, stopping exactly at `iterations`, including
+partway through a pass. Learning-rate, weight-decay, and EMA schedules use this
+same iteration budget. Gradient clipping starts after warmup. `epochs`, `warmup`,
+`ipe_scale`, and the old epoch-based `checkpoint_freq` are rejected.
+
+Batch size is per rank. Learning rates are not automatically scaled. Changing
+GPU count changes the samples processed per iteration, not the iteration budget.
 
 Single GPU:
 
 ```bash
-python main.py --config configs/mjepa_1d_base_v2.yaml --devices cuda:0
+python main.py --config configs/mjepa_1d_base.yaml --devices cuda:0
 ```
 
 Local multi-GPU:
 
 ```bash
 python main.py \
-  --config configs/mjepa_1d_base_v2.yaml \
+  --config configs/mjepa_1d_base.yaml \
   --devices cuda:0 cuda:1 cuda:2 cuda:3
 ```
 
@@ -223,7 +242,7 @@ Standard torchrun launch:
 
 ```bash
 torchrun --standalone --nproc-per-node=4 main.py \
-  --config configs/mjepa_1d_base_v2.yaml
+  --config configs/mjepa_1d_base.yaml
 ```
 
 `main.py` honors `RANK`, `WORLD_SIZE`, and `LOCAL_RANK`. CUDA training uses
@@ -231,23 +250,27 @@ NCCL; CPU integration tests use Gloo. `main_distributed.py` remains available
 for Submitit/SLURM launches.
 
 Checkpoints contain unwrapped encoder and predictor weights, the EMA target,
-optimizer, optional AMP scaler, all schedules, epoch/global step, mask state,
-latest online diagnostics, and per-rank Python/NumPy/PyTorch RNG states. Writes are atomic. Exact resume
-requires the same world size and continues from the latest completed epoch:
+optimizer, optional AMP scaler, all schedules, completed iteration, next data
+position, mask state, and per-rank Python/NumPy/PyTorch RNG states. Writes are
+atomic. Every `checkpoint_interval` iterations, and at the final iteration,
+training writes `<write_tag>-latest.pth.tar` and `<write_tag>-it<N>.pth.tar`.
+Training metrics are written only to TensorBoard, using the global iteration
+as the horizontal axis. CSV and JSONL training logs are no longer written.
+
+Exact resume requires the same world size, dataset, batch size, seed, precision,
+mask settings, and optimization configuration. It continues at the next batch,
+including partway through a data pass, without loading already consumed samples.
+Masks are generated in the training process so worker prefetching cannot advance
+saved mask state. The current dataset loader is deterministic; worker count may
+change on resume. Legacy epoch-training checkpoints cannot resume under this new
+schedule; their compatible RoPE model weights remain readable by model-loading
+utilities. To resume an iteration-based checkpoint:
 
 ```yaml
 meta:
   load_checkpoint: true
   read_checkpoint: null  # null selects <write_tag>-latest.pth.tar
 ```
-
-The active config also evaluates a fixed unlabeled validation subset at the
-linear-probe cadence. TensorBoard receives RankMe, feature variance, sample
-cosine, covariance-spectrum, held-out JEPA, PredictionGain, and trajectory
-reliance metrics under `online_metrics/`. Full summaries are appended to
-`online-metrics.jsonl`; they are diagnostic and do not select checkpoints. See
-`agent/ONLINE_REPRESENTATION_METRICS.md` for definitions and
-`agent/MOTION_JEPA_TRAJECTORY.md` for the deferred cross-attention design.
 
 BF16 autocast is controlled by `meta.use_bfloat16`. BF16 does not use a
 gradient scaler; optional FP16 training uses `meta.use_float16` and restores
@@ -263,211 +286,42 @@ tensorboard --logdir output
 
 Events are written under `<logging.folder>/tensorboard` at `logging.log_freq`.
 Loss, iteration time, learning rate, and weight decay are interval averages
-accumulated since the previous log event. The CSV continues to store raw values
-for every optimization step.
+accumulated since the previous log event. Resume purges TensorBoard events
+after the loaded checkpoint iteration. Checkpoints and the saved run configuration
+remain available for reproducibility and resume.
 
-## Linear probing
+## Raw-motion experiments
 
-Extract and cache frozen features from a pretrained EMA target encoder, then
-train a single linear style classifier on 100STYLE:
+Experiments train directly on normalized motion frames. No pretrained motion
+checkpoint or frozen motion-feature cache is used. Shared Transformer layers
+and architecture sizes can still be used to initialize models from scratch.
 
-```bash
-python -m experiment.linear_probe \
-  --checkpoint output/<run>/motion-jepa-1d-latest.pth.tar \
-  --dataset-root dataset/100style-processed-nframes60-150 \
-  --output output/linear-probe/<run>
-```
-
-`--output` may be omitted; in that case results are written under
-`<checkpoint directory>/linear-probe`. Supplying it explicitly selects a
-different linear-probe result directory.
-
-The encoder is reconstructed from the checkpoint config and uses the
-pretraining mean and standard deviation, not the 100STYLE statistics. Its
-selected pooled features are cached as `float32` under
-`<output>/features`. The probe is a bias-enabled `nn.Linear` trained with
-ordinary cross-entropy and momentum SGD. Use `--overwrite` to rerun the head
-while retaining valid feature caches, or `--recompute-features` when the
-checkpoint, dataset index, statistics, or extraction setup has changed.
-
-Pooled-feature linear-probe commands and online probes now standardize each
-feature channel using **training features only**: `(x - train_mean) /
-max(train_std, 1e-6)`, with population standard deviation. Validation and test
-reuse those training statistics. Raw feature caches stay unchanged; saved
-offline heads include a `standardizer` containing the mean and scale required
-at inference. Use `--no-standardize` in the probe/LR-sweep CLI, or
-`linear_probe.standardize: false` online, to reproduce the previous protocol.
-This feature transformation is additional to BONES input-motion normalization.
-
-For the default validation-free dataset, the probe protocol is fixed in
-advance: 50 epochs, SGD with LR 0.3, momentum 0.9, zero weight decay, and cosine
-decay. Per-epoch training metrics are written to `metrics.csv`; the epoch-50
-head is saved and `FW` test is evaluated exactly once. `summary.json` records
-`selection: fixed_last_epoch` and `validation_used: false`.
-
-To monitor representation quality during pretraining, opt a training config into
-an in-memory 100STYLE probe:
-
-```yaml
-linear_probe:
-  enabled: true
-  # Probe cadence is independent of logging.checkpoint_freq:
-  frequency: 10
-  dataset_root: ./dataset/100style-processed-nframes60-150
-  epochs: 50
-  feature_batch_size: 256
-  batch_size: 256
-  num_workers: 8
-  lr: 0.3
-  momentum: 0.9
-  weight_decay: 0.0
-  seed: 42
-  standardize: true
-  pooling: global_mean
-```
-
-The EMA target encoder is evaluated before the first training epoch, at every
-`linear_probe.frequency` epoch, and at the final epoch. When `frequency` is
-omitted, it defaults to `logging.checkpoint_freq` for backward compatibility.
-This cadence does not create additional named epoch checkpoints. Features
-remain in memory rather than being cached per checkpoint. The fixed-protocol
-`FW` metrics are diagnostic trajectories under `linear_probe/test_*`. They do
-not create `<write_tag>-best-accuracy.pth.tar` and do not select a pretraining
-checkpoint; use latest or a named epoch checkpoint for final comparison.
-Linear probing is disabled when the section is absent or `enabled: false`.
-
-For BABEL-60 and BABEL-120 online probing, use `linear_probe.datasets` instead
-of `dataset_root`. This evaluates both datasets before training, at the configured frequency,
-and at the final epoch. Each probe
-fits a fresh 50-epoch SGD linear head on frozen EMA features with multi-label
-BCE, selects the head by validation mAP, and records validation metrics under
-`linear_probe/babel-60/*` and `linear_probe/babel-120/*`. BABEL has no labeled
-test split. The best pretraining checkpoints are saved separately as
-`<write_tag>-best-babel-60-map.pth.tar` and
-`<write_tag>-best-babel-120-map.pth.tar`; probe results and both best scores
-resume from the latest checkpoint. The existing single-dataset `dataset_root`
-configuration continues to use the 100STYLE probe.
-
-Enable an attentive probe alongside the standardized linear probe with:
-
-```yaml
-attentive_probe:
-  enabled: true
-  frequency: 10
-  # datasets defaults to linear_probe.datasets (BABEL-60 and BABEL-120).
-  epochs: 50
-  feature_batch_size: 256
-  batch_size: 256
-  num_workers: 8
-  lr: 0.0003
-  weight_decay: 0.05
-  warmup_epochs: 5
-  final_lr: 1.0e-6
-  gradient_clip: 1.0
-  num_heads: 6
-  seed: 42
-```
-
-The attentive head uses one learned query, one cross-attention block and a
-residual MLP (ratio 4, GELU), followed by LayerNorm and classification. It trains
-with AdamW (betas 0.9/0.999), warmup + cosine, and unweighted BCE. Inputs are
-unpooled frozen EMA tokens; padding is excluded, and motions with no valid token
-are rejected. It keeps the existing head's LayerNorm without adding the pooled
-linear probe's channel standardization. Tokens are held temporarily in CPU BF16
-memory, one dataset at a time; no token caches are written during pretraining.
-
-Both probe types run sequentially on rank 0, preserving the pretraining RNG.
-Attentive evaluation has its own frequency (defaulting to the linear frequency),
-and also runs before training and at the final epoch. Its metrics use
-`attentive_probe/babel-{60,120}/*`; its best pretraining checkpoints are
-`<write_tag>-best-attentive-babel-{60,120}-map.pth.tar`. Latest checkpoints store
-independent latest/best results for all four evaluations. Attentive probing can
-be disabled independently or enabled with its own BABEL `datasets` mapping.
-
-When resuming with a changed probe protocol (including raw → standardized
-linear features), the affected best scores are reset and that probe evaluates
-the resumed encoder before the next optimization step. Compatible probe scores
-are restored. TensorBoard's `feature_standardization` scalar marks the protocol;
-historical raw and standardized values should not be treated as one unchanged
-evaluation curve. A running process keeps its already-loaded configuration;
-these settings apply on the next launch/resume. Attentive probing adds full
-head-training time at each evaluation interval.
-
-Sweep every direct-child latest checkpoint with:
+- `experiment.classification`: 100STYLE single-label and BABEL multi-label
+  classification with CNN, Transformer, or raw temporal-mean linear baselines.
+- `experiment.segmentation`: supervised BABEL frame classification with
+  a Transformer trained from scratch.
+- `experiment.tmr`: raw-motion/text contrastive training. Frozen LLM2Vec
+  sentence features feed a trainable RoPE-based JEPA text encoder; the JEPA motion
+  encoder also trains from scratch. Both use the selected size preset.
 
 ```bash
-python -m experiment.linear_probe.lr_sweep --device cuda:0
+python -m experiment.classification --model all
+python -m experiment.classification --model linear
+python -m experiment.segmentation --model-size tiny --describe
+python -m experiment.segmentation --model-size base
+python -m experiment.tmr.prepare_cache --device cuda:0
+python -m experiment.tmr --model-size base --device cuda:0
 ```
 
-LR sweeps and validation-selected reports reject validation-free datasets.
-They are retained only for legacy datasets with a genuine non-empty validation
-split, preventing `FW` test results from becoming an implicit tuning set.
+Classification defaults to `dataset/100style-processed-nframes60-150`.
+See the [classification](experiment/classification/README.md),
+[segmentation](experiment/segmentation/README.md), and
+[TMR](experiment/tmr/README.md) instructions for data and training options.
 
-Features are extracted once per checkpoint and reused across learning rates.
-Completed probe runs resume from their summaries unless `--overwrite-runs` is
-given.
-
-The sweep writes its component artifacts to
-`findings/000-100style-classification/linear-probe` by default.
-
-Train matched-size supervised CNN and Transformer baselines directly on raw
-100STYLE motion with:
-
-```bash
-python -m experiment.linear_probe.train_classifier \
-  --model all \
-  --dataset-root dataset/100style-processed-nframes60-150 \
-  --seed 42 \
-  --device cuda:0
-```
-
-Train the single-layer normalized raw-motion baseline with the same data
-loader, optimizer, schedule, metrics, and checkpointing entry point:
-
-```bash
-python -m experiment.linear_probe.linear \
-  --dataset-root dataset/100style-processed-nframes60-150 \
-  --device cuda:0
-```
-
-This model takes the masked temporal mean of each normalized `[90,366]` window
-and applies exactly one `Linear(366, 100)` layer. On the validation-free
-content split it saves the final epoch as `classifier-final.pth.tar` and then
-evaluates `FW` once. The equivalent shared-runner command is
-`python -m experiment.linear_probe.train_classifier --model linear ...`.
-
-The same classifiers can consume frozen frame-token features from a pretrained
-1D MotionJEPA target encoder:
-
-```bash
-python -m experiment.linear_probe.train_classifier \
-  --input-source jepa \
-  --jepa-checkpoint output/<run>/motion-jepa-1d-latest.pth.tar \
-  --checkpoint-key target_encoder \
-  --model all \
-  --dataset-root dataset/100style-processed-nframes60-150 \
-  --seed 42 \
-  --device cuda:0
-```
-
-Token features are cached once as BF16 under
-`<checkpoint directory>/linear-probe/token-features`. Classifier outputs default
-to `<checkpoint directory>/linear-probe/classifiers`; both locations can be
-overridden. Classifier provenance—including the JEPA model name, checkpoint key
-and SHA256, feature dimension, and normalization-statistics hashes—is recorded
-once in the final summary. The best checkpoint contains only model weights and
-the architecture fields required to reconstruct the classifier; resumable latest
-state is removed after successful completion.
-
-Regenerate the combined seed-42 comparison, validation-selected CSV, and plots
-after both components finish:
-
-```bash
-python -m experiment.linear_probe.report
-```
-
-See the [unified 100STYLE findings](findings/000-100style-classification/README.md)
-for the current CNN, CLS Transformer, and 15-probe comparison.
+Frozen-feature probing, online downstream evaluation during JEPA training,
+JEPA-initialized LoRA, and JEPA-conditioned prediction/generation tasks have
+been removed. The main `train.py` continues to train JEPA itself and saves
+ordinary training checkpoints and loss logs.
 
 ## Tests
 
@@ -504,4 +358,4 @@ Training uses masked-target Smooth-L1 loss only. The predictor returns target
 embeddings; visible context tokens condition those predictions. Context loss,
 its warmup and distance weighting, and context-specific logging have been
 removed. Remove `loss.context` from old configs. Training loss remains available
-as `train/loss` in TensorBoard, `loss` in the epoch JSONL, and in the CSV log.
+as `train/loss` in TensorBoard.

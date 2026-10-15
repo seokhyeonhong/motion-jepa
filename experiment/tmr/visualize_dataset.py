@@ -47,22 +47,20 @@ def _read_json(path: Path) -> dict[str, Any]:
 def load_cached_entries(
     cache_root: Path,
     *,
-    input_source: str = "raw",
     split: str = "train",
     limit: int = 500,
     dataset_root: Path | None = None,
 ) -> tuple[Path, list[TMRMotionEntry]]:
     """Read saved captions/locators; render the original unnormalized motions.
 
-    JEPA tokens cannot be inverted to joints, so their paired raw files are used
-    too. Text/token arrays, backbones, annotations, and statistics are not loaded.
+    Text arrays, backbones, annotations, and statistics are not loaded.
     """
-    if input_source not in ("raw", "jepa") or split not in SPLITS:
-        raise ValueError("Expected input_source raw/jepa and split train/val/test")
-    directory = Path(cache_root).expanduser().resolve() / input_source
+    if split not in SPLITS:
+        raise ValueError("Expected split train/val/test")
+    directory = Path(cache_root).expanduser().resolve() / "raw"
     prepared = _read_json(directory / "prepared.json")
     paired = _read_json(directory / "paired-index.json")
-    if prepared.get("format_version") not in (1, 2) or prepared.get("input_source") != input_source:
+    if prepared.get("format_version") not in (1, 2) or prepared.get("input_source") != "raw":
         raise ValueError(f"Unsupported or mismatched prepared TMR cache: {directory}")
     for field, data in (("paired_index_sha256", "records"), ("catalog_sha256", "catalog")):
         digest = json_digest(paired[data])
@@ -134,7 +132,6 @@ class TMRDatasetViewer(MotionJEPADatasetViewer):
         self,
         cache_root: Path,
         *,
-        input_source: str = "raw",
         split: str = "train",
         limit: int = 500,
         dataset_root: Path | None = None,
@@ -145,10 +142,9 @@ class TMRDatasetViewer(MotionJEPADatasetViewer):
         mesh: bool = False,
     ):
         self.cache_root = Path(cache_root).expanduser().resolve()
-        self.input_source = input_source
         self.split = split
         root, entries = load_cached_entries(
-            self.cache_root, input_source=input_source, split=split,
+            self.cache_root, split=split,
             limit=limit, dataset_root=dataset_root,
         )
         super().__init__(
@@ -215,7 +211,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize cached TMR motion-caption pairs with viser.")
     parser.add_argument("input", nargs="?", type=Path, help="Existing TMR cache root")
     parser.add_argument("--cache-root", type=Path, help="Alternative to the positional cache root")
-    parser.add_argument("--input-source", choices=("raw", "jepa"), default="raw")
     parser.add_argument("--dataset-root", type=Path, help="Override the original motion dataset location")
     parser.add_argument("--split", choices=SPLITS, default="train")
     parser.add_argument("--sample-index", "--sample_index", type=int, default=0)
@@ -234,7 +229,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     viewer = TMRDatasetViewer(
-        args.cache_root, input_source=args.input_source, split=args.split,
+        args.cache_root, split=args.split,
         limit=args.limit, dataset_root=args.dataset_root,
         sample_index=args.sample_index, sample_id=args.sample_id,
         host=args.host, port=args.port, mesh=args.mesh,

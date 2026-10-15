@@ -7,9 +7,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from experiment.linear_probe.features import _atomic_json_save
+from experiment.utils import _atomic_json_save
 from .features import load_prepared_datasets
-from .model import alignment_config_from_dict, build_alignment
+from .model import AlignmentConfig, TextMotionAlignment
 from .train import DATA_FIELDS, evaluate_split, load_alignment_checkpoint
 from .utils import resolve_device
 
@@ -25,17 +25,10 @@ def run(args: argparse.Namespace) -> dict[str, float]:
         if value is not None:
             data[field] = str(value) if isinstance(value, Path) else value
     datasets, provenance = load_prepared_datasets(**data)
-    if config["model"].get("motion_adaptation") == "lora":
-        from .lora import evaluation_initialization
-        provenance = {
-            **provenance, "motion_initialization": evaluation_initialization(
-                data, checkpoint["provenance"]["motion_initialization"],
-            ),
-        }
     if provenance != checkpoint["provenance"]:
         raise ValueError("Evaluation feature provenance differs from the training checkpoint")
     device = resolve_device(args.device)
-    model = build_alignment(alignment_config_from_dict(config["model"])).to(device)
+    model = TextMotionAlignment(AlignmentConfig(**config["model"])).to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
     metrics = evaluate_split(
         model, datasets[args.split], device, batch_size=args.batch_size,
@@ -61,17 +54,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-root", type=Path)
     parser.add_argument("--annotations-path", type=Path)
     parser.add_argument("--cache-root", type=Path)
-    parser.add_argument("--input-source", choices=("raw", "jepa"))
-    parser.add_argument("--jepa-checkpoint", type=Path)
-    parser.add_argument("--checkpoint-key", choices=("target_encoder", "encoder"))
     parser.add_argument("--stats-path", type=Path)
     parser.add_argument(
         "--text-model",
-        help="T5Gemma or DistilBERT model ID/local directory; e.g. "
-             "google/t5gemma-2b-2b-ul2 or distilbert/distilbert-base-uncased. "
+        help="LLM2Vec Llama-3 MNTP model ID/local directory. "
              "Uses the activated environment's Hugging Face cache.",
     )
     parser.add_argument("--text-revision")
+    parser.add_argument("--text-adapter", help="LLM2Vec supervised adapter; defaults to the Kimodo Llama-3 adapter.")
+    parser.add_argument("--text-adapter-revision")
     parser.add_argument("--max-text-length", type=int)
     return parser
 

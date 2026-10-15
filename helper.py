@@ -103,16 +103,14 @@ def architecture_signature_from_config(config: dict) -> dict:
 def init_opt(
     encoder,
     predictor,
-    iterations_per_epoch,
+    total_steps,
     start_lr,
     ref_lr,
-    warmup,
-    num_epochs,
+    warmup_steps,
     wd=1.0e-6,
     final_wd=1.0e-6,
     final_lr=0.0,
     use_float16=False,
-    ipe_scale=1.0,
 ):
     decay, no_decay = [], []
     for module in (encoder, predictor):
@@ -126,10 +124,9 @@ def init_opt(
             {"params": no_decay, "weight_decay": 0.0, "WD_exclude": True},
         ]
     )
-    total_steps = int(ipe_scale * num_epochs * iterations_per_epoch)
     scheduler = WarmupCosineSchedule(
         optimizer,
-        warmup_steps=int(warmup * iterations_per_epoch),
+        warmup_steps=warmup_steps,
         start_lr=start_lr,
         ref_lr=ref_lr,
         final_lr=final_lr,

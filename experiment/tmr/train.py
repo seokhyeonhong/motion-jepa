@@ -1,4 +1,4 @@
-"""Train TMR v1 readouts or a JEPA-shaped TMR v2 raw-motion encoder."""
+"""Train text-motion retrieval using raw motion and cached text tokens."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 
-from experiment.linear_probe.features import (
+from experiment.utils import (
     PROJECT_ROOT,
     _atomic_json_save,
     _seed_all,
@@ -37,17 +37,16 @@ from .dataset import (
 from .features import load_prepared_datasets
 from .losses import symmetric_multi_positive_info_nce
 from .model import (
-    AlignmentConfig, TextMotionAlignment, V2AlignmentConfig, MODEL_SPECS,
-    alignment_config_from_dict, build_alignment, parameter_counts,
+    AlignmentConfig, TextMotionAlignment, MODEL_SPECS, parameter_counts,
 )
 from .retrieval import evaluate_retrieval
 from .utils import atomic_torch_save as _atomic_torch_save, resolve_device
 
 
 DATA_FIELDS = (
-    "dataset_root", "annotations_path", "cache_root", "input_source",
-    "jepa_checkpoint", "checkpoint_key", "stats_path", "text_model",
-    "text_revision", "max_text_length",
+    "dataset_root", "annotations_path", "cache_root",
+    "stats_path", "text_model",
+    "text_revision", "max_text_length", "text_adapter", "text_adapter_revision",
 )
 OPTIMIZATION_FIELDS = (
     "seed", "epochs", "warmup_epochs", "batch_size", "lr", "final_lr",
@@ -57,39 +56,21 @@ OPTIMIZATION_FIELDS = (
 
 def optimization_configuration(args):
     values = {name: getattr(args, name) for name in OPTIMIZATION_FIELDS}
-    for name in ("adapter_lr", "text_head_lr"):
-        if getattr(args, name, None) is not None:
-            values[name] = getattr(args, name)
     if getattr(args, "validation_only", False):
         values["validation_only"] = True
     return values
 
 
 def build_optimizer(model, args):
-    adapter_lr = getattr(args, "adapter_lr", None)
-    text_lr = getattr(args, "text_head_lr", None)
-    if adapter_lr is None and text_lr is None:
-        return torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
-                                lr=args.lr, weight_decay=args.weight_decay)
-    motion = [p for p in model.motion_encoder.parameters() if p.requires_grad]
-    text = [p for p in model.text_encoder.parameters() if p.requires_grad]
-    if not motion or not text:
-        raise ValueError("Separate learning rates require trainable adapters and text readout")
-    if {id(p) for p in motion+text} != {id(p) for p in model.parameters() if p.requires_grad}:
-        raise ValueError("Optimizer groups do not cover all trainable parameters")
-    return torch.optim.AdamW([
-        {"params": motion, "lr": adapter_lr or args.lr, "name": "motion_adapters"},
-        {"params": text, "lr": text_lr or args.lr, "name": "text_readout"},
-    ], weight_decay=args.weight_decay)
+    return torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
 
 def data_configuration(args: argparse.Namespace) -> dict[str, Any]:
-    values = {name: getattr(args, name) for name in DATA_FIELDS}
-    for name in ("dataset_root", "annotations_path", "cache_root", "jepa_checkpoint", "stats_path"):
+    values = {name: getattr(args, name, None) for name in DATA_FIELDS}
+    for name in ("dataset_root", "annotations_path", "cache_root", "stats_path"):
         if values[name] is not None:
             values[name] = str(Path(values[name]).expanduser().resolve())
     values["text_model"] = str(values["text_model"])
-    # Preserve the data configuration of existing full-data checkpoints.
     if args.train_fraction != 1:
         values.update(train_fraction=args.train_fraction, train_subset_seed=args.seed)
     return values
@@ -209,57 +190,7 @@ def load_alignment_checkpoint(path: Path) -> dict[str, Any]:
     return checkpoint
 
 
-def _canonical_configuration(config: dict[str, Any]) -> dict[str, Any]:
-    """Compare effective head depths, including legacy depth-only checkpoints."""
-    model = asdict(alignment_config_from_dict(config["model"]))
-    # Once both head depths are resolved, the shared fallback is not architectural.
-    if model["model_version"] == "v1":
-        model.pop("depth")
-    return {**config, "model": model}
-
-
-LEGACY_ARCHITECTURE_DEFAULTS = {
-    "embed_dim": 256, "depth": 6, "text_depth": None, "motion_depth": None,
-    "text_pooling": "cls", "motion_pooling": "cls", "num_heads": 4,
-    "ff_dim": 1024, "dropout": 0.1,
-}
-
-
-class _LegacyArchitectureAction(argparse.Action):
-    """Retain v1 parser defaults while detecting explicit v2 overrides."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        setattr(namespace, self.dest, values)
-        supplied = getattr(namespace, "_legacy_architecture_options", ())
-        setattr(namespace, "_legacy_architecture_options", (*supplied, option_string))
-
-
 def _validate_args(args: argparse.Namespace) -> None:
-    for name in ("adapter_lr", "text_head_lr"):
-        value = getattr(args, name, None)
-        if value is not None:
-            if args.motion_adaptation != "lora" or not math.isfinite(value) or value <= 0:
-                raise ValueError(f"{name} requires LoRA and a finite positive learning rate")
-    if args.motion_adaptation == "lora" and args.model_version != "v2":
-        raise ValueError("LoRA adaptation requires --model-version v2")
-    if args.motion_adaptation == "scratch" and (args.lora_rank, args.lora_alpha, args.lora_dropout) != (8, 16.0, 0.0):
-        raise ValueError("LoRA options require --motion-adaptation lora")
-    if args.model_version == "v2":
-        overrides = list(getattr(args, "_legacy_architecture_options", ()))
-        overrides += [
-            "--" + key.replace("_", "-") for key, default in LEGACY_ARCHITECTURE_DEFAULTS.items()
-            if getattr(args, key) != default
-        ]
-        if overrides:
-            raise ValueError("TMR v2 fixes its architecture; remove " + ", ".join(sorted(set(overrides))))
-        if args.input_source != "raw":
-            raise ValueError("TMR v2 requires raw motion; frozen JEPA feature input is unsupported")
-        if args.motion_adaptation == "scratch" and args.jepa_checkpoint is not None:
-            raise ValueError("Scratch TMR v2 does not accept a JEPA checkpoint")
-        if args.motion_adaptation == "lora" and args.jepa_checkpoint is None:
-            raise ValueError("LoRA adaptation requires --jepa-checkpoint")
-    elif args.model_size is not None:
-        raise ValueError("--model-size requires --model-version v2")
     if not math.isfinite(args.train_fraction) or not 0 < args.train_fraction <= 1:
         raise ValueError("--train-fraction must be finite and in (0, 1]")
     if args.epochs < 1 or not 0 <= args.warmup_epochs < args.epochs:
@@ -274,26 +205,14 @@ def _validate_args(args: argparse.Namespace) -> None:
     for name in ("weight_decay", "gradient_clip"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             raise ValueError(f"{name} must be finite and nonnegative")
-    if args.input_source == "jepa" and args.jepa_checkpoint is None:
-        raise ValueError("--jepa-checkpoint is required for --input-source jepa")
-    for name in ("depth", "text_depth", "motion_depth"):
-        value = getattr(args, name)
-        if value is not None and (value < 0 or (value == 0 and (
-            name == "depth" or getattr(args, name.replace("_depth", "_pooling")) != "mean"
-        ))):
-            raise ValueError(f"--{name.replace('_', '-')} must be positive, or 0 with mean pooling")
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     _validate_args(args)
-    default_output = PROJECT_ROOT / "output/tmr" / args.input_source / f"seed-{args.seed}"
-    if args.model_version == "v2":
-        folder = "output/tmr-jepa-lora" if args.motion_adaptation == "lora" else "output/tmr-v2"
-        size_folder = args.model_size or ("checkpoint-size" if args.motion_adaptation == "lora" else "base")
-        default_output = PROJECT_ROOT / folder / size_folder
-        if args.train_fraction != 1:
-            default_output /= f"frac{args.train_fraction:g}"
-        default_output /= f"seed-{args.seed}"
+    default_output = PROJECT_ROOT / "output/tmr" / args.model_size
+    if args.train_fraction != 1:
+        default_output /= f"frac{args.train_fraction:g}"
+    default_output /= f"seed-{args.seed}"
     output = Path(args.output_root or default_output)
     output = output.expanduser().resolve()
     latest_path, best_path = output / "latest.pth.tar", output / "best.pth.tar"
@@ -308,37 +227,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     datasets, provenance = load_prepared_datasets(**data_config)
     if len(datasets["train"]) < 2 or not len(datasets["val"]):
         raise ValueError("TMR needs at least two training pairs and a nonempty validation split")
-    pretrained_encoder = None
-    resolved_size = args.model_size or "base"
-    if args.motion_adaptation == "lora":
-        from .lora import load_motion_initialization
-        pretrained_encoder, initialization = load_motion_initialization(
-            args.jepa_checkpoint, args.checkpoint_key, provenance, args.model_size,
-        )
-        provenance = {**provenance, "motion_initialization": initialization}
-        resolved_size = initialization["model_size"]
-    if args.model_version == "v2":
-        timing = provenance["provenance"]
-        model_config = V2AlignmentConfig(
-            text_dim=provenance["text_dim"], motion_dim=provenance["motion_dim"],
-            num_frames=timing["num_frames"], fps=timing["fps"],
-            model_size=resolved_size, motion_adaptation=args.motion_adaptation,
-            lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
-        )
-    else:
-        model_config = AlignmentConfig(
-            text_dim=provenance["text_dim"], motion_dim=provenance["motion_dim"],
-            embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
-            ff_dim=args.ff_dim, dropout=args.dropout,
-            text_depth=args.text_depth, motion_depth=args.motion_depth,
-            text_pooling=args.text_pooling, motion_pooling=args.motion_pooling,
-        )
+    model_config = AlignmentConfig(
+        text_dim=provenance["text_dim"], motion_dim=provenance["motion_dim"],
+        model_size=args.model_size,
+        num_frames=provenance["provenance"]["num_frames"],
+        fps=provenance["provenance"]["fps"],
+    )
     config = {
         "model": asdict(model_config), "data": data_config,
         "optimization": optimization_configuration(args),
     }
-    model = build_alignment(model_config, pretrained_encoder=pretrained_encoder).to(device)
-    del pretrained_encoder
+    model = TextMotionAlignment(model_config).to(device)
     optimizer = build_optimizer(model, args)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda epoch: _lr_factor(
@@ -351,7 +250,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     history: list[dict[str, Any]] = []
     if args.resume:
         checkpoint = load_alignment_checkpoint(latest_path)
-        if (_canonical_configuration(checkpoint["config"]) != _canonical_configuration(config)
+        if (checkpoint["config"] != config
                 or checkpoint["provenance"] != provenance):
             raise ValueError("Resume config or feature provenance differs from the saved run")
         model.load_state_dict(checkpoint["model"], strict=True)
@@ -378,7 +277,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         f"val={len(datasets['val'])}, test={len(datasets['test'])}", flush=True,
     )
     counts = parameter_counts(model)
-    print(f"TMR {model_config.model_version} architecture: {asdict(model_config)}", flush=True)
+    print(f"TMR architecture: {asdict(model_config)}", flush=True)
     print(f"TMR trainable parameters: {counts}", flush=True)
     _atomic_json_save(counts, output / "parameters.json")
     _atomic_json_save({
@@ -439,9 +338,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "train_samples": sample_count, **{f"val_{key}": value for key, value in validation.items()},
             }
             history.append(row)
-            if len(optimizer.param_groups) > 1:
-                row["adapter_lr"] = float(optimizer.param_groups[0]["lr"])
-                row["text_head_lr"] = float(optimizer.param_groups[1]["lr"])
             improved = validation["mean_r1"] > best_score
             if improved:
                 best_epoch, best_score = epoch + 1, float(validation["mean_r1"])
@@ -470,13 +366,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if writer is not None:
                 writer.flush()
             print(
-                f"TMR {args.input_source} epoch {epoch + 1}/{args.epochs}: "
+                f"TMR raw epoch {epoch + 1}/{args.epochs}: "
                 f"loss={row['train_loss']:.5f}, val mean R@1={best_score:.4f} "
                 f"(current={validation['mean_r1']:.4f}), {time.monotonic() - started:.1f}s",
                 flush=True,
             )
         selected = load_alignment_checkpoint(best_path)
-        if (_canonical_configuration(selected["config"]) != _canonical_configuration(config)
+        if (selected["config"] != config
                 or selected["provenance"] != provenance):
             raise ValueError("Best checkpoint does not belong to this TMR run")
         model.load_state_dict(selected["model"], strict=True)
@@ -488,7 +384,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             for key, value in test.items():
                 writer.add_scalar(f"test/{key}", value, global_step)
         summary = {
-            "input_source": args.input_source, "output_root": str(output),
+            "input_source": "raw", "output_root": str(output),
             "train_fraction": args.train_fraction,
             "split_counts": {split: len(dataset) for split, dataset in datasets.items()},
             "selection": "mean_bidirectional_val_r1", "best_epoch": best_epoch,
@@ -505,27 +401,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-version", choices=("v1", "v2"), default="v1")
-    parser.add_argument("--motion-adaptation", choices=("scratch", "lora"), default="scratch",
-                        help="V2 raw-motion training: scratch, or frozen JEPA with trainable attention LoRA.")
-    parser.add_argument("--lora-rank", type=int, default=8)
-    parser.add_argument("--lora-alpha", type=float, default=16.0)
-    parser.add_argument("--lora-dropout", type=float, default=0.0)
-    parser.add_argument("--model-size", choices=tuple(MODEL_SPECS), help="V2 JEPA encoder size; defaults to base.")
-    parser.add_argument("--input-source", choices=("raw", "jepa"), default="raw")
+    parser.add_argument("--model-size", choices=tuple(MODEL_SPECS), default="base", help="Text and motion encoder size; defaults to base.")
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--annotations-path", type=Path, default=DEFAULT_ANNOTATIONS_PATH)
     parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)
-    parser.add_argument("--jepa-checkpoint", type=Path)
-    parser.add_argument("--checkpoint-key", choices=("target_encoder", "encoder"), default="target_encoder")
     parser.add_argument("--stats-path", type=Path)
     parser.add_argument(
         "--text-model", default=DEFAULT_TEXT_MODEL,
-        help="T5Gemma or DistilBERT model ID/local directory; e.g. "
-             "google/t5gemma-2b-2b-ul2 or distilbert/distilbert-base-uncased. "
+        help="LLM2Vec Llama-3 MNTP model ID/local directory. "
              "Uses the activated environment's Hugging Face cache.",
     )
     parser.add_argument("--text-revision")
+    parser.add_argument("--text-adapter", help="LLM2Vec supervised adapter; defaults to the Kimodo Llama-3 adapter.")
+    parser.add_argument("--text-adapter-revision")
     parser.add_argument("--max-text-length", type=int, default=256)
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--device", default="auto")
@@ -540,38 +428,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--adapter-lr", type=float, help="LoRA adapter LR; defaults to --lr")
-    parser.add_argument("--text-head-lr", type=float, help="Text projection/LayerNorm LR; defaults to --lr")
     parser.add_argument("--validation-only", action="store_true", help="Do not evaluate test during hyperparameter search")
     parser.add_argument("--final-lr", type=float, default=1e-6,
         help="Final LR for the reference --lr; all optimizer groups use the same relative decay")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=0.1)
-    parser.add_argument("--embed-dim", action=_LegacyArchitectureAction, type=int, default=256)
-    parser.add_argument(
-        "--depth", action=_LegacyArchitectureAction, type=int, default=6,
-        help="Shared alignment-head depth; defaults to 6. Individual head options override it.",
-    )
-    parser.add_argument(
-        "--text-depth", action=_LegacyArchitectureAction, type=int,
-        help="Text alignment-head blocks; defaults to --depth. Set 0 with --text-pooling mean.",
-    )
-    parser.add_argument(
-        "--motion-depth", action=_LegacyArchitectureAction, type=int,
-        help="Motion alignment-head blocks; defaults to --depth. Set 0 with --motion-pooling mean.",
-    )
-    parser.add_argument(
-        "--text-pooling", action=_LegacyArchitectureAction, choices=("cls", "mean"), default="cls",
-        help="Text readout: CLS (default) or masked mean of valid tokens.",
-    )
-    parser.add_argument(
-        "--motion-pooling", action=_LegacyArchitectureAction, choices=("cls", "mean"), default="cls",
-        help="Motion readout after its Transformer blocks: CLS (default) or masked mean.",
-    )
-    parser.add_argument("--num-heads", action=_LegacyArchitectureAction, type=int, default=4)
-    parser.add_argument("--ff-dim", action=_LegacyArchitectureAction, type=int, default=1024)
-    parser.add_argument("--dropout", action=_LegacyArchitectureAction, type=float, default=0.1)
     parser.add_argument("--chunk-size", type=int, default=512)
     parser.add_argument("--use-bfloat16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=True)
