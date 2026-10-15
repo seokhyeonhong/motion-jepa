@@ -167,7 +167,15 @@ class _TargetMoments:
 
 
 def tensorboard_metrics(summary: dict) -> dict[str, float]:
-    """Flatten diagnostic scalars; never write CSV, JSON, or cached feature files."""
+    """Emit changing diagnostics, keeping fixed counts/metadata out of curves."""
+    excluded = {
+        "heldout_jepa/count",
+        "num_samples",
+        "feature_dim",
+        "rankme_ceiling",
+        "covariance_rank_ceiling",
+        "representation/standardized/mean_std",
+    }
     output = {}
     def collect(path, value):
         if isinstance(value, dict):
@@ -176,7 +184,8 @@ def tensorboard_metrics(summary: dict) -> dict[str, float]:
         elif isinstance(value, (int, float)):
             if not math.isfinite(value):
                 raise ValueError(f"Non-finite online metric: {path}={value}")
-            output[path] = float(value)
+            if path not in excluded:
+                output[path] = float(value)
     collect("", summary)
     return output
 

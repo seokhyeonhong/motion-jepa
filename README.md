@@ -213,7 +213,11 @@ RankMe (uncentered singular values), mean channel standard deviation, average
 pairwise cosine similarity, covariance effective rank, largest eigenvalue share,
 condition number, and off-diagonal covariance magnitude. Raw and per-channel
 standardized features are reported separately, along with temporal variation,
-near-zero channel counts, sample count, and rank ceilings. Rank is a collapse
+near-zero channel counts. Fixed sample/target-token counts, feature dimension,
+and rank ceilings remain in the returned diagnostic summary but are excluded
+from TensorBoard scalar curves. Standardized mean standard deviation is also
+omitted because channel standardization fixes it near 1. Raw standard deviation
+and near-zero channel count remain useful collapse diagnostics. Rank is a collapse
 diagnostic, not evidence of semantic quality on its own.
 
 Held-out JEPA diagnostics compare the online encoder/predictor against the
