@@ -127,10 +127,10 @@ def write_ragged_bank(path, keys, lengths, feature_dim, signature, batches, extr
 
 
 def load_text_backbone(model_name, revision, device):
-    """Instantiate only the pretrained bidirectional T5Gemma encoder."""
+    """Load a frozen T5Gemma or DistilBERT encoder using the environment HF cache."""
     # Deliberately deferred: cache-only training has no Transformers dependency.
     try:
-        from transformers import AutoConfig, AutoTokenizer, T5GemmaEncoderModel
+        from transformers import AutoConfig, AutoTokenizer, DistilBertModel, T5GemmaEncoderModel
     except ImportError as error:
         raise RuntimeError(
             f"Cannot extract {model_name!r}: install the text dependencies with "
@@ -138,12 +138,22 @@ def load_text_backbone(model_name, revision, device):
         ) from error
     try:
         config = AutoConfig.from_pretrained(model_name, revision=revision)
-        if config.model_type != "t5gemma":
-            raise ValueError(f"Text model {model_name!r} must use model_type='t5gemma', got {config.model_type!r}")
-        config.is_encoder_decoder = False
+        if config.model_type == "t5gemma":
+            config.is_encoder_decoder = False
+            model_class = T5GemmaEncoderModel
+            feature_dim = int(config.encoder.hidden_size)
+        elif config.model_type == "distilbert":
+            model_class = DistilBertModel
+            feature_dim = int(config.dim)
+        else:
+            raise ValueError(
+                f"Text model {model_name!r} must use model_type='t5gemma' or "
+                f"'distilbert', got {config.model_type!r}"
+            )
+        # Leave cache_dir unset: honor HF_HOME/HF_HUB_CACHE from motion-jepa.
         resolved_revision = getattr(config, "_commit_hash", None) or revision
         tokenizer = AutoTokenizer.from_pretrained(model_name, revision=resolved_revision)
-        model, loading = T5GemmaEncoderModel.from_pretrained(
+        model, loading = model_class.from_pretrained(
             model_name, revision=resolved_revision, config=config,
             dtype=torch.bfloat16, output_loading_info=True,
         )
@@ -162,13 +172,16 @@ def load_text_backbone(model_name, revision, device):
         "backend": tokenizer.backend_tokenizer.to_str(),
         "special_tokens": {key: str(value) for key, value in tokenizer.special_tokens_map.items()},
     })
-    return model, tokenizer, {
+    info = {
         "model": str(model_name), "revision": revision,
         "resolved_revision": getattr(config, "_commit_hash", None),
         "tokenizer_sha256": tokenizer_hash,
-        "feature_dim": int(config.encoder.hidden_size), "dtype": "bfloat16",
-        "model_class": "T5GemmaEncoderModel",
+        "feature_dim": feature_dim, "dtype": "bfloat16",
+        "model_class": model_class.__name__,
     }
+    if config.model_type == "distilbert":
+        info["max_position_embeddings"] = int(config.max_position_embeddings)
+    return model, tokenizer, info
 
 
 def _prepare_text(path, paired, *, model_name, revision, max_length, device, batch_size, recompute):
@@ -177,6 +190,12 @@ def _prepare_text(path, paired, *, model_name, revision, max_length, device, bat
     if existing is not None:
         return existing
     model, tokenizer, info = load_text_backbone(model_name, revision, device)
+    position_limit = info.get("max_position_embeddings")
+    if position_limit is not None and max_length > position_limit:
+        raise ValueError(
+            f"--max-text-length {max_length} exceeds {model_name!r}'s positional "
+            f"limit of {position_limit}"
+        )
     keys = list(paired["catalog"])
     texts = [paired["catalog"][key] for key in keys]
     lengths, truncated = [], 0
@@ -191,7 +210,7 @@ def _prepare_text(path, paired, *, model_name, revision, max_length, device, bat
 
     def batches():
         with torch.inference_mode():
-            for start in tqdm(range(0, len(texts), batch_size), desc="Cache T5Gemma tokens"):
+            for start in tqdm(range(0, len(texts), batch_size), desc=f"Cache {info['model_class']} tokens"):
                 encoded = tokenizer(
                     texts[start:start + batch_size], padding=True, truncation=True,
                     max_length=max_length, return_tensors="pt",

@@ -19,7 +19,12 @@ def build_parser():
     parser.add_argument("--jepa-checkpoint", type=Path)
     parser.add_argument("--checkpoint-key", choices=("target_encoder", "encoder"), default="target_encoder")
     parser.add_argument("--stats-path", type=Path)
-    parser.add_argument("--text-model", default=DEFAULT_TEXT_MODEL)
+    parser.add_argument(
+        "--text-model", default=DEFAULT_TEXT_MODEL,
+        help="T5Gemma or DistilBERT model ID/local directory; e.g. "
+             "google/t5gemma-2b-2b-ul2 or distilbert/distilbert-base-uncased. "
+             "Uses the activated environment's Hugging Face cache.",
+    )
     parser.add_argument("--text-revision")
     parser.add_argument("--max-text-length", type=int, default=256)
     parser.add_argument("--device", default="auto")

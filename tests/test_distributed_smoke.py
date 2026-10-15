@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -18,6 +19,12 @@ from _npy_fixture import write_npy_dataset
 
 class DistributedTrainingSmokeTest(unittest.TestCase):
     def test_two_cpu_processes_train_through_main(self):
+        self._run_training(context=False)
+
+    def test_two_cpu_processes_with_context_warmup(self):
+        self._run_training(context=True)
+
+    def _run_training(self, *, context):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             dataset = root / "dataset"
@@ -76,6 +83,11 @@ class DistributedTrainingSmokeTest(unittest.TestCase):
                     "weight_decay": 0.04,
                 },
             }
+            if context:
+                config["loss"] = {"context": {"weight": .1, "warmup_epochs": 1,
+                                               "distance_weighting": True}}
+                config["position_encoding"] = {"temporal": "rope"}
+                config["optimization"]["epochs"] = 2
             config_path = root / "config.yaml"
             config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
             with socket.socket() as sock:
@@ -103,6 +115,14 @@ class DistributedTrainingSmokeTest(unittest.TestCase):
                 env=environment,
             )
             self.assertTrue((output / "ddp-smoke-latest.pth.tar").is_file())
+            if context:
+                rows = [json.loads(line) for line in
+                        (output / "training-epochs.jsonl").read_text().splitlines()]
+                self.assertEqual([row["context_active_steps"] for row in rows], [0, 1])
+                self.assertEqual([row["context_weight"] for row in rows], [0., .1])
+                self.assertGreater(rows[1]["context_loss"], 0)
+                self.assertAlmostEqual(rows[1]["loss"],
+                    rows[1]["masked_loss"] + rows[1]["weighted_context_loss"], places=6)
 
 
 if __name__ == "__main__":

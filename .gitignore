@@ -26,3 +26,6 @@ findings/
 ijepa/
 .codex/
 configs/_depr*
+
+findings
+tests

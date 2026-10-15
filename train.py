@@ -40,6 +40,12 @@ from mask import (
     PatchRandomSpatialSegmentMaskCollator2D,
 )
 from model import MODEL_FACTORIES, PREDICTOR_FACTORIES, TokenLayout
+from model.context_loss import (
+    context_loss_config,
+    context_loss_weight,
+    context_prediction_loss,
+    validate_context_loss_layout,
+)
 from mask.utils import (
     apply_index_masks,
     gather_grid_masks,
@@ -89,6 +95,7 @@ def _write_tensorboard_interval(
     grad_first: float,
     grad_last: float,
     grad_average: float,
+    loss_components: dict | None = None,
 ) -> None:
     if writer is None:
         return
@@ -103,6 +110,8 @@ def _write_tensorboard_interval(
         "train/gradient_average": grad_average,
         "train/epoch": float(epoch),
     }
+    if loss_components is not None:
+        scalars.update({f"train/{name}": value for name, value in loss_components.items()})
     for name, value in scalars.items():
         writer.add_scalar(name, value, global_step)
     writer.flush()
@@ -710,6 +719,17 @@ def _prediction_loss(
     return (token_loss.sum(dim=1) / counts).mean()
 
 
+def _loss_component_meters() -> dict:
+    return {name: AverageMeter() for name in (
+        "masked_loss", "context_loss", "weighted_context_loss", "context_weight"
+    )}
+
+
+def _loss_component_summary(meters: dict) -> dict:
+    return {**{name: meter.avg for name, meter in meters.items()},
+            "context_active_steps": meters["context_loss"].count}
+
+
 def _resolve_device(device: str | torch.device | None) -> torch.device:
     if device is not None:
         resolved = torch.device(device)
@@ -732,6 +752,7 @@ def _seed_all(seed: int, device: torch.device) -> None:
 
 
 def main(args: dict, resume_preempt: bool = False, device=None):
+    context_options = context_loss_config(args)
     device = _resolve_device(device)
     probe_configuration = args.get("linear_probe", {})
     attentive_args = _attentive_probe_args(args)
@@ -804,7 +825,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     def initialize_output():
         # Check and create on the same rank: another rank may arrive after the
         # directory has already been created by rank zero. Broadcast failures
-        # before anyone enters model/DDP initialization.
+        # before anyone enters dataset/DDP initialization.
         if output.exists() and not resume_requested:
             raise FileExistsError(f"Output folder already exists: {output}")
         output.mkdir(parents=True, exist_ok=True)
@@ -812,10 +833,11 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             yaml.safe_dump(args, sort_keys=False), encoding="utf-8"
         )
 
-    _run_rank_zero(initialize_output, is_main=distributed.is_main)
-
     encoder, predictor = init_mjepa_model_from_config(args, device)
     layout = encoder.token_layout
+    validate_context_loss_layout(context_options, layout, predictor.token_layout)
+    _run_rank_zero(initialize_output, is_main=distributed.is_main)
+    logger.info("Resolved context loss: %s", json.dumps(context_options, sort_keys=True))
     architecture = architecture_signature(
         encoder,
         predictor,
@@ -1339,6 +1361,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     interval_time_meter = AverageMeter()
     interval_lr_meter = AverageMeter()
     interval_wd_meter = AverageMeter()
+    interval_components = _loss_component_meters()
     for epoch in range(start_epoch, epochs):
         epoch_started = time.perf_counter()
         sampler.set_epoch(epoch)
@@ -1346,6 +1369,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         predictor.train()
         loss_meter = AverageMeter()
         time_meter = AverageMeter()
+        epoch_components = _loss_component_meters()
         for iteration, (batch, masks_enc, masks_pred) in enumerate(loader):
             started = time.perf_counter()
             motion = batch[0].to(device=device, dtype=torch.float32, non_blocking=True)
@@ -1365,21 +1389,41 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                 if amp_dtype is not None
                 else nullcontext()
             )
+            context_weight = context_loss_weight(context_options, global_step, len(loader))
+            context_loss = None
             with amp_context:
                 with torch.no_grad():
                     target = target_encoder(motion, fps, valid_frames=valid_frames)
                     target = F.layer_norm(target, (target.shape[-1],))
+                    if context_weight > 0:
+                        # Predictor batches are [prediction mask, encoder mask, sample].
+                        context_target = apply_index_masks(target, masks_enc).repeat(
+                            len(masks_pred), 1, 1
+                        )
                     if layout.kind == "1d":
                         target = apply_index_masks(target, masks_pred)
                     else:
                         target = gather_grid_masks(target, masks_pred)
                     target = repeat_mask_blocks(target, len(motion), len(masks_enc))
                 context = encoder(motion, fps, masks_enc, valid_frames=valid_frames)
-                prediction = predictor(context, fps, masks_enc, masks_pred)
-                loss = _prediction_loss(
+                if context_weight > 0:
+                    prediction, context_prediction = predictor(
+                        context, fps, masks_enc, masks_pred, return_context=True
+                    )
+                else:
+                    prediction = predictor(context, fps, masks_enc, masks_pred)
+                masked_loss = _prediction_loss(
                     prediction, target, masks_pred,
                     num_enc_masks=len(masks_enc), kind=layout.kind,
                 )
+                loss = masked_loss
+                if context_weight > 0:
+                    context_loss = context_prediction_loss(
+                        context_prediction, context_target, masks_enc, masks_pred,
+                        distance_weighting=context_options["distance_weighting"],
+                    )
+                    weighted_context_loss = context_weight * context_loss
+                    loss = masked_loss + weighted_context_loss
 
             # full precision
             if scaler is None:
@@ -1402,7 +1446,17 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             momentum = momentum_scheduler.step()
             update_ema(encoder, target_encoder, momentum)
             global_step += 1
-            reported_loss = float(reduce_mean(loss).cpu())
+            if context_loss is None:
+                # Reuse the original scalar reduction; no context tensor work at zero weight.
+                reported_loss = float(reduce_mean(loss).cpu())
+                reported_masked, reported_context, reported_weighted_context = reported_loss, 0.0, 0.0
+            else:
+                reported_loss, reported_masked, reported_context, reported_weighted_context = (
+                    reduce_mean(torch.stack((
+                        loss.detach(), masked_loss.detach(), context_loss.detach(),
+                        weighted_context_loss.detach(),
+                    ))).cpu().tolist()
+                )
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -1412,6 +1466,12 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             interval_time_meter.update(elapsed_ms)
             interval_lr_meter.update(learning_rate)
             interval_wd_meter.update(weight_decay)
+            for components in (epoch_components, interval_components):
+                components["masked_loss"].update(reported_masked)
+                components["weighted_context_loss"].update(reported_weighted_context)
+                components["context_weight"].update(context_weight)
+                if context_loss is not None:
+                    components["context_loss"].update(reported_context)
             if distributed.is_main:
                 csv_logger.log(
                     epoch + 1,
@@ -1454,7 +1514,10 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                         grad_first=stats.first_layer,
                         grad_last=stats.last_layer,
                         grad_average=stats.avg,
+                        loss_components=_loss_component_summary(interval_components),
                     )
+                    for meter in interval_components.values():
+                        meter.reset()
                     interval_loss_meter.reset()
                     interval_time_meter.reset()
                     interval_lr_meter.reset()
@@ -1472,6 +1535,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                 "training_wall_seconds": time.perf_counter() - epoch_started,
                 "step_compute_seconds": time_meter.sum / 1000,
                 "loss": loss_meter.avg,
+                **_loss_component_summary(epoch_components),
             })
         should_probe = probe_enabled and (
             (epoch + 1) % probe_frequency == 0 or (epoch + 1) == epochs

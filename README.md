@@ -215,11 +215,22 @@ attention and loss.
 `rope_time_scale` multiplies these times before rotation; its default retains
 seconds. `rope_theta` controls the frequency spectrum. Both must be finite and
 positive. RoPE currently supports 1D models only and does not change the
-configured input length or masking policy. For a controlled V2 experiment:
+configured input length or masking policy. Matching V2 configs are provided for
+frame tokens (150 tokens per full clip) and three-frame patches (50 tokens).
+They use the same RoPE, data, masking ratios, optimization, and evaluation
+settings, with separate output directories. Run either experiment with:
 
 ```bash
+# One token per frame.
+python main.py --config configs/mjepa_1d_base_v2_rope.yaml --devices cuda:0
+# One token per three-frame patch.
 python main.py --config configs/mjepa_patch_1d_base_v2_rope.yaml --devices cuda:0
 ```
+
+For simultaneous independent runs, use separate GPUs. Concurrent multi-GPU
+runs also need different `--master-port` values (for example `40112` and `40113`). Batch size is per GPU;
+the frame-token variant has a longer attention sequence and may need a smaller
+`data.batch_size` on the same hardware.
 
 Omitting `position_encoding` retains the existing absolute behavior, including
 old checkpoints. Exact resume requires the same positional mode, theta, and
@@ -556,3 +567,62 @@ The JEPA training design is based on Meta's I-JEPA implementation and paper:
   year={2023}
 }
 ```
+
+## Optional context prediction loss
+
+
+Non-patchified 1D models (absolute positions or RoPE) can additionally predict the
+full-view EMA teacher features at visible context frames. Multi-level prediction
+is not included. Configure:
+
+```yaml
+loss:
+  context:
+    weight: 0.0
+    warmup_epochs: 40
+    distance_weighting: true
+```
+
+These are also the defaults when settings are omitted. Weight and warmup must be
+finite and nonnegative, and distance weighting must be a YAML boolean. Positive
+weights are rejected for patchified and 2D models.
+
+The total objective is `masked_loss + effective_weight * context_loss`; the
+existing masked Smooth-L1 objective is unchanged. Context predictions reuse the
+same predictor forward pass, normalization, and output projection, with no new
+parameters. Teacher features are detached and use the existing per-token target
+LayerNorm. The predictor's optional keyword `return_context=True` returns
+`(masked_prediction, context_prediction)`; the default still returns only the
+masked-prediction tensor.
+
+Context Smooth-L1 is averaged over features and valid tokens, then equally over
+samples and encoder/target-mask combinations. With distance weighting, each
+token's error is multiplied by `1 / sqrt(max(1, d))`, where `d` is the nearest
+valid target frame in that prediction-mask branch, measured in original frame
+indices. The denominator remains the number of valid context tokens, not the
+sum of distance weights. Padding is excluded; overlap has distance weight one.
+
+Let `W = ceil(warmup_epochs * iterations_per_epoch)` and let `s` be the number of
+completed optimizer steps. The next update uses `weight * min(1, s / W)`; `W=0`
+uses the full weight immediately. Resume uses the restored global step, so the
+warmup does not restart. Changing these settings during resume is an intentional
+objective change; the resolved settings are logged and the supplied config is
+saved in the checkpoint.
+
+An effective weight of zero skips context output projection, context-target
+gathering, distances, and context loss. The encoder and predictor still process
+the context tokens required by the original masked prediction objective.
+
+The base, small, and tiny RoPE configs keep weight zero.
+`configs/mjepa_1d_small_v2_rope_context.yaml` enables weight `0.1`, a 40-epoch
+warmup, and distance weighting in a separate output directory. These are initial
+experiment settings, not validated optimal values. To run a uniform fixed-weight
+ablation, set `warmup_epochs: 0` and `distance_weighting: false`.
+
+Existing CSV columns and the total `loss` metric are unchanged. TensorBoard
+(`train/` prefix) and `training-epochs.jsonl` additionally record `masked_loss`,
+`context_loss`, `weighted_context_loss`, `context_weight`, and
+`context_active_steps`. Unweighted context loss is averaged only over computed
+steps; its value and active-step count are zero when disabled. Weighted context
+loss and the coefficient are averaged over all steps. TensorBoard counts refer
+to the reporting interval; JSONL counts refer to the epoch.

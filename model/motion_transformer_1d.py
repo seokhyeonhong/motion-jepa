@@ -215,7 +215,10 @@ class MotionTransformerPredictor1D(nn.Module):
         fps: torch.Tensor,
         masks_enc: list[torch.Tensor],
         masks_pred: list[torch.Tensor],
-    ) -> torch.Tensor:
+        *,
+        return_context: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Optionally return context predictions in the same [pred, enc, batch] order."""
         if not masks_enc or not masks_pred:
             raise ValueError("Predictor requires encoder and target masks")
         batch_size = len(fps)
@@ -264,9 +267,20 @@ class MotionTransformerPredictor1D(nn.Module):
             x = x.masked_fill(~active.unsqueeze(-1), 0)
         for block in self.blocks:
             x = block(x, active, rotary)
-        x = self.norm(x[:, context_tokens:])
-        output = self.output_proj(x)
-        return output.masked_fill(~target_active.unsqueeze(-1), 0) if active is not None else output
+        # Keep the masked projection shape and operation order identical to the
+        # original path. Context uses the same head only when explicitly requested.
+        masked = self.norm(x[:, context_tokens:])
+        output = self.output_proj(masked)
+        if active is not None:
+            output = output.masked_fill(~target_active.unsqueeze(-1), 0)
+        if not return_context:
+            return output
+        context_output = self.output_proj(self.norm(x[:, :context_tokens]))
+        if active is not None:
+            context_output = context_output.masked_fill(
+                ~context_active.repeat(len(masks_pred), 1).unsqueeze(-1), 0
+            )
+        return output, context_output
 
 
 def _encoder(size: str, **kwargs) -> MotionTransformer1D:

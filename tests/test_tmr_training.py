@@ -269,6 +269,7 @@ class TMRTrainingIntegrationTest(unittest.TestCase):
             # states while exercising their resume and standalone-evaluation paths.
             for path in (resumed_output / "latest.pth.tar", resumed_output / "best.pth.tar"):
                 saved = torch.load(path, map_location="cpu", weights_only=False)
+                saved["config"]["model"].pop("model_version", None)
                 saved["config"]["model"].pop("text_depth")
                 saved["config"]["model"].pop("motion_depth")
                 original_save(saved, path)

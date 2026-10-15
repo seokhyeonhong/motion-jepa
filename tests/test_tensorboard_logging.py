@@ -44,6 +44,19 @@ class TensorBoardLoggingTest(unittest.TestCase):
         self.assertEqual(writer.scalars["train/epoch"], (2.0, 100))
         self.assertEqual(writer.flush_count, 1)
 
+    def test_loss_components_are_emitted_without_changing_total_loss(self):
+        writer = _Writer()
+        components = dict(masked_loss=.2, context_loss=.5, weighted_context_loss=.05,
+                          context_weight=.1, context_active_steps=3)
+        _write_tensorboard_interval(
+            writer, global_step=4, epoch=1, loss=.25, learning_rate=.001,
+            weight_decay=.04, time_ms=1, memory_mib=0, grad_first=0, grad_last=0,
+            grad_average=0, loss_components=components,
+        )
+        self.assertEqual(writer.scalars["train/loss"], (.25, 4))
+        for name, value in components.items():
+            self.assertEqual(writer.scalars["train/" + name], (value, 4))
+
     def test_none_writer_is_a_noop(self):
         _write_tensorboard_interval(
             None,

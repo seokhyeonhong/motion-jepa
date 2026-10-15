@@ -236,8 +236,10 @@ class RotaryModelsTest(unittest.TestCase):
                 motion = self.motion.cuda().requires_grad_()
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     with torch.no_grad():
+                        # Older autocast caches can reuse a no-grad cast of a
+                        # leaf input in the student; keep the teacher input separate.
                         target = apply_index_masks(
-                            teacher(motion, fps, valid_frames=valid_frames), targets
+                            teacher(motion.detach(), fps, valid_frames=valid_frames), targets
                         )
                     context = encoder(motion, fps, contexts, valid_frames)
                     predicted = predictor(context, fps, contexts, targets)

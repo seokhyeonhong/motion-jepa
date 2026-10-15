@@ -19,7 +19,15 @@ Hub version below 2. Existing PyTorch/CUDA packages remain in place.
 
 ## Model
 
-The frozen text backbone is the first-generation, text-only pretrained
+Choose the frozen text backbone with `--text-model` in preparation and training:
+`google/t5gemma-2b-2b-ul2` (the unchanged default, 2304-dimensional tokens), or
+`distilbert/distilbert-base-uncased` (768-dimensional tokens). Local directories
+of either model type are supported. The loader detects the architecture from its
+config, freezes all parameters, and retains valid final hidden-state tokens;
+it does not load a language-model or classification head. Head input widths are
+inferred from the prepared features.
+
+The default frozen text backbone is the first-generation, text-only pretrained
 [`google/t5gemma-2b-2b-ul2`](https://huggingface.co/google/t5gemma-2b-2b-ul2).
 `T5GemmaEncoderModel` loads with `is_encoder_decoder=False`; no decoder is
 constructed. Standard Hugging Face loading can still download all weight shards
@@ -27,9 +35,10 @@ of the published encoder-decoder checkpoint. Accept the Gemma model license and
 authenticate with `hf auth login`, or provide an already downloaded local model
 directory using `--text-model`.
 
-Preparation must use the same `HF_HOME` as your login. On this server the
-authenticated cache is `/data/seokhyeon/hf-cache`, so set
-`export HF_HOME=/data/seokhyeon/hf-cache` before running the commands below.
+Preparation honors `HF_HOME`/`HF_HUB_CACHE` inherited from the activated
+environment; the scripts do not override them. On this server, activating
+`motion-jepa` sets `HF_HOME=/data/seokhyeon/hf-cache/`. Activate the environment
+before each command so downloads and authentication use that existing cache.
 
 The complete valid encoder token sequence is retained. Each trainable readout
 projects its input to 256 dimensions, prepends its own learnable CLS token, adds
@@ -37,9 +46,14 @@ sinusoidal positions, and applies six pre-norm Transformer blocks by default (fo
 heads, 1024-wide FFN, dropout 0.1). `--text-depth` and `--motion-depth` independently
 set the number of blocks in the trainable alignment heads. Each defaults to
 `--depth` (6); an individual option overrides the shared value for that head only.
-These options do not change the frozen T5Gemma or JEPA backbones. The final
-LayerNorm CLS output is L2-normalized. CLS is added after the frozen text encoder,
-not to its tokenizer input.
+These options do not change the frozen text or JEPA backbones. By default,
+each head's final LayerNorm CLS output is L2-normalized; CLS is added after the
+frozen text encoder, not to its tokenizer input. `--text-pooling mean` and
+`--motion-pooling mean` instead average valid tokens after the head's final
+LayerNorm, then L2-normalize. A zero-depth head is supported only with mean
+pooling: it projects the frozen tokens, applies LayerNorm, and pools without adding
+positional embeddings or a Transformer block. The two pooling choices are saved
+in checkpoints and checked on resume; historical checkpoints default to CLS.
 
 Raw motion uses `[150,366]` frame features. JEPA uses the checkpoint's temporal
 tokens, e.g. `[50,384]` for the current 3-frame patch encoder. For 2D checkpoints,
@@ -132,6 +146,47 @@ For a small smoke run, prepare **both** branches into a separate cache root with
 --batch-size 4 --num-workers 0`. A smoke cache is identified in its manifest and
 cannot silently be mistaken for the full dataset. It still needs text model
 access, unless a local model is supplied.
+
+## DistilBERT comparison
+
+Use a separate TMR feature-cache root for each text model. This feature cache is
+distinct from the shared Hugging Face download cache. A cache prepared for
+T5Gemma cannot train a DistilBERT run, or vice versa; mismatched signatures and
+resume configurations are rejected.
+
+```bash
+source /opt/conda/etc/profile.d/conda.sh
+conda activate motion-jepa
+TMR_TEXT_MODEL=distilbert/distilbert-base-uncased
+TMR_CACHE=output/tmr-cache-distilbert
+
+python -m experiment.tmr.prepare_cache \
+  --input-source raw --text-model "$TMR_TEXT_MODEL" \
+  --stats-path "$TMR_STATS" --cache-root "$TMR_CACHE"
+
+python -m experiment.tmr.prepare_cache \
+  --input-source jepa --text-model "$TMR_TEXT_MODEL" \
+  --jepa-checkpoint "$TMR_JEPA_CHECKPOINT" \
+  --stats-path "$TMR_STATS" --cache-root "$TMR_CACHE"
+
+python -m experiment.tmr \
+  --input-source raw --text-model "$TMR_TEXT_MODEL" \
+  --stats-path "$TMR_STATS" --cache-root "$TMR_CACHE" \
+  --output-root output/tmr/distilbert-raw/seed-42
+
+python -m experiment.tmr \
+  --input-source jepa --text-model "$TMR_TEXT_MODEL" \
+  --jepa-checkpoint "$TMR_JEPA_CHECKPOINT" \
+  --stats-path "$TMR_STATS" --cache-root "$TMR_CACHE" \
+  --output-root output/tmr/distilbert-jepa/seed-42
+```
+
+Use the same model ID/revision and token limit for both preparation and training.
+DistilBERT supports at most 512 positions; the default `--max-text-length 256`
+is valid. Evaluation restores the selected model and feature cache from the
+checkpoint automatically. To compare with T5Gemma, use its model ID with a
+different feature-cache and output directory. All existing head-depth and
+training-fraction options work with either backbone.
 
 ## Visualize cached motion-caption pairs
 
@@ -290,3 +345,113 @@ Tests use a small local text encoder/tokenizer and synthetic motion/checkpoints,
 without Hugging Face downloads. A real pretrained 2B inference check additionally
 requires access to the gated model. Cache preparation reports an actionable error
 if that access is unavailable.
+
+
+## TMR v2: JEPA-sized raw-motion training
+
+Select v2 with `--model-version v2 --model-size tiny`. The motion encoder is the
+actual frame-token `MotionTransformer1D`, randomly initialized and fully trained
+with the existing TMR contrastive objective. Its RoPE uses frame times in seconds,
+theta 100, and time scale 1. There are no context/target masks, predictor, or EMA
+teacher; padding masks still exclude invalid frames.
+
+| Size | Width | Blocks | Heads |
+|---|---:|---:|---:|
+| tiny | 192 | 6 | 3 |
+| small | 256 | 8 | 4 |
+| base (v2 default) | 384 | 12 | 6 |
+| large | 512 | 16 | 8 |
+| huge | 768 | 24 | 12 |
+| giant | 1024 | 32 | 16 |
+
+Motion encoding is raw normalized frames → JEPA input projection and RoPE blocks
+→ terminal LayerNorm → valid-frame mean → L2 normalization. There is no extra
+motion projection or CLS token. Frame count and FPS come from validated dataset
+metadata; batches are zero-padded to that frame count.
+
+The frozen text backbone remains selectable between T5Gemma and DistilBERT.
+Text encoding is frozen tokens → trainable linear projection to the selected
+JEPA width → trainable per-token LayerNorm → masked mean → L2 normalization.
+There are no additional text transformer blocks. Both modalities therefore have
+the selected size's embedding width.
+
+After preparing a raw-motion cache with the chosen text backbone:
+
+```bash
+source /opt/conda/etc/profile.d/conda.sh
+conda activate motion-jepa
+python -m experiment.tmr \
+  --model-version v2 --model-size tiny \
+  --input-source raw \
+  --text-model google/t5gemma-2b-2b-ul2 \
+  --cache-root dataset/tmr-cache \
+  --output-root output/tmr-v2/tiny/seed-42
+```
+
+Use the existing DistilBERT cache and its matching `--text-model` to change text
+backbones. All Hugging Face paths continue to follow the activated environment's
+cache settings. Existing `--train-fraction`, optimization, logging, resume, and
+evaluation options apply. Defaults remain 100 epochs, batch size 256, AdamW LR
+1e-4, weight decay 0.01, five warmup epochs, cosine decay to 1e-6, temperature
+0.1, gradient clipping 1, BF16, and seed 42. Validation mean bidirectional R@1
+selects the checkpoint before test-gallery evaluation.
+
+V1 remains the default and old checkpoints remain readable. V2 accepts raw
+motion only, rejects JEPA checkpoints/features and explicitly supplied legacy
+architecture flags (`--depth`, `--text-depth`, `--motion-depth`, `--embed-dim`,
+`--num-heads`, `--ff-dim`, `--dropout`, and pooling flags). Its architecture
+is determined by the named size. Use `--resume` with the same v2 configuration;
+evaluation reconstructs the model from the checkpoint automatically.
+
+Without `--output-root`, v2 writes to `output/tmr-v2/<size>/seed-<seed>`, or
+`output/tmr-v2/<size>/frac<fraction>/seed-<seed>` for subsets. Specify distinct
+output roots when comparing text backbones or optimization settings.
+`config.json` stores the version, resolved size, frame count, FPS, and RoPE
+settings. `parameters.json` and `summary.json` report trainable motion, text,
+and total parameter counts; frozen text-backbone parameters are excluded.
+
+
+## RoPE JEPA + LoRA for TMR
+
+Use v2 with `--motion-adaptation lora --jepa-checkpoint <final-EMA-checkpoint>`.
+The encoder is initialized from the chosen `--checkpoint-key` (default
+`target_encoder`). Raw frames are encoded online so adapters receive gradients;
+frozen JEPA token caches are not used. No additional motion transformer is added.
+
+Only attention QKV/output LoRA adapters and the text projection/LayerNorm train.
+Original JEPA parameters and the text backbone stay frozen. Both readouts remain
+valid-token mean pooling and L2 normalization at the JEPA embedding width.
+LoRA defaults are rank 8, alpha 16 and dropout 0, applied in every block.
+The existing TMR optimizer LR and schedule apply to both adapters and text readout.
+
+The model size is inferred from the checkpoint; an explicit `--model-size` must
+match. Only non-patchified 1D RoPE checkpoints with theta 100/time scale 1 are
+supported. Frame count, FPS, input width and the original raw normalization
+statistics must match the prepared dataset. Both T5Gemma and DistilBERT caches
+are supported through their existing text-model/cache options.
+
+Checkpoint provenance includes the source SHA256, selected encoder key,
+pretraining epoch and complete source config. Resume rejects changed initialization
+or recipes. Training checkpoints contain the frozen encoder plus adaptation and
+optimizer states; standalone evaluation reconstructs the LoRA architecture and
+verifies the original source identity. Parameter reports distinguish trainable
+motion adapters/text readout from frozen motion parameters.
+
+Example (with the matching raw-motion/T5 cache prepared):
+
+```bash
+python -m experiment.tmr --model-version v2 --motion-adaptation lora --model-size base \
+  --input-source raw --jepa-checkpoint <RoPE-JEPA-base-final-epoch300.pth.tar> \
+  --checkpoint-key target_encoder --cache-root output/tmr-cache-rope-raw \
+  --dataset-root dataset/bones-seed-processed-nframes150 \
+  --stats-path dataset/bones-seed-processed-v2-nframes150-min60/stats \
+  --output-root output/tmr-jepa-lora/base/seed-42
+```
+
+Use an explicit output root when comparing pretrained checkpoints. Default LoRA
+outputs use `output/tmr-jepa-lora/<size>/seed-<seed>` (or `checkpoint-size`
+when size is inferred), with fraction subdirectories for partial training data.
+
+Prepare a raw cache manifest with the checkpoint's original normalization before training.
+The shared text bank may be reused through a symlink when its signed text provenance
+matches. The launched base experiment uses output/tmr-cache-rope-raw for this purpose.

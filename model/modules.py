@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.varlen import varlen_attn
 
+from .pos_embs import apply_rotary_pos_emb
+
 
 _PACKED_SPATIAL_SDPA = True
 
@@ -245,12 +247,15 @@ class SelfAttention(nn.Module):
         self,
         x: torch.Tensor,
         active: torch.Tensor | None = None,
+        rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         batch, tokens, dim = x.shape
         qkv = self.qkv(x).reshape(
             batch, tokens, 3, self.num_heads, self.head_dim
         ).permute(2, 0, 3, 1, 4)
         query, key, value = qkv.unbind(0)
+        if rotary is not None:
+            query, key = apply_rotary_pos_emb(query, key, rotary)
         attention_mask = None
         if active is not None:
             active = active.to(device=x.device, dtype=torch.bool)
@@ -369,8 +374,9 @@ class TransformerBlock1D(nn.Module):
         self,
         x: torch.Tensor,
         active: torch.Tensor | None = None,
+        rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        x = x + self.drop_path(self.attn(self.attn_norm(x), active))
+        x = x + self.drop_path(self.attn(self.attn_norm(x), active, rotary))
         if active is not None:
             x = x * active.unsqueeze(-1).to(dtype=x.dtype)
         x = x + self.drop_path(self.mlp(self.mlp_norm(x)))
