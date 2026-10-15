@@ -1,4 +1,4 @@
-"""Preprocess frame-cut 100STYLE SOMA77 BVHs into content-disjoint NPY windows."""
+"""Preprocess frame-cut 100STYLE SOMA77 BVHs into shuffled variable-length NPY windows."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import math
 import os
 import sys
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing import Pool
 from pathlib import Path
 from typing import Any, Iterator
@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from dataset.preprocess_bones_seed import (  # noqa: E402
     SPLITS,
     _prepare_output,
+    _protocol_sha256,
     _save_record_motion,
     _validate_complete_dataset,
     finalize_processed_dataset,
@@ -40,7 +41,9 @@ from skeleton import SOMASkeleton30, parse_bvh_motion  # noqa: E402
 SOURCE_PATTERN = "bvh/*_soma77.bvh"
 DEFAULT_CONTENTS = ("BR", "BW", "FR", "FW", "SR", "SW")
 KNOWN_CONTENTS = ("BR", "BW", "FR", "FW", "ID", "SR", "SW", "TR1", "TR2", "TR3")
-DEFAULT_TEST_CONTENT = "FW"
+PREPROCESSING_VERSION = "100style_window_split"
+SEGMENTATION_POLICY = "frame_cut_non_overlapping_windows_with_short_tail"
+SPLIT_PROPORTIONS = {"train": 0.85, "val": 0.05, "test": 0.10}
 FRAME_CUT_STOP_CONVENTION = "exclusive"
 
 _DATASET_ROOT: Path | None = None
@@ -209,12 +212,37 @@ def resampled_frame_count(frame_count: int, source_fps: int, target_fps: int) ->
 
 
 def enumerate_windows(
-    source_id: str, frame_count: int, num_frames: int
+    source_id: str, frame_count: int, num_frames: int, min_frames: int
 ) -> list[WindowDescriptor]:
-    """Enumerate complete, non-overlapping windows and discard the final remainder."""
+    """Keep non-overlapping windows, including a remainder of at least min_frames."""
+    if not 1 <= min_frames <= num_frames:
+        raise ValueError("Expected 1 <= min_frames <= num_frames")
     return [
-        WindowDescriptor(source_id, index, start, start + num_frames)
-        for index, start in enumerate(range(0, frame_count - num_frames + 1, num_frames))
+        WindowDescriptor(source_id, index, start, min(start + num_frames, frame_count))
+        for index, start in enumerate(range(0, frame_count, num_frames))
+        if frame_count - start >= min_frames
+    ]
+
+
+def assign_window_splits(
+    planned: list[PlannedSource], split_seed: int
+) -> list[PlannedSource]:
+    """Shuffle all windows; floor train/val counts and assign the rest to test."""
+    windows = [window for item in planned for window in item.windows]
+    order = np.random.default_rng(split_seed).permutation(len(windows))
+    train_end = len(windows) * 85 // 100
+    val_end = train_end + len(windows) * 5 // 100
+    assignments = {}
+    for rank, index in enumerate(order):
+        window = windows[index]
+        split = "train" if rank < train_end else "val" if rank < val_end else "test"
+        assignments[(window.source_id, window.segment_index)] = split
+    return [
+        replace(item, windows=tuple(
+            replace(window, split=assignments[(window.source_id, window.segment_index)])
+            for window in item.windows
+        ))
+        for item in planned
     ]
 
 
@@ -224,9 +252,10 @@ def build_window_plan(
     num_frames: int,
     fps: int,
     frame_cuts: dict[str, FrameCut],
-    test_content: str,
+    min_frames: int,
+    split_seed: int,
 ) -> tuple[list[PlannedSource], list[dict[str, Any]]]:
-    """Plan trimmed windows with content-disjoint train/test assignment."""
+    """Plan trimmed windows, then randomly split the global window pool."""
     planned: list[PlannedSource] = []
     errors: list[dict[str, Any]] = []
     for source in sources:
@@ -246,21 +275,9 @@ def build_window_plan(
             frame_count = resampled_frame_count(
                 frame_cut.stop_frame - frame_cut.start_frame, source_fps, fps
             )
-            split = "test" if source.motion_code == test_content else "train"
-            windows = tuple(
-                WindowDescriptor(
-                    window.source_id,
-                    window.segment_index,
-                    window.start_frame,
-                    window.end_frame,
-                    split,
-                )
-                for window in enumerate_windows(source.id, frame_count, num_frames)
-            )
+            windows = tuple(enumerate_windows(source.id, frame_count, num_frames, min_frames))
             if not windows:
-                raise ValueError(
-                    f"Trimmed motion has {frame_count} resampled frames, fewer than {num_frames}"
-                )
+                continue
             planned.append(
                 PlannedSource(
                     source=source,
@@ -284,7 +301,7 @@ def build_window_plan(
                 }
             )
 
-    return planned, errors
+    return assign_window_splits(planned, split_seed), errors
 
 
 def _absolute_source_path(source: SourceMotion, dataset_root: Path | None) -> Path:
@@ -434,12 +451,15 @@ def _ordered_results(
 def _validate_config(args: argparse.Namespace) -> None:
     if args.num_frames <= 0:
         raise ValueError(f"--num_frames must be positive, got {args.num_frames}")
+    if not 1 <= args.min_frames <= args.num_frames:
+        raise ValueError("--min_frames must be between 1 and --num_frames")
+    if args.split_seed < 0:
+        raise ValueError("--split_seed must be non-negative")
     if args.fps <= 0:
         raise ValueError(f"--fps must be positive, got {args.fps}")
     if args.limit == 0:
         raise ValueError("--limit must be positive or negative for no limit")
     contents = tuple(str(value).strip() for value in args.contents)
-    args.test_content = str(args.test_content).strip()
     if not contents or any(not value for value in contents):
         raise ValueError("--contents must contain at least one non-empty content")
     if len(set(contents)) != len(contents):
@@ -447,10 +467,6 @@ def _validate_config(args: argparse.Namespace) -> None:
     unknown = sorted(set(contents) - set(KNOWN_CONTENTS))
     if unknown:
         raise ValueError(f"Unknown 100STYLE contents: {unknown}")
-    if args.test_content not in contents:
-        raise ValueError("--test-content must be included in --contents")
-    if len(contents) < 2:
-        raise ValueError("At least one train content is required beside --test-content")
     args.contents = contents
 
 
@@ -458,30 +474,45 @@ def preprocess(args: argparse.Namespace) -> None:
     """Discover, split, convert, and finalize the 100STYLE NPY dataset."""
     _validate_config(args)
     args.dataset_root = Path(args.dataset_root).resolve()
-    args.frame_cuts = Path(args.frame_cuts).resolve()
+    args.frame_cuts = (
+        Path(args.frame_cuts) if args.frame_cuts is not None
+        else args.dataset_root / "Frame_Cuts.csv"
+    ).resolve()
     args.output = Path(args.output).resolve()
     args.overlap = 0.0
-    args.split_seed = None
     frame_cut_sha256 = hashlib.sha256(args.frame_cuts.read_bytes()).hexdigest()
-    expected_protocol = {
+    protocol = {
+        "version": PREPROCESSING_VERSION,
+        "segmentation": SEGMENTATION_POLICY,
+        "dataset_root": str(args.dataset_root),
         "fps": args.fps,
         "num_frames": args.num_frames,
+        "min_frames": args.min_frames,
+        "overlap": 0.0,
+        "stride_frames": args.num_frames,
+        "split_seed": args.split_seed,
+        "split_proportions": SPLIT_PROPORTIONS,
+        "split_rounding": "floor_train_and_val_remainder_test",
+        "limit": args.limit,
         "contents": list(args.contents),
-        "train_contents": [
-            content for content in args.contents if content != args.test_content
-        ],
-        "test_contents": [args.test_content],
-        "validation_enabled": False,
+        "validation_enabled": True,
         "frame_cuts_sha256": frame_cut_sha256,
         "frame_cut_stop_convention": FRAME_CUT_STOP_CONVENTION,
         "frame_cut_interval": "start_inclusive_stop_exclusive",
         "frame_cuts_applied_before_resampling": True,
     }
-    if args.output.exists() and _validate_complete_dataset(args.output) and not args.overwrite:
+    if args.output.exists() and not args.overwrite and _validate_complete_dataset(
+        args.output, preprocessing_version=PREPROCESSING_VERSION,
+        segmentation=SEGMENTATION_POLICY,
+    ):
         metadata = json.loads((args.output / "meta.json").read_text(encoding="utf-8"))
-        if all(metadata.get(key) == value for key, value in expected_protocol.items()):
-            print(f"Reusing complete NPY dataset: {args.output}")
-            return
+        if metadata.get("preprocessing_protocol") != protocol:
+            raise ValueError(
+                "Existing dataset preprocessing protocol does not match the requested "
+                f"configuration or inputs: {args.output}; use --overwrite or a new --output"
+            )
+        print(f"Reusing complete NPY dataset: {args.output}")
+        return
 
     frame_cuts = load_frame_cuts(args.frame_cuts)
     sources = discover_sources(args.dataset_root, args.limit, args.contents)
@@ -501,7 +532,7 @@ def preprocess(args: argparse.Namespace) -> None:
             }
             for content in args.contents
         }
-        expected_styles = cut_styles_by_content[args.test_content]
+        expected_styles = cut_styles_by_content[args.contents[0]]
         mismatched = {
             content: sorted(cut_styles_by_content[content].symmetric_difference(styles))
             for content, styles in styles_by_content.items()
@@ -523,7 +554,8 @@ def preprocess(args: argparse.Namespace) -> None:
         args.num_frames,
         args.fps,
         frame_cuts,
-        args.test_content,
+        args.min_frames,
+        args.split_seed,
     )
     if errors:
         first = errors[0]
@@ -532,7 +564,7 @@ def preprocess(args: argparse.Namespace) -> None:
             f"first error: {first['id']}: {first['error']}"
         )
     if not planned:
-        raise RuntimeError("No complete 100STYLE windows were discovered")
+        raise RuntimeError("No 100STYLE windows meeting --min_frames were discovered")
 
     _prepare_output(args.output, args.overwrite)
     records_by_split: dict[str, list[dict[str, Any]]] = {split: [] for split in SPLITS}
@@ -562,44 +594,52 @@ def preprocess(args: argparse.Namespace) -> None:
             f"first error: {first['id']}: {first['error']}"
         )
 
+    rng = np.random.default_rng(args.split_seed)
+    for records in records_by_split.values():
+        rng.shuffle(records)
+
     finalize_processed_dataset(
         args,
         records_by_split,
         errors,
         {split: len(sources_by_split[split]) for split in SPLITS},
         source_dataset="100STYLE_soma77",
-        segmentation="frame_cut_complete_non_overlapping_windows_by_content",
+        segmentation=SEGMENTATION_POLICY,
+        preprocessing_version=PREPROCESSING_VERSION,
         num_source_motions=len(successful_sources),
         metadata_extra={
-            "split_unit": "source_content",
+            "split_unit": "window",
             "source_pattern": SOURCE_PATTERN,
-            "tail_policy": "discard_incomplete_window",
+            "tail_policy": "retain_remainder_at_least_min_frames",
             "source_standard_tpose": True,
             "num_discovered_source_motions": len(sources),
             "downsampling": "fixed_step_from_trimmed_frame_zero_no_interpolation",
-            **expected_protocol,
+            **{key: value for key, value in protocol.items() if key != "version"},
+            "preprocessing_protocol": protocol,
+            "preprocessing_protocol_sha256": _protocol_sha256(protocol),
         },
     )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert 100STYLE SOMA77 BVHs to shuffled MotionJEPA NPY windows."
     )
     parser.add_argument(
         "--dataset_root",
         type=Path,
-        default=PROJECT_ROOT / "dataset/100STYLE_soma77",
+        default=PROJECT_ROOT / "dataset/100style-soma77",
     )
     parser.add_argument(
         "--frame-cuts",
         type=Path,
-        default=PROJECT_ROOT / "dataset/Frame_Cuts.csv",
+        default=None,
+        help="Frame-cut CSV (default: <dataset_root>/Frame_Cuts.csv).",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=PROJECT_ROOT / "dataset/100style-soma77-processed",
+        default=PROJECT_ROOT / "dataset/100style-processed-nframes60-150",
     )
     parser.add_argument(
         "--workers",
@@ -608,10 +648,11 @@ def parse_args() -> argparse.Namespace:
         help="Worker processes. Each worker uses one PyTorch CPU thread.",
     )
     parser.add_argument("--chunksize", type=int, default=8)
-    parser.add_argument("--num_frames", type=int, default=90)
+    parser.add_argument("--num_frames", type=int, default=150)
+    parser.add_argument("--min_frames", "--min-frames", type=int, default=60)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--contents", nargs="+", default=list(DEFAULT_CONTENTS))
-    parser.add_argument("--test-content", default=DEFAULT_TEST_CONTENT)
+    parser.add_argument("--split_seed", "--split-seed", type=int, default=42)
     parser.add_argument(
         "--limit",
         type=int,
@@ -620,7 +661,7 @@ def parse_args() -> argparse.Namespace:
         help="Process at most N source BVHs; negative values process every source.",
     )
     parser.add_argument("--overwrite", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":

@@ -96,28 +96,41 @@ targets, and loss.
 
 ### 100STYLE preprocessing
 
-The 100STYLE preprocessor uses the included official
-[`Frame_Cuts.csv`](dataset/Frame_Cuts.csv), trims each original 60 FPS motion
-with stop-exclusive `[START:STOP]` bounds, resamples the trimmed sequence to 30
-FPS, and creates complete non-overlapping 90-frame windows. The default split
-is content-disjoint: `BR/BW/FR/SR/SW` are training contents and all `FW`
-motions form the test set. Validation is intentionally empty.
+The 100STYLE preprocessor reads
+[`Frame_Cuts.csv`](dataset/100style-soma77/Frame_Cuts.csv), trims each original
+60 FPS motion with stop-exclusive `[START:STOP]` bounds, and resamples to 30 FPS.
+It creates non-overlapping 150-frame windows and retains a final remainder
+with at least 60 frames. Shorter remainders are discarded; a source with fewer
+than 60 resampled frames contributes no windows. Each retained window is
+canonicalized independently.
 
-Run a small end-to-end preview with:
+All windows are randomly shuffled into 85% train, 5% validation, and 10% test
+using `--split_seed 42`. Train and validation counts are rounded down; test
+receives the remaining windows. Splitting is by window, so a source recording
+can appear in multiple splits. Split rows are shuffled reproducibly, and
+normalization statistics use training frames only.
+
+Run the default preprocessing with:
+
+```bash
+python dataset/preprocess_100style.py
+```
+
+The input is `dataset/100style-soma77` and the output is
+`dataset/100style-processed-nframes60-150`. For a small preview:
 
 ```bash
 python dataset/preprocess_100style.py \
   --limit 10 \
   --workers 1 \
-  --output dataset/100style-soma77-processed-preview
+  --output dataset/100style-processed-nframes60-150-preview
 ```
 
-Omit `--limit` to process every `bvh/*_soma77.bvh` file under
-`dataset/100STYLE_soma77`. Override the protocol only explicitly with
-`--contents ... --test-content ...`; content names, style coverage, source
-availability, and every frame-cut range are checked strictly. Metadata records
-the CSV SHA256 and trim/resampling convention, so an older split protocol is
-not silently reused.
+By default, contents are `BR/BW/FR/FW/SR/SW`; use `--contents` to select others.
+`--frame-cuts` defaults to `Frame_Cuts.csv` inside `--dataset_root`.
+Content names, style coverage, source availability, and frame-cut ranges are
+checked strictly. Metadata records window limits, split seed, proportions,
+CSV SHA256, and trim/resampling convention; incompatible output is not reused.
 
 Workers convert and save source motions directly, avoiding transfer of large
 feature arrays back to the parent process. Training uses global per-epoch
@@ -261,7 +274,7 @@ train a single linear style classifier on 100STYLE:
 ```bash
 python -m experiment.linear_probe \
   --checkpoint output/<run>/motion-jepa-1d-latest.pth.tar \
-  --dataset-root dataset/100style-soma77-processed \
+  --dataset-root dataset/100style-processed-nframes60-150 \
   --output output/linear-probe/<run>
 ```
 
@@ -300,7 +313,7 @@ linear_probe:
   enabled: true
   # Probe cadence is independent of logging.checkpoint_freq:
   frequency: 10
-  dataset_root: ./dataset/100style-soma77-processed
+  dataset_root: ./dataset/100style-processed-nframes60-150
   epochs: 50
   feature_batch_size: 256
   batch_size: 256
@@ -403,7 +416,7 @@ Train matched-size supervised CNN and Transformer baselines directly on raw
 ```bash
 python -m experiment.linear_probe.train_classifier \
   --model all \
-  --dataset-root dataset/100style-soma77-processed \
+  --dataset-root dataset/100style-processed-nframes60-150 \
   --seed 42 \
   --device cuda:0
 ```
@@ -413,7 +426,7 @@ loader, optimizer, schedule, metrics, and checkpointing entry point:
 
 ```bash
 python -m experiment.linear_probe.linear \
-  --dataset-root dataset/100style-soma77-processed \
+  --dataset-root dataset/100style-processed-nframes60-150 \
   --device cuda:0
 ```
 
@@ -432,7 +445,7 @@ python -m experiment.linear_probe.train_classifier \
   --jepa-checkpoint output/<run>/motion-jepa-1d-latest.pth.tar \
   --checkpoint-key target_encoder \
   --model all \
-  --dataset-root dataset/100style-soma77-processed \
+  --dataset-root dataset/100style-processed-nframes60-150 \
   --seed 42 \
   --device cuda:0
 ```

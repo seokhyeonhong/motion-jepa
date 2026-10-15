@@ -52,7 +52,7 @@ class OnlineLinearProbe:
             raise ValueError("linear_probe.num_workers must be non-negative")
 
         dataset_root = Path(
-            str(probe_config.get("dataset_root", "dataset/100style-soma77-processed"))
+            str(probe_config.get("dataset_root", "dataset/100style-processed-nframes60-150"))
         ).expanduser()
         if not dataset_root.is_absolute():
             dataset_root = PROJECT_ROOT / dataset_root

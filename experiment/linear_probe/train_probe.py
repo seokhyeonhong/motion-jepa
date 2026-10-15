@@ -555,7 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset-root",
         type=Path,
-        default=PROJECT_ROOT / "dataset/100style-soma77-processed",
+        default=PROJECT_ROOT / "dataset/100style-processed-nframes60-150",
     )
     parser.add_argument(
         "--output",

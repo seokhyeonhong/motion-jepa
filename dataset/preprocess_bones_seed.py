@@ -423,6 +423,9 @@ def _manifest(
     split: str,
     records: list[dict[str, Any]],
     args: argparse.Namespace,
+    *,
+    preprocessing_version: str = PREPROCESSING_VERSION,
+    segmentation: str = SEGMENTATION_POLICY,
 ) -> dict[str, Any]:
     split_path = root / f"{split}.txt"
     return {
@@ -435,8 +438,8 @@ def _manifest(
         "fps": args.fps,
         "num_frames": args.num_frames,
         "min_frames": args.min_frames,
-        "preprocessing_version": PREPROCESSING_VERSION,
-        "segmentation": SEGMENTATION_POLICY,
+        "preprocessing_version": preprocessing_version,
+        "segmentation": segmentation,
         "motion_dim": MotionJEPAMotionRep.FEATURE_DIM,
         "values": "npy_valid_frames_row_major",
         "split_index": f"{split}.txt",
@@ -481,15 +484,20 @@ def _protocol_sha256(protocol: dict[str, Any]) -> str:
     ).hexdigest()
 
 
-def _validate_complete_dataset(output: Path) -> bool:
+def _validate_complete_dataset(
+    output: Path,
+    *,
+    preprocessing_version: str = PREPROCESSING_VERSION,
+    segmentation: str = SEGMENTATION_POLICY,
+) -> bool:
     """Return whether output is a complete, internally consistent NPY dataset."""
     try:
         metadata = json.loads((output / "meta.json").read_text(encoding="utf-8"))
         if metadata.get("motion_storage") != "npy_float32_v1":
             return False
-        if metadata.get("preprocessing_version") != PREPROCESSING_VERSION:
+        if metadata.get("preprocessing_version") != preprocessing_version:
             return False
-        if metadata.get("segmentation") != SEGMENTATION_POLICY:
+        if metadata.get("segmentation") != segmentation:
             return False
         if not 1 <= int(metadata.get("min_frames", 0)) <= int(metadata["num_frames"]):
             return False
@@ -564,6 +572,7 @@ def finalize_processed_dataset(
     *,
     source_dataset: str,
     segmentation: str,
+    preprocessing_version: str = PREPROCESSING_VERSION,
     num_source_motions: int | None = None,
     metadata_extra: dict[str, Any] | None = None,
 ) -> None:
@@ -573,7 +582,10 @@ def finalize_processed_dataset(
         _write_split(args.output / f"{split}.txt", records)
         _write_json(
             args.output / f"motions/{split}.json",
-            _manifest(args.output, split, records, args),
+            _manifest(
+                args.output, split, records, args,
+                preprocessing_version=preprocessing_version, segmentation=segmentation,
+            ),
         )
 
     train_count = 0
@@ -611,7 +623,7 @@ def finalize_processed_dataset(
         "num_frames": args.num_frames,
         "min_frames": args.min_frames,
         "min_seconds": args.min_frames / args.fps,
-        "preprocessing_version": PREPROCESSING_VERSION,
+        "preprocessing_version": preprocessing_version,
         "clip_seconds": args.num_frames / args.fps,
         "overlap": args.overlap,
         "stride_frames": calculate_stride(args.num_frames, args.overlap),
@@ -654,7 +666,9 @@ def finalize_processed_dataset(
         for error in errors:
             file.write(json.dumps(error, ensure_ascii=False) + "\n")
 
-    if not _validate_complete_dataset(args.output):
+    if not _validate_complete_dataset(
+        args.output, preprocessing_version=preprocessing_version, segmentation=segmentation
+    ):
         raise RuntimeError(f"NPY dataset failed final validation: {args.output}")
     print(f"Output: {args.output}")
     print(
