@@ -1,4 +1,8 @@
-"""Preprocess BONES-SEED SOMA BVHs into lazy-loadable NPY motion clips."""
+"""BONES-SEED v2: retain short motions and end-align the final full window.
+
+NPY arrays contain actual valid frames; MotionDataset pads them when loading.
+The original preprocessing module and its complete-window protocol are unchanged.
+"""
 
 from __future__ import annotations
 
@@ -38,11 +42,14 @@ HELDOUT_SPLIT_FILES = (
 )
 SPLITS = ("train", "val", "test")
 NPY_FORMAT = "motion_jepa_npy_v1"
+PREPROCESSING_VERSION = "bones_seed_v2"
+SEGMENTATION_POLICY = "overlapping_full_windows_end_aligned_tail_short_sources"
 
 _DATASET_ROOT: Path | None = None
-_NUM_FRAMES = 90
+_NUM_FRAMES = 150
+_MIN_FRAMES = 60
 _FPS = 30
-_STRIDE_FRAMES = 45
+_STRIDE_FRAMES = 75
 _SOURCE_SKELETON: SOMASkeleton77 | None = None
 _TARGET_SKELETON: SOMASkeleton30 | None = None
 _OUTPUT_ROOT: Path | None = None
@@ -98,8 +105,35 @@ def calculate_stride(num_frames: int, overlap: float) -> int:
 def _validate_config(args: argparse.Namespace) -> None:
     if args.num_frames <= 0:
         raise ValueError(f"--num_frames must be positive, got {args.num_frames}")
+    if not 1 <= args.min_frames <= args.num_frames:
+        raise ValueError(
+            "--min_frames must be in [1, --num_frames], "
+            f"got {args.min_frames} with num_frames={args.num_frames}"
+        )
+    if args.fps <= 0:
+        raise ValueError(f"--fps must be positive, got {args.fps}")
     if not 0.0 <= args.overlap < 1.0:
         raise ValueError(f"--overlap must be in [0, 1), got {args.overlap}")
+
+
+def select_windows(
+    source_frames: int,
+    num_frames: int,
+    min_frames: int,
+    stride_frames: int,
+) -> list[tuple[int, int]]:
+    """Keep eligible short sources, plus full windows covering long-source ends."""
+    if not 1 <= min_frames <= num_frames or not 1 <= stride_frames <= num_frames:
+        raise ValueError("Invalid minimum, maximum, or stride for window selection")
+    if source_frames < min_frames:
+        return []
+    if source_frames <= num_frames:
+        return [(0, source_frames)]
+    starts = list(range(0, source_frames - num_frames + 1, stride_frames))
+    final_start = source_frames - num_frames
+    if starts[-1] != final_start:
+        starts.append(final_start)
+    return [(start, start + num_frames) for start in starts]
 
 
 def _read_ids(path: Path) -> list[str]:
@@ -183,12 +217,14 @@ def _init_worker(
     num_frames: int,
     fps: int,
     stride_frames: int,
+    min_frames: int = 60,
 ) -> None:
-    global _DATASET_ROOT, _OUTPUT_ROOT, _NUM_FRAMES, _FPS, _STRIDE_FRAMES
+    global _DATASET_ROOT, _OUTPUT_ROOT, _NUM_FRAMES, _MIN_FRAMES, _FPS, _STRIDE_FRAMES
     global _SOURCE_SKELETON, _TARGET_SKELETON, _THREAD_CONFIG_PID
     _DATASET_ROOT = Path(dataset_root)
     _OUTPUT_ROOT = Path(output_root)
     _NUM_FRAMES = int(num_frames)
+    _MIN_FRAMES = int(min_frames)
     _FPS = int(fps)
     _STRIDE_FRAMES = int(stride_frames)
     current_pid = os.getpid()
@@ -221,12 +257,18 @@ def _convert_one(item: WorkItem) -> dict[str, Any]:
             local_rotations, root_positions, source_fps, _FPS
         )
         num_source_frames = len(local_rotations)
-        starts = (
-            list(range(0, num_source_frames - _NUM_FRAMES + 1, _STRIDE_FRAMES))
-            if num_source_frames >= _NUM_FRAMES
-            else []
+        clips = select_windows(
+            num_source_frames, _NUM_FRAMES, _MIN_FRAMES, _STRIDE_FRAMES
         )
-        clips = [(start, start + _NUM_FRAMES) for start in starts]
+        if not clips:
+            return {
+                "ok": True,
+                "id": item.id,
+                "split": item.split,
+                "records": [],
+                "source_length": num_source_frames,
+                "excluded_reason": "below_min_frames",
+            }
         local_rotations, _ = _SOURCE_SKELETON.to_standard_tpose(local_rotations)
         local_rotations = _TARGET_SKELETON.from_soma77(local_rotations)
         motion_rep = MotionJEPAMotionRep(_TARGET_SKELETON, fps)
@@ -263,7 +305,13 @@ def _convert_one(item: WorkItem) -> dict[str, Any]:
                     "motion": motion,
                 }
             )
-        return {"ok": True, "id": item.id, "split": item.split, "records": records}
+        return {
+            "ok": True,
+            "id": item.id,
+            "split": item.split,
+            "records": records,
+            "source_length": num_source_frames,
+        }
     except Exception as error:
         return {
             "ok": False,
@@ -330,6 +378,7 @@ def _ordered_results(items: list[WorkItem], args: argparse.Namespace) -> Iterato
         args.num_frames,
         args.fps,
         calculate_stride(args.num_frames, args.overlap),
+        args.min_frames,
     )
     worker_count = min(max(1, int(args.workers)), len(items))
     if worker_count == 1:
@@ -385,11 +434,51 @@ def _manifest(
         "representation": MotionJEPAMotionRep.FORMAT_NAME,
         "fps": args.fps,
         "num_frames": args.num_frames,
+        "min_frames": args.min_frames,
+        "preprocessing_version": PREPROCESSING_VERSION,
+        "segmentation": SEGMENTATION_POLICY,
         "motion_dim": MotionJEPAMotionRep.FEATURE_DIM,
         "values": "npy_valid_frames_row_major",
         "split_index": f"{split}.txt",
         "split_sha256": hashlib.sha256(split_path.read_bytes()).hexdigest(),
     }
+
+
+def _file_sha256(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def preprocessing_protocol(args: argparse.Namespace) -> dict[str, Any]:
+    """Record inputs and options that determine dataset contents and statistics."""
+    return {
+        "version": PREPROCESSING_VERSION,
+        "segmentation": SEGMENTATION_POLICY,
+        "dataset_root": str(args.dataset_root),
+        "num_frames": args.num_frames,
+        "min_frames": args.min_frames,
+        "fps": args.fps,
+        "overlap": args.overlap,
+        "stride_frames": calculate_stride(args.num_frames, args.overlap),
+        "split_seed": args.split_seed,
+        "max_per_split": args.max_per_split,
+        "metadata_sha256": _file_sha256(args.metadata_csv),
+        "split_sha256": {
+            name: _file_sha256(args.splits_root / name)
+            for name in (TRAIN_SPLIT_FILE, *HELDOUT_SPLIT_FILES)
+        },
+    }
+
+
+def _protocol_sha256(protocol: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _validate_complete_dataset(output: Path) -> bool:
@@ -398,6 +487,22 @@ def _validate_complete_dataset(output: Path) -> bool:
         metadata = json.loads((output / "meta.json").read_text(encoding="utf-8"))
         if metadata.get("motion_storage") != "npy_float32_v1":
             return False
+        if metadata.get("preprocessing_version") != PREPROCESSING_VERSION:
+            return False
+        if metadata.get("segmentation") != SEGMENTATION_POLICY:
+            return False
+        if not 1 <= int(metadata.get("min_frames", 0)) <= int(metadata["num_frames"]):
+            return False
+        protocol = metadata.get("preprocessing_protocol")
+        if not isinstance(protocol, dict):
+            return False
+        if metadata.get("preprocessing_protocol_sha256") != _protocol_sha256(protocol):
+            return False
+        if protocol.get("version") != metadata["preprocessing_version"]:
+            return False
+        for key in ("segmentation", "num_frames", "min_frames", "fps", "overlap", "stride_frames", "split_seed"):
+            if protocol.get(key) != metadata.get(key):
+                return False
         if not (output / "index.json").is_file() or not (output / "errors.jsonl").is_file():
             return False
         mean_path = output / "stats/mean.npy"
@@ -422,6 +527,9 @@ def _validate_complete_dataset(output: Path) -> bool:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             if manifest.get("format") != NPY_FORMAT:
                 return False
+            for key in ("num_frames", "min_frames", "preprocessing_version", "segmentation"):
+                if manifest.get(key) != metadata.get(key):
+                    return False
             if manifest.get("split_sha256") != hashlib.sha256(split_path.read_bytes()).hexdigest():
                 return False
             rows = [line for line in split_path.read_text(encoding="utf-8").splitlines() if line]
@@ -501,6 +609,9 @@ def finalize_processed_dataset(
         "motion_dim": MotionJEPAMotionRep.FEATURE_DIM,
         "fps": args.fps,
         "num_frames": args.num_frames,
+        "min_frames": args.min_frames,
+        "min_seconds": args.min_frames / args.fps,
+        "preprocessing_version": PREPROCESSING_VERSION,
         "clip_seconds": args.num_frames / args.fps,
         "overlap": args.overlap,
         "stride_frames": calculate_stride(args.num_frames, args.overlap),
@@ -560,7 +671,14 @@ def preprocess(args: argparse.Namespace) -> None:
     args.splits_root = Path(args.splits_root).resolve()
     args.metadata_csv = Path(args.metadata_csv).resolve()
     args.output = Path(args.output).resolve()
+    protocol = preprocessing_protocol(args)
     if args.output.exists() and _validate_complete_dataset(args.output) and not args.overwrite:
+        existing = json.loads((args.output / "meta.json").read_text(encoding="utf-8"))
+        if existing["preprocessing_protocol"] != protocol:
+            raise ValueError(
+                "Existing dataset preprocessing protocol does not match the requested "
+                f"configuration or inputs: {args.output}; use --overwrite or a new --output"
+            )
         print(f"Reusing complete NPY dataset: {args.output}")
         return
     _prepare_output(args.output, args.overwrite)
@@ -571,6 +689,9 @@ def preprocess(args: argparse.Namespace) -> None:
     records_by_split: dict[str, list[dict[str, Any]]] = {}
     errors: list[dict[str, Any]] = []
     source_success_counts = {split: 0 for split in SPLITS}
+    retained_source_counts = {split: 0 for split in SPLITS}
+    excluded_short_source_counts = {split: 0 for split in SPLITS}
+    excluded_short_frame_counts = {split: 0 for split in SPLITS}
 
     for split in SPLITS:
         items = items_by_split[split]
@@ -588,6 +709,11 @@ def preprocess(args: argparse.Namespace) -> None:
                 errors.append(result)
                 continue
             source_success_counts[split] += 1
+            if result.get("excluded_reason") == "below_min_frames":
+                excluded_short_source_counts[split] += 1
+                excluded_short_frame_counts[split] += int(result["source_length"])
+            if result["records"]:
+                retained_source_counts[split] += 1
             for record in result["records"]:
                 # Test and custom result producers may still return an in-memory
                 # array; production workers save it before crossing the process pipe.
@@ -601,13 +727,20 @@ def preprocess(args: argparse.Namespace) -> None:
         errors,
         source_success_counts,
         source_dataset="BONES-SEED/soma_uniform",
-        segmentation="overlapping_complete_windows",
+        segmentation=SEGMENTATION_POLICY,
+        metadata_extra={
+            "preprocessing_protocol": protocol,
+            "preprocessing_protocol_sha256": _protocol_sha256(protocol),
+            "retained_source_split_counts": retained_source_counts,
+            "excluded_short_source_split_counts": excluded_short_source_counts,
+            "excluded_short_frame_split_counts": excluded_short_frame_counts,
+        },
     )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert BONES-SEED SOMA BVHs to MotionJEPA NPY clips."
+        description="Convert BONES-SEED SOMA BVHs to variable-length MotionJEPA v2 NPY clips."
     )
     parser.add_argument(
         "--dataset_root",
@@ -627,7 +760,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=PROJECT_ROOT / "dataset/bones-seed-processed",
+        default=PROJECT_ROOT / "dataset/bones-seed-processed-nframes150-min60",
     )
     parser.add_argument(
         "--workers",
@@ -637,6 +770,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--chunksize", type=int, default=8)
     parser.add_argument("--num_frames", type=int, default=150)
+    parser.add_argument(
+        "--min_frames", "--min-frames", type=int, default=60,
+        help="Minimum valid frames after FPS conversion (60 = 2 seconds at 30 FPS).",
+    )
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--overlap", type=float, default=0.5)
     parser.add_argument("--split_seed", type=int, default=42)
@@ -653,7 +790,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--overwrite", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
