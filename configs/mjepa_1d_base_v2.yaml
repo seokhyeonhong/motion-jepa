@@ -43,7 +43,6 @@ attentive_probe:
   enabled: false
 
 mask:
-  version: v2
   context_selection: random  # all | prefix | random
   min_context_tokens: 1
   min_context_ratio: 0.2  # Minimum valid context fraction for each sample.

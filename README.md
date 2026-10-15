@@ -137,25 +137,27 @@ Visualize the frame-token mask timeline with:
 python visualize_mask.py --config configs/mjepa_1d_base_v2.yaml --output output/mask.png --seed 0 --valid-length 90
 ```
 
-For V1 frame-token multiblock masks, choose how context candidates
-are trimmed to the batch's minimum count:
+The sole `MaskCollator1D` samples temporal blocks using each sample's valid
+length. Blocks are padded with `-1`, and padding is excluded from attention and
+loss. Configure context selection with:
 
 ```yaml
 mask:
-  context_selection: random  # prefix (default) | random
+  context_selection: random  # all (default) | prefix | random
+  min_context_tokens: 1
+  min_context_ratio: 0.2
 ```
 
-`prefix` keeps the earliest remaining context tokens, matching the original
-implementation. `random` uniformly selects without replacement from each
-sample's remaining context candidates, then sorts their original time indices.
-Both modes keep the same context count and target masks for a given collator
-step; this option changes only context trimming. It does not change block
-sampling, target exclusion, or guarantee uniform coverage of the full timeline.
+`all` retains every available context token. `prefix` takes the earliest tokens;
+`random` samples without replacement and sorts the original frame indices.
+The latter two trim toward the batch minimum while preserving each sample's
+minimum context guard. Target blocks keep their original lengths.
 
-The mode is saved in mask checkpoint state for deterministic resume. Old
-checkpoints without this field are interpreted as `prefix`. Exact resume
-requires the same mode; switching modes requires a separate training experiment.
-V2 supports `all`, `prefix`, and `random`; the active V2 configs use `random`.
+There is no `mask.version` selector. Remove it from existing configs. Saved
+state from the former V2 collator migrates to the unversioned name and resumes
+the same masks when settings match; legacy collator state is rejected. The
+`v2` suffix in dataset paths and experiment config filenames still identifies
+the preprocessing dataset variant.
 
 ## Frame-token JEPA
 
@@ -483,60 +485,10 @@ The JEPA training design is based on Meta's I-JEPA implementation and paper:
 }
 ```
 
-## Optional context prediction loss
+## Training objective
 
-
-Frame-token 1D models can additionally predict the
-full-view EMA teacher features at visible context frames. Multi-level prediction
-is not included. Configure:
-
-```yaml
-loss:
-  context:
-    weight: 0.0
-    warmup_epochs: 40
-    distance_weighting: true
-```
-
-These are also the defaults when settings are omitted. Weight and warmup must be
-finite and nonnegative, and distance weighting must be a YAML boolean.
-
-The total objective is `masked_loss + effective_weight * context_loss`; the
-existing masked Smooth-L1 objective is unchanged. Context predictions reuse the
-same predictor forward pass, normalization, and output projection, with no new
-parameters. Teacher features are detached and use the existing per-token target
-LayerNorm. The predictor's optional keyword `return_context=True` returns
-`(masked_prediction, context_prediction)`; the default still returns only the
-masked-prediction tensor.
-
-Context Smooth-L1 is averaged over features and valid tokens, then equally over
-samples and encoder/target-mask combinations. With distance weighting, each
-token's error is multiplied by `1 / sqrt(max(1, d))`, where `d` is the nearest
-valid target frame in that prediction-mask branch, measured in original frame
-indices. The denominator remains the number of valid context tokens, not the
-sum of distance weights. Padding is excluded; overlap has distance weight one.
-
-Let `W = ceil(warmup_epochs * iterations_per_epoch)` and let `s` be the number of
-completed optimizer steps. The next update uses `weight * min(1, s / W)`; `W=0`
-uses the full weight immediately. Resume uses the restored global step, so the
-warmup does not restart. Changing these settings during resume is an intentional
-objective change; the resolved settings are logged and the supplied config is
-saved in the checkpoint.
-
-An effective weight of zero skips context output projection, context-target
-gathering, distances, and context loss. The encoder and predictor still process
-the context tokens required by the original masked prediction objective.
-
-The base, small, and tiny RoPE configs keep weight zero.
-`configs/mjepa_1d_small_v2_rope_context.yaml` enables weight `0.1`, a 40-epoch
-warmup, and distance weighting in a separate output directory. These are initial
-experiment settings, not validated optimal values. To run a uniform fixed-weight
-ablation, set `warmup_epochs: 0` and `distance_weighting: false`.
-
-Existing CSV columns and the total `loss` metric are unchanged. TensorBoard
-(`train/` prefix) and `training-epochs.jsonl` additionally record `masked_loss`,
-`context_loss`, `weighted_context_loss`, `context_weight`, and
-`context_active_steps`. Unweighted context loss is averaged only over computed
-steps; its value and active-step count are zero when disabled. Weighted context
-loss and the coefficient are averaged over all steps. TensorBoard counts refer
-to the reporting interval; JSONL counts refer to the epoch.
+Training uses masked-target Smooth-L1 loss only. The predictor returns target
+embeddings; visible context tokens condition those predictions. Context loss,
+its warmup and distance weighting, and context-specific logging have been
+removed. Remove `loss.context` from old configs. Training loss remains available
+as `train/loss` in TensorBoard, `loss` in the epoch JSONL, and in the CSV log.

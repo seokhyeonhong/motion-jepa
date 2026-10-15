@@ -56,7 +56,6 @@ online_metrics:
   seed: 42
 
 mask:
-  version: v2
   context_selection: random  # all | prefix | random
   min_context_tokens: 1
   min_context_ratio: 0.2  # Minimum valid context fraction for each sample.
@@ -74,12 +73,6 @@ meta:
   predictor_name: mot_predictor_base_1d
   use_bfloat16: true
   use_float16: false
-
-loss:
-  context:
-    weight: 0.0  # Zero skips all additional context-loss computation.
-    warmup_epochs: 40
-    distance_weighting: true
 
 optimization:
   ema: [0.996, 1.0]
