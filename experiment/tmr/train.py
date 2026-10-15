@@ -24,8 +24,10 @@ from torch.utils.data import DataLoader
 from experiment.utils import (
     PROJECT_ROOT,
     _atomic_json_save,
+    _atomic_torch_save,
     _seed_all,
     _torch_load_checkpoint,
+    resolve_device,
 )
 from .dataset import (
     DEFAULT_ANNOTATIONS_PATH,
@@ -40,7 +42,6 @@ from .model import (
     AlignmentConfig, TextMotionAlignment, MODEL_SPECS, parameter_counts,
 )
 from .retrieval import evaluate_retrieval
-from .utils import atomic_torch_save as _atomic_torch_save, resolve_device
 
 
 DATA_FIELDS = (
@@ -59,10 +60,6 @@ def optimization_configuration(args):
     if getattr(args, "validation_only", False):
         values["validation_only"] = True
     return values
-
-
-def build_optimizer(model, args):
-    return torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
 
 def data_configuration(args: argparse.Namespace) -> dict[str, Any]:
@@ -238,7 +235,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "optimization": optimization_configuration(args),
     }
     model = TextMotionAlignment(model_config).to(device)
-    optimizer = build_optimizer(model, args)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda epoch: _lr_factor(
             epoch, epochs=args.epochs, warmup_epochs=args.warmup_epochs,

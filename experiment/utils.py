@@ -48,9 +48,19 @@ def _sha256_file_version(path: Path, size: int, mtime_ns: int) -> str:
 
 
 def _atomic_torch_save(value: Any, path: Path) -> None:
+    """Flush checkpoint contents and rename before publishing the new state."""
     temporary = path.with_name(path.name + ".tmp")
-    torch.save(value, temporary)
+    with temporary.open("wb") as stream:
+        torch.save(value, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
     os.replace(temporary, path)
+    if hasattr(os, "O_DIRECTORY"):
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 def _atomic_json_save(value: Any, path: Path) -> None:
@@ -74,7 +84,7 @@ def resolve_device(value: str) -> torch.device:
     if value == "auto":
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     else:
-        device = torch.device(value)
+        device = torch.device("cuda:0" if value == "cuda" else value)
     if device.type == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError(f"CUDA device requested but CUDA is unavailable: {device}")

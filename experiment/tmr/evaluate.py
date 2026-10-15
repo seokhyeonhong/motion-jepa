@@ -7,11 +7,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from experiment.utils import _atomic_json_save
+from experiment.utils import _atomic_json_save, resolve_device
 from .features import load_prepared_datasets
 from .model import AlignmentConfig, TextMotionAlignment
 from .train import DATA_FIELDS, evaluate_split, load_alignment_checkpoint
-from .utils import resolve_device
 
 
 def run(args: argparse.Namespace) -> dict[str, float]:

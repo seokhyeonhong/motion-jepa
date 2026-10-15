@@ -11,6 +11,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from .dataset import DEFAULT_TEXT_ADAPTER, json_digest
+
 
 class LLM2VecBackbone(nn.Module):
     def __init__(self, model, tokenizer):
@@ -63,42 +65,56 @@ class LLM2VecBackbone(nn.Module):
         return vectors
 
 
-def load_llm2vec(model_name, revision, adapter_name, adapter_revision, device):
-    from peft import PeftConfig, PeftModel
-    from transformers import AutoConfig, AutoTokenizer, LlamaModel
-    from transformers.utils.hub import cached_file, extract_commit_hash
+def load_llm2vec(model_name, revision, device, adapter=None, adapter_revision=None):
+    """Load the frozen backbone and its cache provenance."""
+    adapter_name = str(adapter or DEFAULT_TEXT_ADAPTER)
+    try:
+        from peft import PeftConfig, PeftModel
+        from transformers import AutoConfig, AutoTokenizer, LlamaModel
+        from transformers.utils.hub import cached_file, extract_commit_hash
 
-    config = AutoConfig.from_pretrained(model_name, revision=revision)
-    if config.model_type != "llama" or config.hidden_size != 4096:
-        raise ValueError("LLM2Vec requires a Llama-3 4096D MNTP checkpoint")
-    resolved_revision = getattr(config, "_commit_hash", None) or revision
-    tokenizer = AutoTokenizer.from_pretrained(model_name, revision=resolved_revision)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-    mntp = PeftConfig.from_pretrained(model_name, revision=resolved_revision)
-    base_config = AutoConfig.from_pretrained(mntp.base_model_name_or_path, revision=mntp.revision)
-    base_revision = getattr(base_config, "_commit_hash", None) or mntp.revision
-    model, loading = LlamaModel.from_pretrained(
-        mntp.base_model_name_or_path, revision=base_revision,
-        config=config, dtype=torch.bfloat16, attn_implementation="sdpa",
-        output_loading_info=True,
-    )
-    if loading.get("missing_keys") or loading.get("mismatched_keys"):
-        raise ValueError(f"LLM2Vec base weights did not load completely: {loading}")
-    model = model.to(device)
-    model = PeftModel.from_pretrained(model, model_name, revision=resolved_revision)
-    model = model.merge_and_unload()
-    adapter_file = cached_file(adapter_name, "adapter_config.json", revision=adapter_revision)
-    resolved_adapter_revision = extract_commit_hash(adapter_file, None) or adapter_revision
-    model = PeftModel.from_pretrained(model, adapter_name, revision=resolved_adapter_revision)
-    model = model.to(device).eval().requires_grad_(False)
-    backbone = LLM2VecBackbone(model, tokenizer).eval().requires_grad_(False)
-    return backbone, tokenizer, {
+        config = AutoConfig.from_pretrained(model_name, revision=revision)
+        if config.model_type != "llama" or config.hidden_size != 4096:
+            raise ValueError("LLM2Vec requires a Llama-3 4096D MNTP checkpoint")
+        resolved_revision = getattr(config, "_commit_hash", None) or revision
+        tokenizer = AutoTokenizer.from_pretrained(model_name, revision=resolved_revision)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+        mntp = PeftConfig.from_pretrained(model_name, revision=resolved_revision)
+        base_config = AutoConfig.from_pretrained(mntp.base_model_name_or_path, revision=mntp.revision)
+        base_revision = getattr(base_config, "_commit_hash", None) or mntp.revision
+        model, loading = LlamaModel.from_pretrained(
+            mntp.base_model_name_or_path, revision=base_revision,
+            config=config, dtype=torch.bfloat16, attn_implementation="sdpa",
+            output_loading_info=True,
+        )
+        if loading.get("missing_keys") or loading.get("mismatched_keys"):
+            raise ValueError(f"LLM2Vec base weights did not load completely: {loading}")
+        model = model.to(device)
+        model = PeftModel.from_pretrained(model, model_name, revision=resolved_revision)
+        model = model.merge_and_unload()
+        adapter_file = cached_file(adapter_name, "adapter_config.json", revision=adapter_revision)
+        resolved_adapter_revision = extract_commit_hash(adapter_file, None) or adapter_revision
+        model = PeftModel.from_pretrained(model, adapter_name, revision=resolved_adapter_revision)
+        model = model.to(device).eval().requires_grad_(False)
+        backbone = LLM2VecBackbone(model, tokenizer).eval().requires_grad_(False)
+    except ImportError as error:
+        raise RuntimeError("Install text dependencies: pip install -r experiment/tmr/requirements.txt") from error
+    except OSError as error:
+        raise RuntimeError(
+            "Cannot load LLM2Vec. Check the MNTP/supervised adapter paths and "
+            "Hugging Face access to meta-llama/Meta-Llama-3-8B-Instruct."
+        ) from error
+    return backbone, {
         "model": str(model_name), "revision": revision,
         "resolved_revision": resolved_revision,
         "base_model": mntp.base_model_name_or_path, "base_revision": base_revision,
         "adapter": str(adapter_name), "adapter_revision": adapter_revision,
         "resolved_adapter_revision": resolved_adapter_revision,
+        "tokenizer_sha256": json_digest({
+            "backend": tokenizer.backend_tokenizer.to_str(),
+            "special_tokens": {key: str(value) for key, value in tokenizer.special_tokens_map.items()},
+        }),
         "feature_dim": 4096, "dtype": "bfloat16", "model_class": "LLM2VecBackbone",
         "max_position_embeddings": int(config.max_position_embeddings),
         "attention": "bidirectional", "pooling": "mean_without_instruction",

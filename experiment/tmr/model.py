@@ -130,4 +130,4 @@ def parameter_counts(model: TextMotionAlignment) -> dict[str, int]:
     return {**counts, "total": sum(counts.values())}
 
 
-__all__ = ["AlignmentConfig", "JEPASequenceEncoder", "TextMotionAlignment", "parameter_counts"]
+__all__ = ["AlignmentConfig", "SequenceEncoder", "TextMotionAlignment", "parameter_counts"]

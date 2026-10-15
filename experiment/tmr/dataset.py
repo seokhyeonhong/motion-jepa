@@ -217,6 +217,23 @@ class RaggedTokenBank:
         return tokens
 
 
+def validate_motion_records(raw_dataset, records):
+    """Check paired motion records and return their raw sample-to-row mapping."""
+    if raw_dataset is None:
+        raise ValueError("raw_dataset is required")
+    rows = {entry.sample_id: row for row, entry in enumerate(raw_dataset.entries)}
+    for record in records:
+        if record["sample_id"] not in rows:
+            raise ValueError("Paired sample is missing from the raw split index")
+        entry = raw_dataset.entries[rows[record["sample_id"]]]
+        if (
+            entry.length != record["length"] or entry.fps != record["fps"]
+            or entry.path != raw_dataset.root_path / record["motion_path"]
+        ):
+            raise ValueError(f"Paired interval/path disagrees with the raw split index: {record['sample_id']}")
+    return rows
+
+
 class PreparedPairDataset(Dataset):
     def __init__(
         self, records, text_bank, *, raw_dataset, sample_captions=False,
@@ -228,25 +245,13 @@ class PreparedPairDataset(Dataset):
         self.sample_ids = [record["sample_id"] for record in records]
         self.caption_ids = [record["caption_id"] for record in records]
         self.caption_candidates = [record["caption_ids"] for record in records]
-        self.raw_rows = (
-            {entry.sample_id: row for row, entry in enumerate(raw_dataset.entries)}
-            if raw_dataset is not None else {}
-        )
+        self.raw_rows = validate_motion_records(raw_dataset, records)
         for record in records:
             candidates = record["caption_ids"]
             if not candidates or len(set(candidates)) != len(candidates) or record["caption_id"] != candidates[0]:
                 raise ValueError("Paired captions must be a nonempty list of unique candidates")
             if any(caption_id not in text_bank.key_to_row for caption_id in candidates):
                 raise ValueError("Paired caption is missing from the text cache")
-            if raw_dataset is not None and record["sample_id"] not in self.raw_rows:
-                raise ValueError("Paired sample is missing from the raw split index")
-            if raw_dataset is not None:
-                entry = raw_dataset.entries[self.raw_rows[record["sample_id"]]]
-                if (
-                    entry.length != record["length"] or entry.fps != record["fps"]
-                    or entry.path != raw_dataset.root_path / record["motion_path"]
-                ):
-                    raise ValueError(f"Paired interval/path disagrees with the raw split index: {record['sample_id']}")
 
     def __len__(self):
         return len(self.records)

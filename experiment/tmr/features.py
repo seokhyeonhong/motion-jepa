@@ -11,18 +11,16 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from dataset import MotionDataset
 from experiment.utils import (
-    _atomic_json_save, _sha256_file,
+    _atomic_json_save, _sha256_file, resolve_device,
 )
-from .utils import resolve_device
 from .dataset import (
     DEFAULT_ANNOTATIONS_PATH, DEFAULT_CACHE_ROOT, DEFAULT_DATASET_ROOT,
     DEFAULT_TEXT_MODEL, DEFAULT_TEXT_ADAPTER, SPLITS, PreparedPairDataset, RaggedTokenBank,
-    build_paired_index, json_digest, select_training_subset,
+    build_paired_index, json_digest, select_training_subset, validate_motion_records,
 )
 
 
@@ -60,14 +58,6 @@ def _stats_signature(root: Path):
         "stats_mean_sha256": _sha256_file(root / "mean.npy"),
         "stats_std_sha256": _sha256_file(root / "std.npy"),
     }
-
-
-def _existing_bank(path, signature, recompute):
-    if recompute:
-        return None
-    if path.exists():
-        return RaggedTokenBank(path, signature)
-    return None
 
 
 def write_ragged_bank(path, keys, lengths, feature_dim, signature, batches, extra=None):
@@ -117,34 +107,12 @@ def write_ragged_bank(path, keys, lengths, feature_dim, signature, batches, extr
     return RaggedTokenBank(path, signature)
 
 
-def load_text_backbone(model_name, revision, device, adapter=None, adapter_revision=None):
-    """Load the frozen LLM2Vec backbone; training only needs its cached features."""
-    adapter = str(adapter or DEFAULT_TEXT_ADAPTER)
-    try:
-        from .llm2vec import load_llm2vec
-        model, tokenizer, info = load_llm2vec(
-            model_name, revision, adapter, adapter_revision, device,
-        )
-    except ImportError as error:
-        raise RuntimeError("Install text dependencies: pip install -r experiment/tmr/requirements.txt") from error
-    except OSError as error:
-        raise RuntimeError(
-            "Cannot load LLM2Vec. Check the MNTP/supervised adapter paths and "
-            "Hugging Face access to meta-llama/Meta-Llama-3-8B-Instruct."
-        ) from error
-    info["tokenizer_sha256"] = json_digest({
-        "backend": tokenizer.backend_tokenizer.to_str(),
-        "special_tokens": {key: str(value) for key, value in tokenizer.special_tokens_map.items()},
-    })
-    return model, tokenizer, info
-
-
 def _prepare_text(path, paired, *, model_name, revision, max_length, device, batch_size, recompute, adapter=None, adapter_revision=None):
     signature = _text_signature(paired, model_name, revision, max_length, adapter, adapter_revision)
-    existing = _existing_bank(path, signature, recompute)
-    if existing is not None:
-        return existing
-    model, tokenizer, info = load_text_backbone(model_name, revision, device, adapter, adapter_revision)
+    if not recompute and path.exists():
+        return RaggedTokenBank(path, signature)
+    from .llm2vec import load_llm2vec
+    model, info = load_llm2vec(model_name, revision, device, adapter, adapter_revision)
     position_limit = info.get("max_position_embeddings")
     if position_limit is not None and max_length > position_limit:
         raise ValueError(
@@ -172,23 +140,6 @@ def _prepare_text(path, paired, *, model_name, revision, max_length, device, bat
             torch.cuda.empty_cache()
 
 
-class _MotionRows(Dataset):
-    def __init__(self, base, records):
-        self.base, self.records = base, records
-        rows = {entry.sample_id: index for index, entry in enumerate(base.entries)}
-        self.rows = [rows[record["sample_id"]] for record in records]
-        for row, record in zip(self.rows, records):
-            entry = base.entries[row]
-            if entry.length != record["length"] or entry.fps != record["fps"] or entry.path != base.root_path / record["motion_path"]:
-                raise ValueError(f"Paired interval/path disagrees with raw split index: {record['sample_id']}")
-
-    def __len__(self):
-        return len(self.rows)
-
-    def __getitem__(self, index):
-        return self.base[self.rows[index]]
-
-
 def _raw_dataset(root, split, paired, stats_root):
     provenance = paired["provenance"]
     return MotionDataset(
@@ -214,7 +165,7 @@ def prepare_caches(
     raw_datasets = {split: _raw_dataset(root, split, paired, stats_root) for split in SPLITS}
     for split, base in raw_datasets.items():
         records = [record for record in paired["records"] if record["split"] == split]
-        _MotionRows(base, records)
+        validate_motion_records(base, records)
     # Validate motion/statistics before an expensive text-model download or run.
     text_bank = _prepare_text(
         cache / "text", paired, model_name=str(text_model), revision=text_revision,
@@ -284,4 +235,4 @@ def load_prepared_datasets(
     return datasets, metadata
 
 
-__all__ = ["prepare_caches", "load_prepared_datasets", "load_text_backbone", "write_ragged_bank"]
+__all__ = ["prepare_caches", "load_prepared_datasets", "write_ragged_bank"]
