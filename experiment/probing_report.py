@@ -318,7 +318,7 @@ footer{{border-top:1px solid var(--line);padding-top:18px;margin-top:30px;color:
 <div class="scroll"><table><thead><tr><th>Features</th><th>Status</th><th>Epochs</th><th>Best epoch</th><th>Best validation</th><th>Final validation</th><th>Δ raw (pp)</th><th>Test</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
 {comparison_section}
 <h2>Trainable parameters</h2>
-<p class="muted">M = 1,000,000 parameters; values are rounded to three decimals. Counts come from saved run summaries and exclude frozen JEPA and LLM2Vec encoders. TMR totals include both the motion probe and trainable text encoder. Exact integer counts remain in the saved artifacts.</p>
+<p class="muted">M = 1,000,000 parameters; values are rounded to three decimals. Counts come from saved run summaries and exclude frozen JEPA and LLM2Vec encoders. TMR totals sum all trainable components: the motion encoder or probe and the text encoder. Exact integer counts remain in the saved artifacts.</p>
 <div class="scroll"><table><thead><tr><th>Model / features</th><th>Total trainable (M)</th><th>Components (M)</th></tr></thead><tbody>{''.join(parameter_rows)}</tbody></table></div>
 <h2>Assessment</h2><ul>{conclusions(runs)}</ul>
 <h2>Full learning curves</h2><p class="muted">Every available epoch is plotted without smoothing or truncation. Test metrics do not select checkpoints.</p>{plot_curves(task, runs)}
