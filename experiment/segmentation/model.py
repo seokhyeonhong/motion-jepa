@@ -44,3 +44,29 @@ class MotionSegmentationTransformer(nn.Module):
         head=sum(p.numel() for p in self.head.parameters() if p.requires_grad)
         return dict(encoder=encoder,head=head,total=encoder+head)
 
+
+
+class MotionSegmentationProbe(nn.Module):
+    """One attention layer and one frame-classification projection."""
+
+    def __init__(self, input_dim, num_classes, num_frames, mean, std, num_heads=6):
+        super().__init__()
+        from experiment.probing import AttentiveProbe
+
+        self.input_dim, self.num_frames = input_dim, num_frames
+        self.probe = AttentiveProbe(input_dim, num_classes, mean, std, num_heads=num_heads, pool=False)
+        self.config = {
+            "model_version": "attentive_frame_probe", "input_dim": input_dim,
+            "num_classes": num_classes, "num_frames": num_frames,
+            "num_heads": num_heads, "attention_layers": 1, "output_linear_layers": 1,
+            "normalization": "training_feature_mean_std",
+        }
+
+    def forward(self, features, valid_frames, fps):
+        if features.ndim != 3 or features.shape[1:] != (self.num_frames, self.input_dim):
+            raise ValueError("Feature shape differs from saved probe architecture")
+        return self.probe(features, valid_frames)
+
+    def parameter_counts(self):
+        total = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return dict(encoder=0, probe=total, total=total)

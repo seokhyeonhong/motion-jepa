@@ -24,9 +24,16 @@ def run(args: argparse.Namespace) -> dict[str, float]:
         if value is not None:
             data[field] = str(value) if isinstance(value, Path) else value
     datasets, provenance = load_prepared_datasets(**data)
+    device = resolve_device(args.device)
+    if "probe" in config:
+        from .probing import prepare_probe_datasets
+        datasets, provenance, _, _ = prepare_probe_datasets(
+            datasets, provenance, config["probe"], device,
+            batch_size=args.batch_size, num_workers=args.num_workers,
+        )
+        args.num_workers = 0
     if provenance != checkpoint["provenance"]:
         raise ValueError("Evaluation feature provenance differs from the training checkpoint")
-    device = resolve_device(args.device)
     model = TextMotionAlignment(AlignmentConfig(**config["model"])).to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
     metrics = evaluate_split(

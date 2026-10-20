@@ -241,6 +241,7 @@ class PreparedPairDataset(Dataset):
         self.records = records
         self.text_bank = text_bank
         self.raw_dataset = raw_dataset
+        self.motion_bank = None
         self.sample_captions = sample_captions
         self.sample_ids = [record["sample_id"] for record in records]
         self.caption_ids = [record["caption_id"] for record in records]
@@ -261,8 +262,11 @@ class PreparedPairDataset(Dataset):
         candidates = record["caption_ids"]
         selected = int(torch.randint(len(candidates), ()).item()) if self.sample_captions and len(candidates) > 1 else 0
         caption_id = candidates[selected]
-        values, _, length = self.raw_dataset[self.raw_rows[record["sample_id"]]]
-        motion = torch.from_numpy(values[:length].copy())
+        if self.motion_bank is None:
+            values, _, length = self.raw_dataset[self.raw_rows[record["sample_id"]]]
+            motion = torch.from_numpy(values[:length].copy())
+        else:
+            motion = self.motion_bank[record["sample_id"]]
         return {
             "motion_tokens": motion, "text_tokens": self.text_bank[caption_id],
             "caption_id": caption_id, "caption_candidate_ids": candidates,

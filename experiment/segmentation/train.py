@@ -20,7 +20,7 @@ from experiment.utils import (
 )
 from model.specs import MODEL_SPECS
 from .metrics import FrameMetricAccumulator
-from .model import MotionSegmentationTransformer
+from .model import MotionSegmentationProbe, MotionSegmentationTransformer
 
 
 def run_epoch(model, loader, device, *, optimizer=None, gradient_clip=1.0):
@@ -32,7 +32,7 @@ def run_epoch(model, loader, device, *, optimizer=None, gradient_clip=1.0):
     loss_sum, frame_count = 0.0, 0
     for motion, fps, lengths, labels, supervised, _ in loader:
         motion, fps = motion.to(device), fps.to(device)
-        labels, supervised = labels.to(device), supervised.to(device)
+        labels, supervised = labels.to(device, dtype=torch.float32), supervised.to(device)
         valid = torch.arange(motion.shape[1], device=device)[None] < lengths.to(device)[:, None]
         selected = supervised.bool() & valid
         count = int(selected.sum())
@@ -96,22 +96,39 @@ def run(args):
         split: BabelSegmentationDataset(
             root, split, num_frames=meta["num_frames"], fps=meta["fps"],
             motion_dim=meta["motion_dim"], stats_root=root / "stats",
+            normalize=args.mode == "supervised",
         )
         for split in ("train", "val", "test")
     }
     if not len(datasets["train"]) or not len(datasets["val"]):
         raise ValueError("Supervised segmentation requires nonempty train and validation splits")
-    model = MotionSegmentationTransformer(
-        args.model_size, input_dim=meta["motion_dim"],
-        num_classes=datasets["train"].num_classes, num_frames=meta["num_frames"],
-    ).to(device)
-    output = (args.output_root or PROJECT_ROOT / f"output/segmentation/{args.model_size}/seed-{args.seed}").resolve()
-    findings = (args.findings_root or PROJECT_ROOT / f"findings/segmentation/{args.model_size}/seed-{args.seed}").resolve()
+    run_name = args.model_size if args.mode == "supervised" else (
+        f"{args.model_size}-probe-{args.feature_source}"
+        + (f"-layer-{args.feature_layer}" if args.feature_layer is not None else "")
+    )
+    output = (args.output_root or PROJECT_ROOT / f"output/segmentation/{run_name}/seed-{args.seed}").resolve()
+    findings = args.findings_root.expanduser().resolve() if args.findings_root is not None else None
     latest, best = output / "latest.pth.tar", output / "best.pth.tar"
     if output.exists() and any(output.iterdir()) and not args.resume:
         raise FileExistsError(f"Output exists: {output}; use --resume or a new --output-root")
     if args.resume and not latest.is_file():
         raise FileNotFoundError(f"Resume checkpoint does not exist: {latest}")
+    feature_metadata = None
+    if args.mode == "probe":
+        from .probe import prepare_probe_datasets
+        datasets, mean, std, feature_metadata = prepare_probe_datasets(datasets, args, device)
+        _seed_all(args.seed)
+        model = MotionSegmentationProbe(
+            feature_metadata["feature_dim"], datasets["train"].num_classes,
+            meta["num_frames"], mean, std, num_heads=args.probe_heads,
+        ).to(device)
+    else:
+        if args.checkpoint is not None or args.feature_layer is not None:
+            raise ValueError("Checkpoint/layer arguments require --mode probe")
+        model = MotionSegmentationTransformer(
+            args.model_size, input_dim=meta["motion_dim"],
+            num_classes=datasets["train"].num_classes, num_frames=meta["num_frames"],
+        ).to(device)
     signature = {
         "architecture": model.config, "dataset_root": str(root),
         "data_hashes": {name: _sha256_file(root / name) for name in (
@@ -130,6 +147,11 @@ def run(args):
         "normalization": "dataset_training_statistics",
         "selection": "validation_babel120_frame_map",
     }
+    if feature_metadata is not None:
+        signature["features"] = feature_metadata
+        signature["normalization"] = "training_feature_statistics_excluding_padding"
+        for path in (Path(__file__).with_name("probe.py"), PROJECT_ROOT / "experiment/probing.py"):
+            signature["code_hashes"][str(path.relative_to(PROJECT_ROOT))] = _sha256_file(path)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     def lr_factor(epoch):
         if epoch < args.warmup_epochs:
@@ -141,7 +163,8 @@ def run(args):
     loaders = {
         split: DataLoader(
             dataset, batch_size=args.batch_size, shuffle=split == "train",
-            num_workers=args.num_workers, generator=generator if split == "train" else None,
+            num_workers=0 if args.mode == "probe" else args.num_workers,
+            generator=generator if split == "train" else None,
             pin_memory=device.type == "cuda",
         )
         for split, dataset in datasets.items()
@@ -184,22 +207,25 @@ def run(args):
     model.load_state_dict(_torch_load_checkpoint(best)["model"], strict=True)
     test = run_epoch(model, loaders["test"], device) if len(datasets["test"]) else None
     summary = {
-        "input_source": "raw", "actual_epochs": len(history),
+        "input_source": args.feature_source if args.mode == "probe" else "raw",
+        "mode": args.mode, "feature_layer": args.feature_layer,
+        "actual_epochs": len(history),
         "best_epoch": best_epoch, "best_val_frame_map": best_map, "test": test,
         "parameters": model.parameter_counts(), "checkpoint": str(best),
         "metrics": str(output / "metrics.json"), "signature": signature,
     }
     _atomic_json_save(summary, output / "summary.json")
-    findings.mkdir(parents=True, exist_ok=True)
-    _atomic_json_save(summary, findings / "results.json")
-    (findings / "README.md").write_text(
-        f"# Raw-motion segmentation\n\n"
-        f"Trained {args.model_size} from scratch for {len(history)} epochs using dataset training statistics "
-        f"and masked frame BCE. Validation BABEL-120 frame mAP selects epoch {best_epoch} "
-        f"(mAP {best_map:.6f}).\n\n"
-        f"Checkpoint: {best}\n\nMetrics: {output / 'metrics.json'}\n\n"
-        f"Test metrics: {json.dumps(test)}\n",
-    )
+    if findings is not None:
+        findings.mkdir(parents=True, exist_ok=True)
+        _atomic_json_save(summary, findings / "results.json")
+        (findings / "README.md").write_text(
+            f"# Raw-motion segmentation\n\n"
+            f"Trained {args.model_size} from scratch for {len(history)} epochs using dataset training statistics "
+            f"and masked frame BCE. Validation BABEL-120 frame mAP selects epoch {best_epoch} "
+            f"(mAP {best_map:.6f}).\n\n"
+            f"Checkpoint: {best}\n\nMetrics: {output / 'metrics.json'}\n\n"
+            f"Test metrics: {json.dumps(test)}\n",
+        )
     return summary
 
 
@@ -207,6 +233,13 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", type=Path, default=PROJECT_ROOT / "dataset/babel-segmentation-120-processed-nframes30-150")
     parser.add_argument("--model-size", choices=tuple(MODEL_SPECS), default="base")
+    parser.add_argument("--mode", choices=("supervised", "probe"), default="supervised")
+    parser.add_argument("--feature-source", choices=("raw", "jepa"), default="jepa")
+    parser.add_argument("--feature-layer", type=int, help="One-based JEPA block output to probe")
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--encoder-key", choices=("encoder", "target_encoder"), default="target_encoder")
+    parser.add_argument("--precompute-batch-size", type=int, default=256)
+    parser.add_argument("--probe-heads", type=int, default=6)
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--findings-root", type=Path)
     parser.add_argument("--device", default="auto")
@@ -226,7 +259,12 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
     if args.describe:
-        model = MotionSegmentationTransformer(args.model_size)
+        if args.mode == "probe":
+            feature_dim = 366 if args.feature_source == "raw" else MODEL_SPECS[args.model_size]["embed_dim"]
+            model = MotionSegmentationProbe(feature_dim, 120, 150, torch.zeros(feature_dim),
+                                           torch.ones(feature_dim), num_heads=args.probe_heads)
+        else:
+            model = MotionSegmentationTransformer(args.model_size)
         print(json.dumps({"architecture": model.config, "parameters": model.parameter_counts()}, indent=2))
         return
     print(json.dumps(run(args), indent=2))

@@ -28,8 +28,14 @@ class AlignmentConfig:
     depth: int | None = None
     num_heads: int | None = None
     retrieval_dim: int = 256
+    motion_encoder: str = "transformer"
+    probe_heads: int = 6
 
     def __post_init__(self):
+        if self.motion_encoder not in {"transformer", "attentive_probe"}:
+            raise ValueError("Invalid motion encoder")
+        if self.probe_heads < 1 or (self.motion_encoder == "attentive_probe" and self.motion_dim % self.probe_heads):
+            raise ValueError("probe_heads must divide motion feature dimension")
         if self.model_size not in MODEL_SPECS:
             raise ValueError("Invalid model size")
         for name in ("text_dim", "motion_dim", "num_frames", "text_num_tokens", "retrieval_dim"):
@@ -94,21 +100,31 @@ class SequenceEncoder(nn.Module):
 class TextMotionAlignment(nn.Module):
     """Independent RoPE-based JEPA text and motion encoders for retrieval."""
 
-    def __init__(self, config: AlignmentConfig):
+    def __init__(self, config: AlignmentConfig, *, motion_mean=None, motion_std=None):
         super().__init__()
         self.config = config
         self.text_encoder = SequenceEncoder(
             config.text_dim, config, num_tokens=config.text_num_tokens, fps=1.0,
         )
-        self.motion_encoder = SequenceEncoder(
-            config.motion_dim, config, num_tokens=config.num_frames, fps=config.fps,
-        )
+        if config.motion_encoder == "attentive_probe":
+            from experiment.probing import AttentiveProbe
+            mean = torch.zeros(config.motion_dim) if motion_mean is None else motion_mean
+            std = torch.ones(config.motion_dim) if motion_std is None else motion_std
+            self.motion_encoder = AttentiveProbe(
+                config.motion_dim, config.retrieval_dim, mean, std,
+                num_heads=config.probe_heads, pool=True,
+            )
+        else:
+            self.motion_encoder = SequenceEncoder(
+                config.motion_dim, config, num_tokens=config.num_frames, fps=config.fps,
+            )
 
     def encode_text(self, tokens: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
         return self.text_encoder(tokens, valid_mask)
 
     def encode_motion(self, tokens: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-        return self.motion_encoder(tokens, valid_mask)
+        values = self.motion_encoder(tokens, valid_mask)
+        return F.normalize(values.float(), dim=-1) if self.config.motion_encoder == "attentive_probe" else values
 
     def forward(
         self,

@@ -80,10 +80,55 @@ python -m unittest experiment.tmr.test_architecture -v
 
 Training saves configuration, provenance, metrics, and latest/best checkpoints.
 Resume requires matching settings and data provenance.
-There is one supported architecture: LLM2Vec plus RoPE-based JEPA encoders.
-Architecture is selected only by `--model-size`; checkpoints store the resolved
+Supervised runs use LLM2Vec plus RoPE-based JEPA encoders.
+Their architecture is selected by `--model-size`; checkpoints store the resolved
 size settings and dataset timing without a model version. Runs are saved under
 `output/tmr/<size>/seed-<seed>` (with a fraction subdirectory for train subsets).
 
 The text backbone follows `/source/seokhyeon/kimodo/kimodo/kimodo/model/llm2vec/llm2vec_wrapper.py`.
 The trainable encoders use this repository's shared JEPA implementation.
+
+
+## Attentive probing
+
+Use a frozen JEPA checkpoint to extract one frame feature per selected block:
+
+```bash
+python -m experiment.tmr --mode probe --model-size base \
+  --feature-source jepa --feature-layer 3 --encoder-key target_encoder \
+  --checkpoint output/mot_base_1d-bs.512-it.200000-nframes60-150_allctx/motion-jepa-1d-it200000.pth.tar \
+  --output-root output/tmr/probe-layer3/seed-42
+
+python -m experiment.tmr --mode probe --model-size base --feature-source raw \
+  --output-root output/tmr/probe-raw/seed-42
+```
+
+`--feature-layer` is a one-based transformer block index. Features come from
+that block's output before the encoder's final LayerNorm. JEPA extraction uses
+its checkpoint's pretraining input normalization. The raw baseline uses the
+same attention architecture directly on raw motion frames.
+
+The entire trainable motion transformer is replaced by one multihead attention
+operation with a learned query and one linear projection to the 256D retrieval
+space. The existing text encoder architecture remains trainable and unchanged;
+both outputs are L2-normalized and use the existing multi-positive contrastive
+loss. `--probe-heads` defaults to 6 and must divide the input feature width.
+
+Per-channel population mean and standard deviation are fitted only on valid
+frames of the actual captioned training clips, including any selected training
+fraction. Validation/test features use those same fixed statistics. These small
+normalization vectors are buffers in the probe checkpoint.
+
+Motion features are precomputed into anonymous CPU float32 tensors, one layer
+per process. No motion feature file or memory-mapped cache is written. All
+splits remain in RAM during training, and the frozen JEPA network is released
+from the GPU before the trainable model is constructed. Base features for the
+full prepared corpus require about 72 GiB of RAM. `--precompute-batch-size`
+controls extraction batches; probe training and evaluation use zero loader
+workers to avoid replicating the bank. Existing LLM2Vec sentence caches are
+read without loading the frozen text backbone or creating a new cache.
+
+Resume and standalone evaluation rebuild the transient motion features, verify
+the checkpoint/data provenance, and restore the saved normalization and probe
+weights. Neither frozen JEPA weights nor frame feature banks are included in
+probe checkpoints. Supervised mode remains the default.

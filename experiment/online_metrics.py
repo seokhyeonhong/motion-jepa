@@ -238,7 +238,7 @@ class OnlineRepresentationMetrics:
         )
 
     @torch.no_grad()
-    def evaluate(self, encoder, predictor, target_encoder) -> dict[str, Any]:
+    def evaluate(self, encoder, predictor, target_encoder, *, centering_sharpening=None) -> dict[str, Any]:
         if any(model.training for model in (encoder, predictor, target_encoder)):
             raise ValueError("Online metrics require eval-mode models")
         if encoder.token_layout.kind != "1d" or encoder.token_layout.patchified:
@@ -247,6 +247,7 @@ class OnlineRepresentationMetrics:
         pooled = []
         temporal_std = temporal_variance = objective_sum = 0.0
         objective_count = 0
+        cross_entropy_sum = 0.0
         overall = _PredictionAccumulator()
         target_moments = _TargetMoments()
         for motion, fps, lengths in self._loader():
@@ -259,7 +260,8 @@ class OnlineRepresentationMetrics:
             amp = torch.autocast(self.device.type, dtype=self.amp_dtype) if self.amp_dtype else nullcontext()
             with amp:
                 full = target_encoder(motion, fps, valid_frames=valid)
-                target = apply_index_masks(F.layer_norm(full, (full.shape[-1],)), masks_pred)
+                target = full if centering_sharpening is not None else F.layer_norm(full, (full.shape[-1],))
+                target = apply_index_masks(target, masks_pred)
                 target = repeat_mask_blocks(target, len(motion), len(masks_enc))
                 context = encoder(motion, fps, masks_enc, valid_frames=valid)
                 prediction = predictor(context, fps, masks_enc, masks_pred)
@@ -276,6 +278,8 @@ class OnlineRepresentationMetrics:
             row_loss = error.masked_fill(~active, 0).sum(1) / active.sum(1)
             objective_sum += float(row_loss.sum())
             objective_count += len(row_loss)
+            if centering_sharpening is not None:
+                cross_entropy_sum += float(centering_sharpening(prediction, target, active)) * len(row_loss)
         matrix = torch.stack(pooled).double()
         if not torch.isfinite(matrix).all():
             raise ValueError("Non-finite validation embeddings")
@@ -283,6 +287,8 @@ class OnlineRepresentationMetrics:
         standardized = (matrix - matrix.mean(0)) / std.clamp_min(1e-6)
         heldout = overall.summary()
         heldout["smooth_l1"] = objective_sum / objective_count
+        if centering_sharpening is not None:
+            heldout["cross_entropy"] = cross_entropy_sum / objective_count
         heldout["trivial_mean_mse"] = target_moments.baseline_mse()
         heldout["prediction_gain"] = prediction_gain(heldout["mse"], heldout["trivial_mean_mse"])
         result = {

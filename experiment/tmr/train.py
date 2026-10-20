@@ -96,6 +96,8 @@ def evaluate_split(
     dataset = copy.copy(dataset)
     dataset.sample_captions = False
     model.eval()
+    if getattr(dataset, "motion_bank", None) is not None:
+        num_workers = 0
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
         collate_fn=collate_pairs, pin_memory=device.type == "cuda",
@@ -188,6 +190,13 @@ def load_alignment_checkpoint(path: Path) -> dict[str, Any]:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if getattr(args, "mode", "supervised") == "probe":
+        if args.precompute_batch_size < 1 or args.probe_heads < 1:
+            raise ValueError("Precompute batch size and probe head count must be positive")
+        if args.feature_source == "jepa" and (args.checkpoint is None or args.feature_layer < 1):
+            raise ValueError("JEPA probing requires --checkpoint and a positive --feature-layer")
+        if args.feature_source == "raw" and args.checkpoint is not None:
+            raise ValueError("Raw probing does not use --checkpoint")
     if not math.isfinite(args.train_fraction) or not 0 < args.train_fraction <= 1:
         raise ValueError("--train-fraction must be finite and in (0, 1]")
     if args.epochs < 1 or not 0 <= args.warmup_epochs < args.epochs:
@@ -206,7 +215,11 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     _validate_args(args)
+    probe_mode = getattr(args, "mode", "supervised") == "probe"
     default_output = PROJECT_ROOT / "output/tmr" / args.model_size
+    if probe_mode:
+        feature_name = f"layer-{args.feature_layer}" if args.feature_source == "jepa" else "raw"
+        default_output /= f"probe-{feature_name}"
     if args.train_fraction != 1:
         default_output /= f"frac{args.train_fraction:g}"
     default_output /= f"seed-{args.seed}"
@@ -224,17 +237,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     datasets, provenance = load_prepared_datasets(**data_config)
     if len(datasets["train"]) < 2 or not len(datasets["val"]):
         raise ValueError("TMR needs at least two training pairs and a nonempty validation split")
+    probe_config, motion_mean, motion_std = None, None, None
+    if probe_mode:
+        from .probing import prepare_probe_datasets, probe_configuration
+        probe_config = probe_configuration(args)
+        datasets, provenance, motion_mean, motion_std = prepare_probe_datasets(
+            datasets, provenance, probe_config, device,
+            batch_size=args.precompute_batch_size, num_workers=args.num_workers,
+        )
+        # Avoid replicating the large anonymous RAM bank in training workers.
+        args.num_workers = 0
+        _seed_all(args.seed)
     model_config = AlignmentConfig(
         text_dim=provenance["text_dim"], motion_dim=provenance["motion_dim"],
         model_size=args.model_size,
         num_frames=provenance["provenance"]["num_frames"],
         fps=provenance["provenance"]["fps"],
+        motion_encoder="attentive_probe" if probe_mode else "transformer",
+        probe_heads=args.probe_heads if probe_mode else 6,
     )
+    model_settings = asdict(model_config)
+    if not probe_mode:
+        # Preserve the existing supervised checkpoint configuration exactly.
+        model_settings.pop("motion_encoder")
+        model_settings.pop("probe_heads")
     config = {
-        "model": asdict(model_config), "data": data_config,
+        "model": model_settings, "data": data_config,
         "optimization": optimization_configuration(args),
     }
-    model = TextMotionAlignment(model_config).to(device)
+    if probe_config is not None:
+        config["probe"] = probe_config
+    model = TextMotionAlignment(model_config, motion_mean=motion_mean, motion_std=motion_std).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda epoch: _lr_factor(
@@ -363,7 +396,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if writer is not None:
                 writer.flush()
             print(
-                f"TMR raw epoch {epoch + 1}/{args.epochs}: "
+                f"TMR {'probe' if probe_mode else 'raw'} epoch {epoch + 1}/{args.epochs}: "
                 f"loss={row['train_loss']:.5f}, val mean R@1={best_score:.4f} "
                 f"(current={validation['mean_r1']:.4f}), {time.monotonic() - started:.1f}s",
                 flush=True,
@@ -381,14 +414,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             for key, value in test.items():
                 writer.add_scalar(f"test/{key}", value, global_step)
         summary = {
-            "input_source": "raw", "output_root": str(output),
+            "input_source": args.feature_source if probe_mode else "raw", "output_root": str(output),
             "train_fraction": args.train_fraction,
             "split_counts": {split: len(dataset) for split, dataset in datasets.items()},
             "selection": "mean_bidirectional_val_r1", "best_epoch": best_epoch,
             "best_val": {key.removeprefix("val_"): value for key, value in history[best_epoch - 1].items() if key.startswith("val_")},
             "test": test, "epochs_completed": len(history), "global_step": global_step,
             "trainable_parameters": counts["total"],
-            "parameter_counts": counts, "model": asdict(model_config),
+            "parameter_counts": counts, "model": model_settings,
+            **({"probe": probe_config} if probe_mode else {}),
             "best_checkpoint": str(best_path), "latest_checkpoint": str(latest_path),
             "tensorboard_dir": str(Path(args.tensorboard_dir or output / "tensorboard").expanduser().resolve()) if args.tensorboard else None,
         }
@@ -398,6 +432,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("supervised", "probe"), default="supervised")
+    parser.add_argument("--feature-source", choices=("raw", "jepa"), default="jepa")
+    parser.add_argument("--feature-layer", type=int, default=12, help="One-based frozen JEPA block output to probe.")
+    parser.add_argument("--checkpoint", type=Path, help="Frozen JEPA checkpoint, required for JEPA probing.")
+    parser.add_argument("--encoder-key", default="target_encoder", choices=("encoder", "target_encoder"))
+    parser.add_argument("--precompute-batch-size", type=int, default=256)
+    parser.add_argument("--probe-heads", type=int, default=6)
     parser.add_argument("--model-size", choices=tuple(MODEL_SPECS), default="base", help="Text and motion encoder size; defaults to base.")
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--annotations-path", type=Path, default=DEFAULT_ANNOTATIONS_PATH)
