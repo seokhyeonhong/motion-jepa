@@ -47,43 +47,49 @@ def read_run(task, directory, name):
     summary = read_json(directory / "summary.json")
     config = read_json(directory / "config.json") or summary.get("signature", {})
     optimization = config.get("optimization", {})
-    budget = int(optimization.get("epochs", 100))
+    subset = config.get("train_subset") or read_json(directory / "train-subset.json")
+    train_fraction = float(subset.get("fraction", config.get("data", {}).get("train_fraction", 1.0)))
+    unit = "iteration" if "iterations" in optimization or not optimization else "epoch"
+    default_budget = (30000 if task == "segmentation" else 150000) if unit == "iteration" else 100
+    budget = int(optimization.get("iterations" if unit == "iteration" else "epochs", default_budget))
     points = []
     if task == "segmentation":
         history = read_json(directory / "metrics.json")
         for row in history if isinstance(history, list) else []:
             points.append({
-                "epoch": int(row["epoch"]), "train": finite(row["train"].get("loss")),
+                "step": int(row[unit]), "train": finite(row["train"].get("loss")),
                 "val": finite(row["val"].get("babel-120", {}).get("frame_map")),
                 "val_loss": finite(row["val"].get("loss")),
             })
         best_score = finite(summary.get("best_val_frame_map"))
         test = summary.get("test")
         test_score = finite((test or {}).get("babel-120", {}).get("frame_map"))
-        epochs = int(summary.get("actual_epochs", max((p["epoch"] for p in points), default=0)))
+        progress = int(summary.get("global_step" if unit == "iteration" else "actual_epochs",
+                                   max((p["step"] for p in points), default=0)))
         feature_metadata = config.get("features", {})
     else:
         metrics_path = directory / "metrics.csv"
         if metrics_path.is_file():
             with metrics_path.open(newline="") as handle:
                 for row in csv.DictReader(handle):
-                    if finite(row.get("epoch")) is None:
+                    if finite(row.get(unit)) is None:
                         continue
                     points.append({
-                        "epoch": int(row["epoch"]), "train": finite(row.get("train_loss")),
+                        "step": int(row[unit]), "train": finite(row.get("train_loss")),
                         "val": finite(row.get("val_mean_r1")),
                         "t2m": finite(row.get("val_t2m_r1")), "m2t": finite(row.get("val_m2t_r1")),
                     })
         best_score = finite(summary.get("best_val", {}).get("mean_r1"))
         test = summary.get("test")
         test_score = finite((test or {}).get("mean_r1"))
-        epochs = int(summary.get("epochs_completed", max((p["epoch"] for p in points), default=0)))
+        progress = int(summary.get("global_step" if unit == "iteration" else "epochs_completed",
+                                   max((p["step"] for p in points), default=0)))
         feature_metadata = read_json(directory / "provenance.json").get("probe", {}).get("extractor", {})
-    best_epoch = summary.get("best_epoch")
+    best_position = summary.get("best_step" if unit == "iteration" else "best_epoch")
     observed = [p for p in points if p["val"] is not None]
     if best_score is None and observed:
         peak = max(observed, key=lambda point: point["val"])
-        best_score, best_epoch = peak["val"], peak["epoch"]
+        best_score, best_position = peak["val"], peak["step"]
     final_score = points[-1]["val"] if points else None
     stop = read_json(directory / "early_stop.json")
     failure = read_json(directory / "failure.json")
@@ -92,7 +98,7 @@ def read_run(task, directory, name):
     elif stop:
         status, complete = "Intentional early stop", False
     elif summary:
-        status, complete = ("Complete", True) if epochs >= budget else ("Finished below budget", False)
+        status, complete = ("Complete", True) if progress >= budget else ("Finished below budget", False)
     elif points or config:
         status, complete = "Progress recorded", False
     else:
@@ -100,8 +106,11 @@ def read_run(task, directory, name):
     return {
         "name": name, "label": LABELS.get(name, name), "directory": directory,
         "summary": summary, "config": config, "optimization": optimization,
-        "budget": budget, "epochs": epochs, "points": points, "status": status,
-        "complete": complete, "best_epoch": best_epoch, "best": best_score,
+        "train_fraction": train_fraction, "subset_sha256": subset.get("sample_ids_sha256"),
+        "budget": budget, "unit": unit, "progress": progress, "points": points, "status": status,
+        "complete": complete, "best_position": best_position, "best": best_score,
+        "epochs": progress if unit == "epoch" else None,
+        "best_epoch": best_position if unit == "epoch" else None,
         "final": final_score, "test_score": test_score, "test": test,
         "feature_metadata": feature_metadata, "stop": stop, "failure": failure,
     }
@@ -111,7 +120,14 @@ def matched(left, right):
     """Require completed matching recipes before presenting raw-probe deltas."""
     if not left["complete"] or not right["complete"] or left["best"] is None or right["best"] is None:
         return False
-    fields = ("epochs", "seed", "batch_size", "warmup_epochs", "lr", "weight_decay")
+    if (left["train_fraction"] != right["train_fraction"]
+            or left["subset_sha256"] != right["subset_sha256"]):
+        return False
+    if left["unit"] != right["unit"]:
+        return False
+    fields = ("iterations", "warmup_iterations", "eval_interval", "start_lr", "final_lr",
+              "epochs", "seed", "batch_size", "warmup_epochs", "lr", "weight_decay",
+              "gradient_clip", "temperature", "use_bfloat16")
     return all(left["optimization"].get(key) == right["optimization"].get(key) for key in fields)
 
 
@@ -123,7 +139,11 @@ def link(path, report_dir, label):
 def plot_curves(task, runs):
     shown = [run for run in runs if run["points"]]
     if not shown:
-        return '<p class="muted">Learning curves will appear once epoch metrics are available.</p>'
+        return '<p class="muted">Learning curves will appear once validation metrics are available.</p>'
+    units = {run["unit"] for run in shown}
+    if len(units) != 1:
+        raise ValueError("Cannot overlay iteration and legacy epoch curves on the same training axis")
+    unit = next(iter(units))
     panels = (("val", "Validation BABEL-120 frame mAP"), ("train", "Training masked BCE"),
               ("val_loss", "Validation masked BCE")) if task == "segmentation" else (
               ("val", "Validation mean bidirectional R@1"), ("train", "Training contrastive loss"),
@@ -138,9 +158,9 @@ def plot_curves(task, runs):
             for run in shown:
                 values = [p for p in run["points"] if p.get(metric) is not None]
                 if values:
-                    axis.plot([p["epoch"] for p in values], [p[metric] for p in values],
+                    axis.plot([p["step"] for p in values], [p[metric] for p in values],
                               color=COLORS[run["name"]], label=run["label"], linewidth=1.7)
-            axis.set(title=title, xlabel="Epoch")
+            axis.set(title=title, xlabel=unit.title())
             axis.grid(alpha=.7, linewidth=.6)
             axis.set_xlim(left=0)
         handles, labels = axes.flat[0].get_legend_handles_labels()
@@ -171,7 +191,7 @@ def conclusions(runs):
         statements.append("Layer ordering is provisional until the remaining runs finish; intermediate peaks are shown for progress only.")
     for run in completed:
         points = run["points"]
-        selected = next((point for point in points if point["epoch"] == run["best_epoch"]), None)
+        selected = next((point for point in points if point["step"] == run["best_position"]), None)
         final = points[-1] if points else None
         if (selected and final and run["best"] is not None and final["val"] is not None
                 and selected["train"] is not None and final["train"] is not None
@@ -179,7 +199,7 @@ def conclusions(runs):
             delta = 100 * (run["best"] - final["val"])
             statements.append(
                 f"{run['label']}: final validation is {delta:.4f} percentage points below its selected peak, "
-                f"while training loss decreased from {selected['train']:.6f} at the selected epoch to "
+                f"while training loss decreased from {selected['train']:.6f} at the selected checkpoint to "
                 f"{final['train']:.6f}. This train/validation divergence is consistent with overfitting after the peak; "
                 "the best checkpoint remains the evaluation model."
             )
@@ -209,25 +229,33 @@ def generate(task, run_root, report_dir, checkpoint, comparison_root=None):
         if run["best"] is not None and not run["complete"]:
             best += '<span class="small">observed so far</span>'
         rows.append(f"<tr><th>{html.escape(run['label'])}</th><td><span class='badge {badge}'>{run['status']}</span></td>"
-                    f"<td>{run['epochs']} / {run['budget']}</td><td>{run['best_epoch'] or '—'}</td><td>{best}</td>"
+                    f"<td>{run['progress']} / {run['budget']} {run['unit']}s</td><td>{run['best_position'] or '—'}</td><td>{best}</td>"
                     f"<td>{numeric(run['final'])}</td><td>{change}</td><td>{numeric(run['test_score'])}</td></tr>")
         optimization = run["optimization"]
         actual = bool(optimization)
-        planned = {"seed": 42, "epochs": 100, "warmup_epochs": 5, "batch_size": 256,
-                   "lr": 3e-4 if task == "segmentation" else 1e-4, "weight_decay": .01}
+        if run["unit"] == "iteration":
+            planned = {"seed": 42, "iterations": 30000 if task == "segmentation" else 150000,
+                       "warmup_iterations": 1500 if task == "segmentation" else 7500,
+                       "batch_size": 128 if task == "segmentation" else 256,
+                       "lr": 3e-4 if task == "segmentation" else 1e-4, "weight_decay": .01}
+        else:
+            planned = {"seed": 42, "epochs": 100, "warmup_epochs": 5, "batch_size": 256,
+                       "lr": 3e-4 if task == "segmentation" else 1e-4, "weight_decay": .01}
         recipe = {key: optimization.get(key, value) for key, value in planned.items()}
         configs.append(f"<tr><th>{html.escape(run['label'])}</th><td>{'Recorded' if actual else 'Planned'}</td>"
-                       + "".join(f"<td>{recipe[key]:g}</td>" for key in planned) + "</tr>")
+                       + "".join(f"<td>{recipe[key]:g}</td>" for key in planned)
+                       + f"<td>{format(run['train_fraction'], '.0%') if actual else '—'}</td></tr>")
         artifacts = []
         for filename in ("best.pth.tar", "latest.pth.tar", "summary.json", "config.json",
                          "metrics.json" if task == "segmentation" else "metrics.csv", "provenance.json",
-                         "early_stop.json", "failure.json"):
+                         "train-subset.json", "early_stop.json", "failure.json"):
             path = run["directory"] / filename
             if path.is_file():
                 artifacts.append(link(path, report_dir, filename))
-        exact = {"status": run["status"], "actual_epochs": run["epochs"], "budget_epochs": run["budget"],
-                 "best_epoch": run["best_epoch"], "best_validation": run["best"], "final_validation": run["final"],
+        exact = {"status": run["status"], "unit": run["unit"], "completed": run["progress"], "budget": run["budget"],
+                 "best_position": run["best_position"], "optimization": run["optimization"], "best_validation": run["best"], "final_validation": run["final"],
                  "test": run["test"], "feature_metadata": run["feature_metadata"],
+                 "train_fraction": run["train_fraction"], "subset_sha256": run["subset_sha256"],
                  "parameters": run["summary"].get("parameters", run["summary"].get("parameter_counts")),
                  "stop_record": run["stop"] or None, "failure_record": run["failure"] or None}
         details.append(f"<details><summary>{html.escape(run['label'])}: exact values and artifacts</summary>"
@@ -240,7 +268,8 @@ def generate(task, run_root, report_dir, checkpoint, comparison_root=None):
                         "There is no feed-forward block or trainable JEPA backbone.")
         evaluation = ("Masked frame BCE trains annotated frames only. Validation BABEL-120 frame mAP selects the checkpoint. "
                       "All valid training frames, including unannotated context, contribute to feature statistics. "
-                      "The prepared segmentation test split is empty, so test metrics are unavailable.")
+                      "The existing validation split is also the reported evaluation set. "
+                      "The prepared test split remains empty; no separate holdout is created.")
     else:
         architecture = ("One learned query pools all valid motion frames through one six-head attention layer, followed by "
                         "one linear projection to the 256D retrieval space and L2 normalization. This replaces the entire "
@@ -249,8 +278,8 @@ def generate(task, run_root, report_dir, checkpoint, comparison_root=None):
         evaluation = ("Symmetric multi-positive contrastive loss trains the motion probe and text encoder. "
                       "Full-gallery validation mean bidirectional R@1 selects the checkpoint; selected-model test recall "
                       "is reported when available. Text-to-motion and motion-to-text curves remain separate in the figure.")
-    reference_text = (f"The earlier supervised base Transformer completed {reference['epochs']} epochs, selecting epoch "
-                      f"{reference['best_epoch'] or '—'} with validation {metric} {numeric(reference['best'])}; "
+    reference_text = (f"The earlier supervised base Transformer completed {reference['progress']} {reference['unit']}s, selecting {reference['unit']} "
+                      f"{reference['best_position'] or '—'} with validation {metric} {numeric(reference['best'])}; "
                       f"final validation {numeric(reference['final'])}; selected-checkpoint test {numeric(reference['test_score'])}.")
     reference_artifacts = " · ".join(link(reference_dir / file, report_dir, file) for file in
                                     ("summary.json", "best.pth.tar", "metrics.json" if task == "segmentation" else "metrics.csv")
@@ -315,20 +344,20 @@ footer{{border-top:1px solid var(--line);padding-top:18px;margin-top:30px;color:
 <div class="notice">{'All five recorded training budgets are complete.' if completed == 5 else 'This report includes pending or incomplete runs. Observed peaks are progress indicators, not final layer comparisons.'}
 “Progress recorded” describes saved metrics only; this report does not inspect process liveness.</div>
 <h2>Layer comparison</h2><p class="muted">Scores are fractions on [0, 1]. Δ raw uses percentage points and is shown only for completed runs with matching recorded recipes.</p>
-<div class="scroll"><table><thead><tr><th>Features</th><th>Status</th><th>Epochs</th><th>Best epoch</th><th>Best validation</th><th>Final validation</th><th>Δ raw (pp)</th><th>Test</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
+<div class="scroll"><table><thead><tr><th>Features</th><th>Status</th><th>Training budget</th><th>Selected iteration / epoch</th><th>Best validation</th><th>Final validation</th><th>Δ raw (pp)</th><th>Test</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
 {comparison_section}
 <h2>Trainable parameters</h2>
 <p class="muted">M = 1,000,000 parameters; values are rounded to three decimals. Counts come from saved run summaries and exclude frozen JEPA and LLM2Vec encoders. TMR totals sum all trainable components: the motion encoder or probe and the text encoder. Exact integer counts remain in the saved artifacts.</p>
 <div class="scroll"><table><thead><tr><th>Model / features</th><th>Total trainable (M)</th><th>Components (M)</th></tr></thead><tbody>{''.join(parameter_rows)}</tbody></table></div>
 <h2>Assessment</h2><ul>{conclusions(runs)}</ul>
-<h2>Full learning curves</h2><p class="muted">Every available epoch is plotted without smoothing or truncation. Test metrics do not select checkpoints.</p>{plot_curves(task, runs)}
+<h2>Full learning curves</h2><p class="muted">Every available validation point is plotted without smoothing or truncation. Test metrics do not select checkpoints.</p>{plot_curves(task, runs)}
 <h2>Experimental protocol</h2><p>{architecture}</p><p>{evaluation}</p>
 <p>Frozen JEPA features come from the EMA target encoder at update {html.escape(str(source_step))}. Layers are read immediately after their one-based Transformer block, before the encoder's final LayerNorm. Raw motion has 366 channels; base JEPA features have 384.</p>
 <p>JEPA inputs use the checkpoint's pretraining mean/std. Probe inputs use per-channel population mean/std computed only from valid frames in the task's training dataset. Padding, validation and test frames never contribute. Channels with standard deviation below 10⁻⁶ use a divisor of one.</p>
 <p>Per-sample motion features remain in anonymous CPU RAM throughout probing. The frozen network is released from GPU memory before constructing the probe. No per-sample motion feature cache is serialized. Saved probe checkpoints retain normalization buffers, parameters and provenance; TMR continues to use its existing frozen sentence-feature cache.</p>
 <p class="path">Frozen checkpoint: {html.escape(str(checkpoint))}<br>Checkpoint SHA-256: {html.escape(str(source.get('checkpoint_sha256', 'pending extraction metadata')))}</p>
-<div class="scroll"><table><thead><tr><th>Features</th><th>Recipe</th><th>Seed</th><th>Epoch budget</th><th>Warmup</th><th>Batch</th><th>Learning rate</th><th>Weight decay</th></tr></thead><tbody>{''.join(configs)}</tbody></table></div>
-<p class="muted">AdamW, gradient clipping at 1.0, warmup followed by cosine decay. Planned values are explicitly labeled until a run writes its actual configuration. Each layer uses its own best validation checkpoint.</p>
+<div class="scroll"><table><thead><tr><th>Features</th><th>Recipe</th><th>Seed</th><th>Budget (row units)</th><th>Warmup (row units)</th><th>Batch</th><th>Learning rate</th><th>Weight decay</th><th>Train fraction</th></tr></thead><tbody>{''.join(configs)}</tbody></table></div>
+<p class="muted">Training fractions apply only to the training split. Matched deltas also require identical selected sample IDs. AdamW, gradient clipping at 1.0, warmup followed by cosine decay. Planned values are explicitly labeled until a run writes its actual configuration. Each layer uses its own best validation checkpoint.</p>
 <h2>Historical supervised reference</h2><p>{reference_text}</p><p>This reference trains the full raw-motion Transformer and has a different trainable capacity. It is shown separately and is not used for matched raw-probe deltas.</p><p>{reference_artifacts}</p>
 <h2>Exact results and saved artifacts</h2>{''.join(details)}
 <footer>Source run directory: {html.escape(str(run_root))}. All figures are embedded; this HTML report can be opened offline. Artifact links are relative to the report location.</footer>

@@ -88,14 +88,13 @@ class BabelSegmentationDataset(MotionDataset):
         if len(self.records) != sum(record["split"] == split for record in records):
             raise ValueError("Segmentation index contains samples absent from the split")
 
-    def __getitem__(self, index: int):
+    def load_labels(self, index: int):
+        """Read validated, unpadded frame labels without loading motion arrays."""
         record = self.records[index]
+        length = int(record["length"])
         label_path = self.root / record["labels_path"]
         if file_sha256(label_path) != record["labels_sha256"]:
             raise ValueError(f"Segmentation label hash mismatch: {label_path}")
-        if file_sha256(self.entries[index].path) != record["motion_sha256"]:
-            raise ValueError(f"Segmentation motion hash mismatch: {self.entries[index].path}")
-        motion, fps, length = super().__getitem__(index)
         with np.load(label_path, allow_pickle=False) as arrays:
             labels = arrays["labels"]
             supervision = arrays["supervision"]
@@ -105,6 +104,14 @@ class BabelSegmentationDataset(MotionDataset):
             raise ValueError(f"Segmentation labels must be boolean: {label_path}")
         if not np.array_equal(supervision, labels.any(axis=1)):
             raise ValueError(f"Segmentation supervision disagrees with labels: {label_path}")
+        return labels, supervision
+
+    def __getitem__(self, index: int):
+        record = self.records[index]
+        labels, supervision = self.load_labels(index)
+        if file_sha256(self.entries[index].path) != record["motion_sha256"]:
+            raise ValueError(f"Segmentation motion hash mismatch: {self.entries[index].path}")
+        motion, fps, length = super().__getitem__(index)
         padded_labels = np.zeros((self.num_frames, self.num_classes), dtype=np.float32)
         padded_labels[:length] = labels
         padded_supervision = np.zeros(self.num_frames, dtype=np.bool_)

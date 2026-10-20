@@ -29,6 +29,7 @@ from experiment.utils import (
     _torch_load_checkpoint,
     resolve_device,
 )
+from utils.schedulers import WarmupCosineSchedule
 from .dataset import (
     DEFAULT_ANNOTATIONS_PATH,
     DEFAULT_CACHE_ROOT,
@@ -50,7 +51,8 @@ DATA_FIELDS = (
     "text_revision", "max_text_length", "text_adapter", "text_adapter_revision",
 )
 OPTIMIZATION_FIELDS = (
-    "seed", "epochs", "warmup_epochs", "batch_size", "lr", "final_lr",
+    "seed", "iterations", "warmup_iterations", "eval_interval", "checkpoint_interval",
+    "log_freq", "batch_size", "start_lr", "lr", "final_lr",
     "weight_decay", "gradient_clip", "temperature", "use_bfloat16",
 )
 
@@ -144,22 +146,13 @@ def _restore_rng(state: dict[str, Any], loader_generator: torch.Generator) -> No
     loader_generator.set_state(state["loader_generator"])
 
 
-def _lr_factor(epoch: int, *, epochs: int, warmup_epochs: int, final_factor: float) -> float:
-    if epoch < warmup_epochs:
-        return (epoch + 1) / warmup_epochs
-    remaining = epochs - warmup_epochs
-    progress = min(1.0, (epoch - warmup_epochs) / max(1, remaining - 1))
-    return final_factor + (1 - final_factor) * (1 + math.cos(math.pi * progress)) / 2
-
-
 def _write_metrics(history: list[dict[str, Any]], path: Path) -> None:
-    if not history:
-        return
     temporary = path.with_name(path.name + ".tmp")
     with temporary.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=list(history[0]))
-        writer.writeheader()
-        writer.writerows(history)
+        if history:
+            writer = csv.DictWriter(file, fieldnames=list(history[0]))
+            writer.writeheader()
+            writer.writerows(history)
     os.replace(temporary, path)
 
 
@@ -181,7 +174,7 @@ def _tensorboard_writer(args, output: Path, global_step: int):
 
 def load_alignment_checkpoint(path: Path) -> dict[str, Any]:
     checkpoint = _torch_load_checkpoint(path)
-    if checkpoint.get("format_version") != 1 or checkpoint.get("experiment") != "tmr_alignment":
+    if checkpoint.get("experiment") != "tmr_alignment":
         raise ValueError(f"Not a supported TMR alignment checkpoint: {path}")
     for key in ("model", "config", "provenance"):
         if key not in checkpoint:
@@ -199,15 +192,20 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError("Raw probing does not use --checkpoint")
     if not math.isfinite(args.train_fraction) or not 0 < args.train_fraction <= 1:
         raise ValueError("--train-fraction must be finite and in (0, 1]")
-    if args.epochs < 1 or not 0 <= args.warmup_epochs < args.epochs:
-        raise ValueError("epochs must be positive and warmup_epochs in [0, epochs)")
+    if args.iterations <= 0 or not 0 <= args.warmup_iterations < args.iterations:
+        raise ValueError("Require iterations > 0 and 0 <= warmup_iterations < iterations")
+    if min(args.eval_interval, args.checkpoint_interval, args.log_freq) <= 0:
+        raise ValueError("Evaluation, checkpoint, and logging intervals must be positive")
+    for name in ("start_lr", "lr", "final_lr"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
+            raise ValueError(f"{name} must be finite and nonnegative")
+    if args.lr == 0 or max(args.start_lr, args.final_lr) > args.lr:
+        raise ValueError("Require positive lr with start_lr and final_lr no greater than lr")
     if args.batch_size < 2 or args.eval_batch_size < 1 or args.num_workers < 0 or args.chunk_size < 1:
         raise ValueError("Training batch size must be >=2; evaluation sizes positive; workers >=0")
-    for name in ("lr", "final_lr", "temperature"):
+    for name in ("temperature",):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             raise ValueError(f"{name} must be finite and positive")
-    if args.final_lr > args.lr:
-        raise ValueError("final_lr cannot exceed lr")
     for name in ("weight_decay", "gradient_clip"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             raise ValueError(f"{name} must be finite and nonnegative")
@@ -237,6 +235,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     datasets, provenance = load_prepared_datasets(**data_config)
     if len(datasets["train"]) < 2 or not len(datasets["val"]):
         raise ValueError("TMR needs at least two training pairs and a nonempty validation split")
+    if len(datasets["train"]) < args.batch_size:
+        raise ValueError("Training subset is smaller than batch_size; choose a common batch size for all fractions")
     probe_config, motion_mean, motion_std = None, None, None
     if probe_mode:
         from .probing import prepare_probe_datasets, probe_configuration
@@ -269,14 +269,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         config["probe"] = probe_config
     model = TextMotionAlignment(model_config, motion_mean=motion_mean, motion_std=motion_std).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda epoch: _lr_factor(
-            epoch, epochs=args.epochs, warmup_epochs=args.warmup_epochs,
-            final_factor=args.final_lr / args.lr,
-        ),
+    scheduler = WarmupCosineSchedule(
+        optimizer, warmup_steps=args.warmup_iterations, start_lr=args.start_lr,
+        ref_lr=args.lr, final_lr=args.final_lr, T_max=args.iterations,
     )
     generator = torch.Generator().manual_seed(args.seed)
-    start_epoch, best_epoch, best_score, global_step = 0, 0, -math.inf, 0
+    loader = DataLoader(
+        datasets["train"], batch_size=args.batch_size, shuffle=True, drop_last=True,
+        num_workers=args.num_workers, generator=generator, collate_fn=collate_pairs,
+        pin_memory=device.type == "cuda",
+    )
+    best_step, best_score, global_step = 0, -math.inf, 0
+    weighted_loss, sample_count = 0.0, 0
     history: list[dict[str, Any]] = []
     if args.resume:
         checkpoint = load_alignment_checkpoint(latest_path)
@@ -286,14 +290,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         model.load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
-        start_epoch = int(checkpoint["next_epoch"])
-        best_epoch, best_score = int(checkpoint["best_epoch"]), float(checkpoint["best_val_mean_r1"])
-        global_step = int(checkpoint.get("global_step", 0))
+        best_step, best_score = checkpoint["best_step"], checkpoint["best_val_mean_r1"]
+        global_step = checkpoint["global_step"]
+        weighted_loss, sample_count = checkpoint["train_accumulator"]
         history = checkpoint["history"]
         _restore_rng(checkpoint["rng_state"], generator)
-        if not 0 <= start_epoch <= args.epochs or len(history) != start_epoch:
-            raise ValueError("Invalid next_epoch/history in resume checkpoint")
-        if not best_path.is_file():
+        if best_step and not best_path.is_file():
             raise FileNotFoundError(f"Resume requires the selected checkpoint: {best_path}")
     output.mkdir(parents=True, exist_ok=True)
     _atomic_json_save(config, output / "config.json")
@@ -316,91 +318,86 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }, output / "runtime.json")
     _write_metrics(history, output / "metrics.csv")
     with _tensorboard_writer(args, output, global_step) as writer:
-        loader = DataLoader(
-            datasets["train"], batch_size=args.batch_size, shuffle=True,
-            generator=generator, num_workers=args.num_workers, collate_fn=collate_pairs,
-            # Recreate worker iterators each epoch so their generator consumption is
-            # identical after an epoch-boundary resume, including with workers > 0.
-            pin_memory=device.type == "cuda",
-        )
-        for epoch in range(start_epoch, args.epochs):
+        started = time.monotonic()
+        batches = iter(loader)
+        for global_step in range(global_step + 1, args.iterations + 1):
+            try:
+                batch = next(batches)
+            except StopIteration:
+                batches = iter(loader)
+                batch = next(batches)
             model.train()
-            weighted_loss, sample_count, started = 0.0, 0, time.monotonic()
-            learning_rate = float(optimizer.param_groups[0]["lr"])
-            for batch in loader:
-                count = len(batch["caption_ids"])
-                if count < 2:
-                    continue  # A singleton has no negative and contributes zero contrastive signal.
-                optimizer.zero_grad(set_to_none=True)
-                with _autocast(device, args.use_bfloat16):
-                    motion, text = model(
-                        batch["motion_tokens"].to(device, non_blocking=True),
-                        batch["motion_mask"].to(device, non_blocking=True),
-                        batch["text_tokens"].to(device, non_blocking=True),
-                        batch["text_mask"].to(device, non_blocking=True),
-                    )
-                    loss = symmetric_multi_positive_info_nce(
-                        motion, text, batch["caption_ids"], batch["source_ids"],
-                        batch["start_frames"], batch["end_frames"], temperature=args.temperature,
-                        caption_candidate_ids=batch["caption_candidate_ids"],
-                    )
-                if not torch.isfinite(loss):
-                    raise FloatingPointError(f"Non-finite TMR loss at epoch {epoch + 1}, step {global_step}")
-                loss.backward()
-                if args.gradient_clip:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip, error_if_nonfinite=True)
-                optimizer.step()
-                global_step += 1
-                loss_value = float(loss.detach())
+            learning_rate = scheduler.step()
+            count = len(batch["caption_ids"])
+            optimizer.zero_grad(set_to_none=True)
+            with _autocast(device, args.use_bfloat16):
+                motion, text = model(
+                    batch["motion_tokens"].to(device, non_blocking=True),
+                    batch["motion_mask"].to(device, non_blocking=True),
+                    batch["text_tokens"].to(device, non_blocking=True),
+                    batch["text_mask"].to(device, non_blocking=True),
+                )
+                loss = symmetric_multi_positive_info_nce(
+                    motion, text, batch["caption_ids"], batch["source_ids"],
+                    batch["start_frames"], batch["end_frames"], temperature=args.temperature,
+                    caption_candidate_ids=batch["caption_candidate_ids"],
+                )
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"Non-finite TMR loss at iteration {global_step}")
+            loss.backward()
+            if args.gradient_clip:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip, error_if_nonfinite=True)
+            optimizer.step()
+            loss_value = float(loss.detach())
+            weighted_loss += loss_value * count
+            sample_count += count
+            if writer is not None:
+                writer.add_scalar("train/loss", loss_value, global_step)
+                writer.add_scalar("train/learning_rate", learning_rate, global_step)
+            if global_step % args.log_freq == 0 or global_step == args.iterations:
+                print(f"TMR iteration={global_step}/{args.iterations} "
+                      f"loss={weighted_loss / sample_count:.5f} lr={learning_rate:.3e}", flush=True)
+            improved = False
+            if global_step % args.eval_interval == 0 or global_step == args.iterations:
+                validation = evaluate_split(
+                    model, datasets["val"], device, batch_size=args.eval_batch_size,
+                    num_workers=args.num_workers, use_bfloat16=args.use_bfloat16, chunk_size=args.chunk_size,
+                )
+                row = {
+                    "iteration": global_step, "lr": learning_rate,
+                    "train_loss": weighted_loss / sample_count, "train_samples": sample_count,
+                    **{f"val_{key}": value for key, value in validation.items()},
+                }
+                history.append(row)
+                improved = validation["mean_r1"] > best_score
+                if improved:
+                    best_step, best_score = global_step, float(validation["mean_r1"])
                 if writer is not None:
-                    writer.add_scalar("train/loss", loss_value, global_step)
-                    writer.add_scalar("train/learning_rate", learning_rate, global_step)
-                weighted_loss += loss_value * count
-                sample_count += count
-            if not sample_count:
-                raise ValueError("No trainable contrastive batches; at least two pairs are required")
-            validation = evaluate_split(
-                model, datasets["val"], device, batch_size=args.eval_batch_size,
-                num_workers=args.num_workers, use_bfloat16=args.use_bfloat16, chunk_size=args.chunk_size,
-            )
-            row = {
-                "epoch": epoch + 1, "lr": learning_rate, "train_loss": weighted_loss / sample_count,
-                "train_samples": sample_count, **{f"val_{key}": value for key, value in validation.items()},
-            }
-            history.append(row)
-            improved = validation["mean_r1"] > best_score
-            if improved:
-                best_epoch, best_score = epoch + 1, float(validation["mean_r1"])
-            if writer is not None:
-                writer.add_scalar("train/epoch", epoch + 1, global_step)
-                writer.add_scalar("train/epoch_loss", row["train_loss"], global_step)
-                writer.add_scalar("train/epoch_samples", sample_count, global_step)
-                writer.add_scalar("train/epoch_seconds", time.monotonic() - started, global_step)
-                for key, value in validation.items():
-                    writer.add_scalar(f"val/{key}", value, global_step)
-                writer.add_scalar("val/best_mean_r1", best_score, global_step)
-                writer.add_scalar("val/best_epoch", best_epoch, global_step)
-            scheduler.step()
-            checkpoint = {
-                "format_version": 1, "experiment": "tmr_alignment", "config": config,
-                "provenance": provenance, "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
-                "next_epoch": epoch + 1, "global_step": global_step,
-                "best_epoch": best_epoch, "best_val_mean_r1": best_score,
-                "history": history, "rng_state": _capture_rng(generator, device),
-            }
-            _write_metrics(history, output / "metrics.csv")
-            if improved:
-                _atomic_torch_save(checkpoint, best_path)
-            _atomic_torch_save(checkpoint, latest_path)
-            if writer is not None:
-                writer.flush()
-            print(
-                f"TMR {'probe' if probe_mode else 'raw'} epoch {epoch + 1}/{args.epochs}: "
-                f"loss={row['train_loss']:.5f}, val mean R@1={best_score:.4f} "
-                f"(current={validation['mean_r1']:.4f}), {time.monotonic() - started:.1f}s",
-                flush=True,
-            )
+                    writer.add_scalar("train/interval_loss", row["train_loss"], global_step)
+                    writer.add_scalar("train/samples_seen", global_step * args.batch_size, global_step)
+                    for key, value in validation.items():
+                        writer.add_scalar(f"val/{key}", value, global_step)
+                    writer.add_scalar("val/best_mean_r1", best_score, global_step)
+                    writer.add_scalar("val/best_step", best_step, global_step)
+                weighted_loss, sample_count = 0.0, 0
+                _write_metrics(history, output / "metrics.csv")
+                print(f"TMR validation iteration={global_step} mean_R@1={validation['mean_r1']:.4f} "
+                      f"best={best_score:.4f} elapsed={time.monotonic() - started:.1f}s", flush=True)
+            if improved or global_step % args.checkpoint_interval == 0 or global_step == args.iterations:
+                checkpoint = {
+                    "experiment": "tmr_alignment", "config": config,
+                    "provenance": provenance, "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+                    "global_step": global_step,
+                    "best_step": best_step, "best_val_mean_r1": best_score,
+                    "train_accumulator": (weighted_loss, sample_count),
+                    "history": history, "rng_state": _capture_rng(generator, device),
+                }
+                if improved:
+                    _atomic_torch_save(checkpoint, best_path)
+                _atomic_torch_save(checkpoint, latest_path)
+                if writer is not None:
+                    writer.flush()
         selected = load_alignment_checkpoint(best_path)
         if (selected["config"] != config
                 or selected["provenance"] != provenance):
@@ -417,9 +414,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "input_source": args.feature_source if probe_mode else "raw", "output_root": str(output),
             "train_fraction": args.train_fraction,
             "split_counts": {split: len(dataset) for split, dataset in datasets.items()},
-            "selection": "mean_bidirectional_val_r1", "best_epoch": best_epoch,
-            "best_val": {key.removeprefix("val_"): value for key, value in history[best_epoch - 1].items() if key.startswith("val_")},
-            "test": test, "epochs_completed": len(history), "global_step": global_step,
+            "selection": "mean_bidirectional_val_r1", "best_step": best_step,
+            "best_val": {key.removeprefix("val_"): value for key, value in
+                         next(row for row in history if row["iteration"] == best_step).items() if key.startswith("val_")},
+            "test": test, "iterations_completed": global_step, "global_step": global_step,
+            "samples_seen": global_step * args.batch_size,
+            "equivalent_epochs": global_step * args.batch_size / len(datasets["train"]),
             "trainable_parameters": counts["total"],
             "parameter_counts": counts, "model": model_settings,
             **({"probe": probe_config} if probe_mode else {}),
@@ -460,8 +460,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--train-fraction", type=float, default=1.0,
         help="Fraction of cached captioned train clips to use (0 < fraction <= 1); subset uses --seed. Val/test stay complete.",
     )
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--warmup-epochs", type=int, default=5)
+    parser.add_argument("--iterations", type=int, default=150000)
+    parser.add_argument("--warmup-iterations", type=int, default=7500)
+    parser.add_argument("--eval-interval", type=int, default=1500)
+    parser.add_argument("--checkpoint-interval", type=int, default=1500)
+    parser.add_argument("--log-freq", type=int, default=120)
+    parser.add_argument("--start-lr", type=float, default=0.)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=8)

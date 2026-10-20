@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -24,13 +25,24 @@ def write_json(path, value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--name", default="probing-base-allctx-200000-20261018")
+    parser.add_argument("--name", default="probing-base-allctx-200000-iterations")
     parser.add_argument("--task", choices=("all", "segmentation", "tmr"), default="all")
+    parser.add_argument("--train-fraction", type=float, default=1.0,
+                        help="Training fraction for every run; validation/test remain complete")
     parser.add_argument("--runs", nargs="+", default=["raw", "3", "6", "9", "12"])
+    parser.add_argument("--iterations", type=int, help="Override the task's fixed optimizer-update budget")
+    parser.add_argument("--warmup-iterations", type=int)
+    parser.add_argument("--eval-interval", type=int)
+    parser.add_argument("--checkpoint-interval", type=int)
+    parser.add_argument("--log-freq", type=int)
+    parser.add_argument("--batch-size", type=int)
     parser.add_argument("--report-start", type=int, default=1, help="First sequential findings number; TMR uses the following number")
     parser.add_argument("--report-suffix", default="")
     parser.add_argument("--comparison-name", help="Prior probe suite to compare against in the reports")
     args = parser.parse_args()
+    if not math.isfinite(args.train_fraction) or not 0 < args.train_fraction <= 1:
+        raise ValueError("train_fraction must be finite and in (0, 1]")
+    fraction_suffix = f"-frac{args.train_fraction:g}" if args.train_fraction != 1 else ""
     root = Path.cwd()
     checkpoint = args.checkpoint.resolve()
     if not checkpoint.is_file():
@@ -40,9 +52,9 @@ def main():
         raise ValueError(f"Unknown comparisons: {unknown}")
     tasks = ("segmentation", "tmr") if args.task == "all" else (args.task,)
     for task in tasks:
-        task_root = root / "output" / task / args.name
+        task_root = root / "output" / task / (args.name + fraction_suffix)
         report_number = args.report_start + int(task == "tmr")
-        report_dir = root / "findings" / f"{report_number:03d}-{task}-probing{args.report_suffix}"
+        report_dir = root / "findings" / f"{report_number:03d}-{task}-probing{args.report_suffix}{fraction_suffix}"
         for selected in args.runs:
             name = "raw" if selected == "raw" else "layer-" + selected
             output = task_root / name / "seed-42"
@@ -52,12 +64,17 @@ def main():
                 continue
             command = [sys.executable, "-m", "experiment." + task,
                 "--mode", "probe", "--feature-source", "raw" if selected == "raw" else "jepa",
-                "--model-size", "base", "--epochs", "100", "--warmup-epochs", "5",
-                "--batch-size", "256", "--seed", "42", "--num-workers", "8",
+                "--model-size", "base", "--seed", "42", "--num-workers", "8",
+                "--train-fraction", str(args.train_fraction),
                 "--precompute-batch-size", "256", "--probe-heads", "6",
                 "--weight-decay", "0.01", "--gradient-clip", "1.0",
                 "--lr", "0.0003" if task == "segmentation" else "0.0001",
                 "--output-root", str(output), "--device", "cuda:0"]
+            for option in ("iterations", "warmup_iterations", "eval_interval",
+                           "checkpoint_interval", "log_freq", "batch_size"):
+                value = getattr(args, option)
+                if value is not None:
+                    command += ["--" + option.replace("_", "-"), str(value)]
             if selected != "raw":
                 command += ["--checkpoint", str(checkpoint), "--feature-layer", selected,
                             "--encoder-key", "target_encoder"]
@@ -79,7 +96,7 @@ def main():
             write_json(status_path, status)
             if status["state"] != "completed":
                 raise RuntimeError(f"{task}/{name} did not complete; preserving checkpoints and stopping queue")
-            comparison_args = (["--comparison-root", str(root / "output" / task / args.comparison_name)]
+            comparison_args = (["--comparison-root", str(root / "output" / task / (args.comparison_name + fraction_suffix))]
                                if args.comparison_name else [])
             subprocess.run([sys.executable, "-m", "experiment.probing_report", "--task", task,
                             "--run-root", str(task_root), "--report-dir", str(report_dir),

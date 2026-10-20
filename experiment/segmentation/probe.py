@@ -9,7 +9,7 @@ from experiment.probing import FeatureMoments, FrozenFrameExtractor
 
 
 class SegmentationFeatureDataset(Dataset):
-    """Keep features and supervision in CPU memory for all probe epochs."""
+    """Keep features and supervision in CPU memory throughout probe training."""
 
     def __init__(self, source, feature_dim):
         self.num_classes = source.num_classes

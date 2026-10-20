@@ -132,3 +132,56 @@ Resume and standalone evaluation rebuild the transient motion features, verify
 the checkpoint/data provenance, and restore the saved normalization and probe
 weights. Neither frozen JEPA weights nor frame feature banks are included in
 probe checkpoints. Supervised mode remains the default.
+
+
+## Iteration-based training
+
+Training follows the main JEPA trainer's global-update convention. Defaults are
+`--iterations 150000`, `--warmup-iterations 7500`, `--batch-size 256`,
+`--eval-interval 1500`, `--checkpoint-interval 1500`, and `--log-freq 120`.
+Warmup covers 5% of the default budget; validation and periodic checkpointing
+each run every 1%. Logging intervals scale with the original iteration budgets.
+These values never scale with `--train-fraction` or dataset length. One iteration
+is one optimizer update. The shared `utils.schedulers.WarmupCosineSchedule`
+advances before each update, with `--start-lr 0`, peak `--lr 1e-4`, and
+`--final-lr 1e-6`. Weight decay and the remaining task settings stay fixed.
+
+```bash
+python -m experiment.tmr --mode probe --feature-source raw \
+  --train-fraction 0.01 --seed 42 --iterations 150000 \
+  --warmup-iterations 7500 --eval-interval 1500 \
+  --checkpoint-interval 1500 --batch-size 256 \
+  --output-root output/tmr/probe-raw-iterations/frac0.01/seed-42
+```
+
+The trainer runs a fixed number of iterations and restarts its shuffled DataLoader
+when exhausted. Training
+uses `drop_last=True` to keep every optimizer batch the same size; incomplete
+tails are dropped and the subset is reshuffled on the next pass. A subset smaller
+than the requested batch size is rejected rather than silently shrinking batches.
+Choose a common batch size that fits the smallest fraction. Validation/test loaders
+retain all samples, including their final partial batches. `--eval-batch-size`
+controls evaluation batching independently (default 256).
+
+Validation always runs at the final iteration, even when the total is not a
+multiple of its interval. Best checkpoints are selected only from validation.
+Latest checkpoints are saved at the checkpoint interval, on a new validation
+best, and at the final update. Metrics use `iteration`; summaries record
+`global_step`, `best_step`, `samples_seen`, and `equivalent_epochs`. Equivalent
+epochs mean sample exposures divided by selected training-set size; they do not
+control the schedule.
+
+Resume restores model/optimizer, scheduler, RNG, completed iteration count, and
+unfinished training-metric accumulators, then starts a fresh shuffled data pass.
+Checkpoints have no format-version field. Epoch CLI flags have been removed;
+legacy epoch checkpoints have different training settings and cannot resume into
+an iteration run. Historical metrics
+remain readable by `experiment.probing_report` with an explicit epoch axis.
+
+The suite launcher accepts `--iterations`, `--warmup-iterations`, `--eval-interval`,
+`--checkpoint-interval`, `--log-freq`, and `--batch-size` overrides. Omitting them
+uses the task defaults above; use identical values for every compared fraction.
+
+Training captions use the existing random sampling. Resume does not reproduce
+the interrupted data order exactly. Legacy TMR checkpoints remain supported for
+standalone evaluation.

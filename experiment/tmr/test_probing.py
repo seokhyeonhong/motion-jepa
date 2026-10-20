@@ -130,11 +130,11 @@ def test_probe_training_checkpoint_and_completed_resume(tmp_path, monkeypatch):
     monkeypatch.setattr(train, "load_prepared_datasets", lambda **kwargs: fixtures())
     args = train.build_parser().parse_args([
         "--mode", "probe", "--feature-source", "raw", "--probe-heads", "3",
-        "--output-root", str(tmp_path), "--device", "cpu", "--epochs", "1", "--warmup-epochs", "0",
-        "--batch-size", "3", "--eval-batch-size", "3", "--num-workers", "0", "--no-tensorboard",
+        "--output-root", str(tmp_path), "--device", "cpu", "--iterations", "1", "--warmup-iterations", "0",
+        "--eval-interval", "1", "--checkpoint-interval", "1", "--batch-size", "3", "--eval-batch-size", "3", "--num-workers", "0", "--no-tensorboard",
     ])
     result = train.run(args)
-    assert result["epochs_completed"] == 1 and result["global_step"] == 1
+    assert result["iterations_completed"] == 1 and result["global_step"] == 1
     checkpoint = train.load_alignment_checkpoint(tmp_path / "best.pth.tar")
     assert checkpoint["config"]["model"]["motion_encoder"] == "attentive_probe"
     assert not any("motion_encoder.backbone" in key for key in checkpoint["model"])

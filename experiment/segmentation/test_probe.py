@@ -153,11 +153,11 @@ def test_real_probe_training_checkpoint_and_resume(tmp_path, monkeypatch):
     output = tmp_path / "run"
     args = train.build_parser().parse_args([
         "--dataset-root", str(root), "--output-root", str(output), "--mode", "probe",
-        "--feature-source", "raw", "--device", "cpu", "--epochs", "2", "--warmup-epochs", "0",
-        "--batch-size", "2", "--num-workers", "0", "--probe-heads", "2",
+        "--feature-source", "raw", "--device", "cpu", "--iterations", "2", "--warmup-iterations", "0",
+        "--eval-interval", "1", "--checkpoint-interval", "1", "--batch-size", "2", "--num-workers", "0", "--probe-heads", "2",
     ])
     summary = train.run(args)
-    assert summary["actual_epochs"] == 2
+    assert summary["iterations_completed"] == 2
     assert summary["mode"] == "probe"
     assert summary["input_source"] == "raw"
     assert summary["test"] is None
@@ -166,12 +166,12 @@ def test_real_probe_training_checkpoint_and_resume(tmp_path, monkeypatch):
     checkpoint = torch.load(output / "latest.pth.tar", weights_only=False)
     assert "features" not in checkpoint
     assert checkpoint["signature"]["features"]["training_frames"] == 6
-    assert checkpoint["history"][0]["train"]["supervised_frames"] == 3
+    assert checkpoint["history"][0]["train"]["supervised_frames"] == 2
     assert checkpoint["history"][0]["val"]["supervised_frames"] == 2
     assert all(tensor.numel() < 1000 for tensor in checkpoint["model"].values())
     args.resume = True
     resumed = train.run(args)
-    assert resumed["best_epoch"] == summary["best_epoch"]
+    assert resumed["best_step"] == summary["best_step"]
     assert resumed["best_val_frame_map"] == summary["best_val_frame_map"]
 
 

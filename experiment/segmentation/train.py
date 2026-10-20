@@ -18,14 +18,16 @@ from experiment.utils import (
     PROJECT_ROOT, _atomic_json_save, _atomic_torch_save, _seed_all,
     _sha256_file, _torch_load_checkpoint, resolve_device,
 )
+from utils.schedulers import WarmupCosineSchedule
 from model.specs import MODEL_SPECS
 from .metrics import FrameMetricAccumulator
 from .model import MotionSegmentationProbe, MotionSegmentationTransformer
+from .subset import select_training_subset
 
 
-def run_epoch(model, loader, device, *, optimizer=None, gradient_clip=1.0):
-    training = optimizer is not None
-    model.train(training)
+@torch.inference_mode()
+def evaluate_split(model, loader, device):
+    model.eval()
     metrics = FrameMetricAccumulator(
         loader.dataset.num_classes, loader.dataset.class_indices_60,
     )
@@ -38,25 +40,17 @@ def run_epoch(model, loader, device, *, optimizer=None, gradient_clip=1.0):
         count = int(selected.sum())
         if count == 0:
             continue
-        with torch.set_grad_enabled(training):
-            logits = model(motion, valid, fps)
-            loss = F.binary_cross_entropy_with_logits(logits[selected], labels[selected])
-            if not torch.isfinite(loss):
-                raise ValueError("Non-finite segmentation loss")
-            if training:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
-                optimizer.step()
-        loss_sum += float(loss.detach()) * count
+        logits = model(motion, valid, fps)
+        loss = F.binary_cross_entropy_with_logits(logits[selected], labels[selected])
+        if not torch.isfinite(loss):
+            raise ValueError("Non-finite segmentation loss")
+        loss_sum += float(loss) * count
         frame_count += count
-        if not training:
-            metrics.update(logits, labels, selected)
+        metrics.update(logits, labels, selected)
     if not frame_count:
         raise ValueError("Split has no supervised frames")
     result = {"loss": loss_sum / frame_count, "supervised_frames": frame_count}
-    if not training:
-        result.update(metrics.compute())
+    result.update(metrics.compute())
     return result
 
 
@@ -78,10 +72,20 @@ def restore_rng(state, generator):
 
 
 def run(args):
-    if args.epochs <= 0 or not 0 <= args.warmup_epochs < args.epochs:
-        raise ValueError("Require epochs > 0 and 0 <= warmup_epochs < epochs")
-    if args.batch_size <= 0 or args.num_workers < 0:
-        raise ValueError("Require batch_size > 0 and num_workers >= 0")
+    fraction = getattr(args, "train_fraction", 1.0)
+    if not math.isfinite(fraction) or not 0 < fraction <= 1:
+        raise ValueError("train_fraction must be finite and in (0, 1]")
+    if args.iterations <= 0 or not 0 <= args.warmup_iterations < args.iterations:
+        raise ValueError("Require iterations > 0 and 0 <= warmup_iterations < iterations")
+    if min(args.eval_interval, args.checkpoint_interval, args.log_freq) <= 0:
+        raise ValueError("Evaluation, checkpoint, and logging intervals must be positive")
+    for name in ("start_lr", "lr", "final_lr"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
+            raise ValueError(f"{name} must be finite and nonnegative")
+    if args.lr == 0 or max(args.start_lr, args.final_lr) > args.lr:
+        raise ValueError("Require positive lr with start_lr and final_lr no greater than lr")
+    if args.batch_size <= 0 or args.eval_batch_size <= 0 or args.num_workers < 0:
+        raise ValueError("Require positive batch sizes and num_workers >= 0")
     if not (math.isfinite(args.lr) and args.lr > 0):
         raise ValueError("lr must be finite and positive")
     if not (math.isfinite(args.weight_decay) and args.weight_decay >= 0):
@@ -106,13 +110,26 @@ def run(args):
         f"{args.model_size}-probe-{args.feature_source}"
         + (f"-layer-{args.feature_layer}" if args.feature_layer is not None else "")
     )
-    output = (args.output_root or PROJECT_ROOT / f"output/segmentation/{run_name}/seed-{args.seed}").resolve()
+    default_output = PROJECT_ROOT / "output/segmentation" / run_name
+    if fraction != 1:
+        default_output /= f"frac{fraction:g}"
+    output = (args.output_root or default_output / f"seed-{args.seed}").resolve()
     findings = args.findings_root.expanduser().resolve() if args.findings_root is not None else None
     latest, best = output / "latest.pth.tar", output / "best.pth.tar"
     if output.exists() and any(output.iterdir()) and not args.resume:
         raise FileExistsError(f"Output exists: {output}; use --resume or a new --output-root")
     if args.resume and not latest.is_file():
         raise FileNotFoundError(f"Resume checkpoint does not exist: {latest}")
+    datasets["train"], subset_metadata = select_training_subset(datasets["train"], fraction, args.seed)
+    if len(datasets["train"]) < args.batch_size:
+        raise ValueError("Training subset is smaller than batch_size; choose a common batch size for all fractions")
+    if args.resume:
+        saved = _torch_load_checkpoint(latest)
+        saved_subset = saved["signature"].get("train_subset")
+        if saved_subset != subset_metadata:
+            raise ValueError("Resume training subset differs from the saved run")
+    print(f"Segmentation samples: train={len(datasets['train'])} (fraction={fraction:g}), "
+          f"val={len(datasets['val'])}, test={len(datasets['test'])}", flush=True)
     feature_metadata = None
     if args.mode == "probe":
         from .probe import prepare_probe_datasets
@@ -138,38 +155,46 @@ def run(args):
             Path(__file__), Path(__file__).with_name("model.py"),
             PROJECT_ROOT / "model/motion_transformer_1d.py",
             PROJECT_ROOT / "model/modules.py", PROJECT_ROOT / "model/pos_embs.py",
+            PROJECT_ROOT / "utils/schedulers.py",
         )},
         "optimization": {name: getattr(args, name) for name in (
-            "seed", "epochs", "warmup_epochs", "batch_size", "num_workers",
-            "lr", "weight_decay", "gradient_clip",
+            "seed", "iterations", "warmup_iterations", "eval_interval", "checkpoint_interval", "log_freq",
+            "batch_size", "eval_batch_size", "num_workers", "start_lr", "lr", "final_lr",
+            "weight_decay", "gradient_clip",
         )},
         "objective": "supervised_frame_bce",
         "normalization": "dataset_training_statistics",
         "selection": "validation_babel120_frame_map",
     }
+    if subset_metadata is not None:
+        signature["train_subset"] = subset_metadata
+        for path in (Path(__file__).with_name("subset.py"), PROJECT_ROOT / "dataset/babel_segmentation.py"):
+            signature["code_hashes"][str(path.relative_to(PROJECT_ROOT))] = _sha256_file(path)
     if feature_metadata is not None:
         signature["features"] = feature_metadata
         signature["normalization"] = "training_feature_statistics_excluding_padding"
         for path in (Path(__file__).with_name("probe.py"), PROJECT_ROOT / "experiment/probing.py"):
             signature["code_hashes"][str(path.relative_to(PROJECT_ROOT))] = _sha256_file(path)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    def lr_factor(epoch):
-        if epoch < args.warmup_epochs:
-            return (epoch + 1) / max(args.warmup_epochs, 1)
-        progress = (epoch - args.warmup_epochs) / max(args.epochs - args.warmup_epochs - 1, 1)
-        return 0.01 + 0.99 * (1 + math.cos(math.pi * min(progress, 1.0))) / 2
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+    scheduler = WarmupCosineSchedule(
+        optimizer, warmup_steps=args.warmup_iterations, start_lr=args.start_lr,
+        ref_lr=args.lr, final_lr=args.final_lr, T_max=args.iterations,
+    )
     generator = torch.Generator().manual_seed(args.seed)
+    loader = DataLoader(
+        datasets["train"], batch_size=args.batch_size, shuffle=True, drop_last=True,
+        num_workers=0 if args.mode == "probe" else args.num_workers, generator=generator,
+        pin_memory=device.type == "cuda",
+    )
     loaders = {
-        split: DataLoader(
-            dataset, batch_size=args.batch_size, shuffle=split == "train",
-            num_workers=0 if args.mode == "probe" else args.num_workers,
-            generator=generator if split == "train" else None,
-            pin_memory=device.type == "cuda",
-        )
-        for split, dataset in datasets.items()
+        split: DataLoader(dataset, batch_size=args.eval_batch_size, shuffle=False,
+                          num_workers=0 if args.mode == "probe" else args.num_workers,
+                          pin_memory=device.type == "cuda")
+        for split, dataset in datasets.items() if split != "train"
     }
-    history, start, best_epoch, best_map = [], 0, 0, -math.inf
+    history, best_step, best_map = [], 0, -math.inf
+    global_step = 0
+    loss_sum, frame_count = 0.0, 0
     if args.resume:
         checkpoint = _torch_load_checkpoint(latest)
         if checkpoint["signature"] != signature:
@@ -177,40 +202,83 @@ def run(args):
         model.load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
-        history, start = checkpoint["history"], checkpoint["next_epoch"]
-        best_epoch, best_map = checkpoint["best_epoch"], checkpoint["best_map"]
+        history, global_step = checkpoint["history"], checkpoint["global_step"]
+        best_step, best_map = checkpoint["best_step"], checkpoint["best_map"]
+        loss_sum, frame_count = checkpoint["train_accumulator"]
         restore_rng(checkpoint["rng"], generator)
+        if best_step and not best.is_file():
+            raise FileNotFoundError(f"Resume requires the selected checkpoint: {best}")
     output.mkdir(parents=True, exist_ok=True)
     _atomic_json_save(signature, output / "config.json")
-    for epoch in range(start, args.epochs):
-        train = run_epoch(model, loaders["train"], device, optimizer=optimizer, gradient_clip=args.gradient_clip)
-        val = run_epoch(model, loaders["val"], device)
-        score = val["babel-120"]["frame_map"]
-        if score is None:
-            raise ValueError("Validation has no positive classes")
-        improved = score > best_map
-        if improved:
-            best_map, best_epoch = score, epoch + 1
-        history.append({"epoch": epoch + 1, "lr": optimizer.param_groups[0]["lr"], "train": train, "val": val})
-        scheduler.step()
-        checkpoint = {
-            "signature": signature, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(), "next_epoch": epoch + 1,
-            "best_epoch": best_epoch, "best_map": best_map, "history": history,
-            "rng": capture_rng(generator),
-        }
-        _atomic_torch_save(checkpoint, latest)
-        if improved:
-            _atomic_torch_save(checkpoint, best)
-        _atomic_json_save(history, output / "metrics.json")
-        print(f"epoch={epoch + 1} train_loss={train['loss']:.6f} val_frame_map={score:.6f}", flush=True)
+    if subset_metadata is not None:
+        _atomic_json_save(subset_metadata, output / "train-subset.json")
+    _atomic_json_save(history, output / "metrics.json")
+    batches = iter(loader)
+    for global_step in range(global_step + 1, args.iterations + 1):
+        try:
+            batch = next(batches)
+        except StopIteration:
+            batches = iter(loader)
+            batch = next(batches)
+        motion, fps, lengths, labels, supervised, _ = batch
+        model.train()
+        motion, fps = motion.to(device), fps.to(device)
+        labels, supervised = labels.to(device, dtype=torch.float32), supervised.to(device)
+        valid = torch.arange(motion.shape[1], device=device)[None] < lengths.to(device)[:, None]
+        selected = supervised.bool() & valid
+        count = int(selected.sum())
+        if not count:
+            raise ValueError("Training batch has no supervised frames; cannot perform an optimizer iteration")
+        learning_rate = scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(motion, valid, fps)
+        loss = F.binary_cross_entropy_with_logits(logits[selected], labels[selected])
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"Non-finite segmentation loss at iteration {global_step}")
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip, error_if_nonfinite=True)
+        optimizer.step()
+        loss_sum += float(loss.detach()) * count
+        frame_count += count
+        if global_step % args.log_freq == 0 or global_step == args.iterations:
+            print(f"Segmentation iteration={global_step}/{args.iterations} "
+                  f"loss={loss_sum / frame_count:.6f} lr={learning_rate:.3e}", flush=True)
+        improved = False
+        if global_step % args.eval_interval == 0 or global_step == args.iterations:
+            val = evaluate_split(model, loaders["val"], device)
+            score = val["babel-120"]["frame_map"]
+            if score is None:
+                raise ValueError("Validation has no positive classes")
+            improved = score > best_map
+            if improved:
+                best_map, best_step = score, global_step
+            history.append({"iteration": global_step, "lr": learning_rate,
+                            "train": {"loss": loss_sum / frame_count, "supervised_frames": frame_count},
+                            "val": val})
+            loss_sum, frame_count = 0.0, 0
+            _atomic_json_save(history, output / "metrics.json")
+            print(f"Segmentation validation iteration={global_step} val_frame_map={score:.6f}", flush=True)
+        if improved or global_step % args.checkpoint_interval == 0 or global_step == args.iterations:
+            checkpoint = {
+                "signature": signature, "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+                "global_step": global_step,
+                "best_step": best_step, "best_map": best_map, "history": history,
+                "train_accumulator": (loss_sum, frame_count), "rng": capture_rng(generator),
+            }
+            if improved:
+                _atomic_torch_save(checkpoint, best)
+            _atomic_torch_save(checkpoint, latest)
     model.load_state_dict(_torch_load_checkpoint(best)["model"], strict=True)
-    test = run_epoch(model, loaders["test"], device) if len(datasets["test"]) else None
+    test = evaluate_split(model, loaders["test"], device) if len(datasets["test"]) else None
     summary = {
         "input_source": args.feature_source if args.mode == "probe" else "raw",
         "mode": args.mode, "feature_layer": args.feature_layer,
-        "actual_epochs": len(history),
-        "best_epoch": best_epoch, "best_val_frame_map": best_map, "test": test,
+        "iterations_completed": global_step, "global_step": global_step, "train_fraction": fraction,
+        "samples_seen": global_step * args.batch_size,
+        "equivalent_epochs": global_step * args.batch_size / len(datasets["train"]),
+        "split_counts": {split: len(dataset) for split, dataset in datasets.items()},
+        "best_step": best_step, "best_val_frame_map": best_map, "test": test,
         "parameters": model.parameter_counts(), "checkpoint": str(best),
         "metrics": str(output / "metrics.json"), "signature": signature,
     }
@@ -219,9 +287,11 @@ def run(args):
         findings.mkdir(parents=True, exist_ok=True)
         _atomic_json_save(summary, findings / "results.json")
         (findings / "README.md").write_text(
-            f"# Raw-motion segmentation\n\n"
-            f"Trained {args.model_size} from scratch for {len(history)} epochs using dataset training statistics "
-            f"and masked frame BCE. Validation BABEL-120 frame mAP selects epoch {best_epoch} "
+            f"# Segmentation {args.mode}\n\n"
+            f"Trained {args.model_size} in {args.mode} mode for {global_step} iterations on "
+            f"{len(datasets['train'])} training windows (fraction {fraction:g}, seed {args.seed}) "
+            f"with {signature['normalization']} and masked frame BCE. "
+            f"Validation BABEL-120 frame mAP selects iteration {best_step} "
             f"(mAP {best_map:.6f}).\n\n"
             f"Checkpoint: {best}\n\nMetrics: {output / 'metrics.json'}\n\n"
             f"Test metrics: {json.dumps(test)}\n",
@@ -244,11 +314,21 @@ def build_parser():
     parser.add_argument("--findings-root", type=Path)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--warmup-epochs", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument(
+        "--train-fraction", type=float, default=1.0,
+        help="Fixed fraction of training windows with all-label coverage; uses --seed. Val/test stay unchanged.",
+    )
+    parser.add_argument("--iterations", type=int, default=30000)
+    parser.add_argument("--warmup-iterations", type=int, default=1500)
+    parser.add_argument("--eval-interval", type=int, default=300)
+    parser.add_argument("--checkpoint-interval", type=int, default=300)
+    parser.add_argument("--log-freq", type=int, default=300)
+    parser.add_argument("--start-lr", type=float, default=0.)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--final-lr", type=float, default=3e-6)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--resume", action="store_true")
