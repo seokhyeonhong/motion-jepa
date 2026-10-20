@@ -75,11 +75,16 @@ class MotionTransformer1D(nn.Module):
         fps: torch.Tensor,
         masks: list[torch.Tensor] | None = None,
         valid_frames: torch.Tensor | None = None,
+        feature_layer: int | None = None,
     ) -> torch.Tensor:
         if motion.ndim != 3 or motion.shape[1:] != (self.num_frames, self.in_chans):
             raise ValueError(
                 f"Expected motion [B,{self.num_frames},{self.in_chans}], got {tuple(motion.shape)}"
             )
+        if feature_layer is not None and (isinstance(feature_layer, bool)
+                or not isinstance(feature_layer, int)
+                or not 1 <= feature_layer <= len(self.blocks)):
+            raise ValueError("feature_layer must be a 1-based transformer block index")
         x = self.input_proj(motion)
         times = temporal_token_positions(self.num_frames, fps, device=x.device)
         active = None
@@ -108,9 +113,13 @@ class MotionTransformer1D(nn.Module):
         elif active is not None:
             x = x.masked_fill(~active.unsqueeze(-1), 0)
         rotary = self.rotary(times)
-        for block in self.blocks:
+        for index, block in enumerate(self.blocks, start=1):
             x = block(x, active, rotary)
-        x = self.norm(x)
+            if index == feature_layer:
+                break
+        # Probes select block outputs before the final encoder LayerNorm.
+        if feature_layer is None:
+            x = self.norm(x)
         if active is not None:
             x = x.masked_fill(~active.unsqueeze(-1), 0)
         return x

@@ -199,6 +199,43 @@ RoPE settings, and removed model variants fail explicitly. Archived experiment
 outputs and findings remain historical records. Downstream prediction,
 generation, and TMR heads retain their own positional embeddings.
 
+### Optional centering and sharpening
+
+Enable S-JEPA-style distribution matching in either pretraining config:
+
+```yaml
+loss:
+  centering_sharpening:
+    enabled: true
+    center_momentum: 0.9
+    teacher_temperature: 0.06
+    student_temperature: 0.1
+```
+
+When disabled or omitted, training keeps the existing LayerNorm teacher targets
+and Smooth L1 loss. When enabled, masked teacher features are centered by a
+running channel mean and sharpened with softmax; the predictor uses log-softmax
+without centering. Cross-entropy replaces Smooth L1, directly on the existing
+feature channels, with no extra projection head or target LayerNorm. The
+encoder's built-in final normalization remains part of the backbone.
+
+This follows the target/predictor placement and temperatures in
+[S-JEPA, Sections 3 and 4.2](https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/04755.pdf).
+For variable-length frame tokens, the center is one shared channel vector:
+its update averages valid masked target tokens across all GPUs, before repeating
+for context masks. Overlapping target blocks count separately. The loss averages
+each mask/sample equally. Softmax and center arithmetic use float32. Padding
+contributes to neither loss nor center. Each loss uses the previous center;
+the center EMA updates once after the training step.
+
+The center is checkpointed and restored. Resume requires the same enabled loss
+and temperature/momentum settings; old reconstruction checkpoints remain
+resumable with the option disabled. Start a new run/output folder to switch
+objectives. Online evaluation reports `heldout_jepa/cross_entropy` using the
+frozen training center, while raw representation diagnostics remain unchanged.
+Smooth L1/MSE/cosine are additional feature diagnostics in this mode, rather than
+the optimized objective. No negative samples are required.
+
 ## Online representation metrics
 
 The default config evaluates a fixed, seeded subset of up to 1,024 validation
@@ -221,7 +258,7 @@ and near-zero channel count remain useful collapse diagnostics. Rank is a collap
 diagnostic, not evidence of semantic quality on its own.
 
 Held-out JEPA diagnostics compare the online encoder/predictor against the
-normalized EMA target using fixed independent masks: Smooth L1, MSE, cosine
+EMA target (LayerNorm-normalized in the default mode) using fixed independent masks: Smooth L1, MSE, cosine
 similarity, and MSE gain relative to the validation targets' constant mean.
 Smooth L1 weights each mask/sample equally, matching training; MSE and cosine
 weight valid target tokens equally. Padding is excluded everywhere. Evaluation

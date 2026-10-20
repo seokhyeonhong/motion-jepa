@@ -31,6 +31,7 @@ from helper import (
     position_encoding_from_model,
 )
 from mask import MaskCollator1D
+from model.centering_sharpening import CenteredSharpenedLoss, centering_sharpening_config
 from model import MODEL_FACTORIES, PREDICTOR_FACTORIES, TokenLayout
 from mask.utils import (
     apply_index_masks,
@@ -125,7 +126,8 @@ def restore_rng_state(state: dict) -> None:
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
-def _evaluate_online_metrics(evaluator, encoder, predictor, target_encoder, writer, global_step):
+def _evaluate_online_metrics(evaluator, encoder, predictor, target_encoder, writer, global_step,
+                             centering_sharpening=None):
     """Run on rank zero without changing training modes or stochastic state."""
     models = (_unwrapped(encoder), _unwrapped(predictor), target_encoder)
     modes = [model.training for model in models]
@@ -133,14 +135,15 @@ def _evaluate_online_metrics(evaluator, encoder, predictor, target_encoder, writ
     try:
         for model in models:
             model.eval()
-        summary = evaluator.evaluate(*models)
+        kwargs = {} if centering_sharpening is None else {"centering_sharpening": centering_sharpening}
+        summary = evaluator.evaluate(*models, **kwargs)
         if writer is not None:
             for name, value in tensorboard_metrics(summary).items():
                 writer.add_scalar(f"online_metrics/{name}", value, global_step)
             writer.flush()
         logger.info("online_metrics iteration=%d rankme=%.3f heldout_loss=%.6f",
                     global_step, summary["representation"]["raw"]["rankme"],
-                    summary["heldout_jepa"]["smooth_l1"])
+                    summary["heldout_jepa"].get("cross_entropy", summary["heldout_jepa"]["smooth_l1"]))
         return summary
     finally:
         for model, mode in zip(models, modes):
@@ -196,7 +199,7 @@ def _iteration_settings(args: dict) -> tuple[int, int, int, int]:
 
 def _resume_signature(args: dict, batches_per_pass: int) -> dict:
     data = args["data"]
-    return {
+    signature = {
         "optimization": args["optimization"],
         "data": {key: data.get(key) for key in (
             "root_path", "meta_files", "batch_size", "num_frames", "fps",
@@ -204,6 +207,10 @@ def _resume_signature(args: dict, batches_per_pass: int) -> dict:
         "meta": {key: args["meta"].get(key) for key in ("seed", "use_bfloat16", "use_float16")},
         "batches_per_pass": batches_per_pass,
     }
+    settings = centering_sharpening_config(args)
+    if settings is not None:
+        signature["centering_sharpening"] = settings
+    return signature
 
 
 def _save_checkpoint(
@@ -227,6 +234,7 @@ def _save_checkpoint(
     rank: int,
     config: dict,
     architecture: dict | None = None,
+    centering_sharpening=None,
 ) -> None:
     rng_states = all_gather_objects(capture_rng_state())
     mask_states = all_gather_objects(mask_collator.state_dict())
@@ -251,6 +259,8 @@ def _save_checkpoint(
         "config": config,
         "position_encoding": position_encoding_from_model(_unwrapped(encoder)),
     }
+    if centering_sharpening is not None:
+        payload["centering_sharpening"] = centering_sharpening.state_dict()
     if architecture is not None:
         payload["architecture"] = architecture
     _run_rank_zero(lambda: _atomic_torch_save(payload, path), is_main=rank == 0)
@@ -274,6 +284,7 @@ def _load_checkpoint(
     config: dict,
     batches_per_pass: int,
     architecture: dict | None = None,
+    centering_sharpening=None,
 ) -> tuple[int, int, int]:
     # Full training checkpoints contain trusted local Python/NumPy RNG state,
     # optimizer state, and scheduler state in addition to tensor weights.
@@ -283,7 +294,7 @@ def _load_checkpoint(
         raise ValueError("Iteration-based resume requires a new training checkpoint; "
                          "legacy epoch checkpoints cannot be resumed with the new schedules")
     if checkpoint.get("resume_signature") != _resume_signature(config, batches_per_pass):
-        raise ValueError("Resume requires the same iteration schedule, dataset, batch size, seed, and precision")
+        raise ValueError("Resume requires the same iteration schedule, dataset, batch size, seed, precision, and loss settings")
     data_pass = int(checkpoint["data_pass"])
     batch_in_pass = int(checkpoint["batch_in_pass"])
     global_step = int(checkpoint["global_step"])
@@ -305,6 +316,10 @@ def _load_checkpoint(
                 "Checkpoint architecture differs from the requested run: "
                 f"checkpoint={saved_architecture}, requested={architecture}"
             )
+    if centering_sharpening is not None:
+        if "centering_sharpening" not in checkpoint:
+            raise ValueError("Checkpoint has no centering-sharpening state")
+        centering_sharpening.load_state_dict(checkpoint["centering_sharpening"], strict=True)
     encoder.load_state_dict(checkpoint["encoder"], strict=True)
     predictor.load_state_dict(checkpoint["predictor"], strict=True)
     target_encoder.load_state_dict(checkpoint["target_encoder"], strict=True)
@@ -388,6 +403,7 @@ def _seed_all(seed: int, device: torch.device) -> None:
 def main(args: dict, resume_preempt: bool = False, device=None):
     total_steps, warmup_steps, checkpoint_frequency, log_frequency = _iteration_settings(args)
     metric_interval = evaluation_interval(args.get("online_metrics", {}))
+    centering_settings = centering_sharpening_config(args)
     if "context" in args.get("loss", {}):
         raise ValueError("loss.context has been removed; training uses masked prediction loss only")
     device = _resolve_device(device)
@@ -428,6 +444,8 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         )
 
     encoder, predictor = init_mjepa_model_from_config(args, device)
+    centering_sharpening = (CenteredSharpenedLoss(encoder.embed_dim, **centering_settings).to(device)
+                            if centering_settings is not None else None)
     layout = encoder.token_layout
     mask_collator = _build_mask_collator(args, layout)
     architecture = architecture_signature(
@@ -507,6 +525,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             architecture=architecture,
             config=args,
             batches_per_pass=batches_per_pass,
+            centering_sharpening=centering_sharpening,
         )
         logger.info("Resumed %s at iteration=%d", load_path, global_step)
 
@@ -562,7 +581,8 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         if not should_load:
             _run_rank_zero(
                 lambda: _evaluate_online_metrics(online_metrics, encoder, predictor,
-                                                  target_encoder, tensorboard_writer, global_step),
+                                                  target_encoder, tensorboard_writer, global_step,
+                                                  centering_sharpening),
                 is_main=distributed.is_main,
             )
 
@@ -601,15 +621,22 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             with amp_context:
                 with torch.no_grad():
                     target = target_encoder(motion, fps, valid_frames=valid_frames)
-                    target = F.layer_norm(target, (target.shape[-1],))
+                    if centering_sharpening is None:
+                        target = F.layer_norm(target, (target.shape[-1],))
                     target = apply_index_masks(target, masks_pred)
+                    center_target = target
                     target = repeat_mask_blocks(target, len(motion), len(masks_enc))
                 context = encoder(motion, fps, masks_enc, valid_frames=valid_frames)
                 prediction = predictor(context, fps, masks_enc, masks_pred)
-                loss = _prediction_loss(
-                    prediction, target, masks_pred,
-                    num_enc_masks=len(masks_enc),
-                )
+                if centering_sharpening is None:
+                    loss = _prediction_loss(
+                        prediction, target, masks_pred,
+                        num_enc_masks=len(masks_enc),
+                    )
+                else:
+                    center_active = index_mask_validity(masks_pred)
+                    active = repeat_mask_blocks(center_active, len(motion), len(masks_enc))
+                    loss = centering_sharpening(prediction, target, active)
 
             # full precision
             if scaler is None:
@@ -629,6 +656,8 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                 scaler.step(optimizer)
                 scaler.update()
 
+            if centering_sharpening is not None:
+                centering_sharpening.update_center(center_target, center_active)
             momentum = momentum_scheduler.step()
             update_ema(encoder, target_encoder, momentum)
             global_step += 1
@@ -690,7 +719,8 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             if metric_interval and (global_step % metric_interval == 0 or global_step == total_steps):
                 _run_rank_zero(
                     lambda: _evaluate_online_metrics(online_metrics, encoder, predictor,
-                                                      target_encoder, tensorboard_writer, global_step),
+                                                      target_encoder, tensorboard_writer, global_step,
+                                                      centering_sharpening),
                     is_main=distributed.is_main,
                 )
 
@@ -715,6 +745,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                     rank=rank,
                     config=args,
                     architecture=architecture,
+                    centering_sharpening=centering_sharpening,
                 )
                 checkpoint_path = output / f"{log_args['write_tag']}-it{global_step}.pth.tar"
                 _run_rank_zero(

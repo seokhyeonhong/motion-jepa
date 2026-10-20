@@ -21,7 +21,7 @@ logging:
   log_freq: 100
   tensorboard: true
   tensorboard_folder: tensorboard
-  checkpoint_interval: 10000  # Iterations; also saves at the final iteration.
+  checkpoint_interval: 50000  # Iterations; also saves at the final iteration.
 
 mask:
   context_selection: random  # all | prefix | random
@@ -52,6 +52,14 @@ optimization:
   warmup_iterations: 20000
   weight_decay: 0.04
   clip_grad: 1.0
+
+# S-JEPA-style channel-distribution matching; disabled keeps Smooth L1.
+loss:
+  centering_sharpening:
+    enabled: false
+    center_momentum: 0.9
+    teacher_temperature: 0.06
+    student_temperature: 0.1
 
 online_metrics:
   enabled: true
