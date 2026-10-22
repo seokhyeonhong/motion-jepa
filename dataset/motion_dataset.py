@@ -12,6 +12,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from motion_rep.registry import get_representation
+
 
 NPY_FORMAT = "motion_jepa_npy_v1"
 
@@ -35,15 +37,20 @@ class MotionDataset(torch.utils.data.Dataset):
         meta_files: str | list[str],
         num_frames: int,
         fps: int,
-        motion_dim: int = 366,
+        motion_dim: int | None = None,
         normalize: bool = False,
         stats_path: str | Path | None = None,
+        representation: str = "MotionJEPAMotionRep",
     ) -> None:
         self.root_path = Path(root_path)
         self.meta_files = [meta_files] if isinstance(meta_files, str) else list(meta_files)
         self.num_frames = int(num_frames)
         self.fps = int(fps)
-        self.motion_dim = int(motion_dim)
+        rep = get_representation(representation)
+        self.representation = rep.FORMAT_NAME
+        self.motion_dim = rep.FEATURE_DIM if motion_dim is None else int(motion_dim)
+        if self.motion_dim != rep.FEATURE_DIM:
+            raise ValueError(f"{representation} requires motion_dim={rep.FEATURE_DIM}, got {self.motion_dim}")
         self.normalize = bool(normalize)
         self.dataset_min_frames: int | None = None
         self._validate_dataset_metadata()
@@ -93,7 +100,7 @@ class MotionDataset(torch.utils.data.Dataset):
                     f"[1, {self.num_frames}]"
                 )
         expected = {
-            "representation": self.REPRESENTATION,
+            "representation": self.representation,
             "motion_storage": "npy_float32_v1",
             "motion_dim": self.motion_dim,
             "num_frames": self.num_frames,
@@ -143,7 +150,7 @@ class MotionDataset(torch.utils.data.Dataset):
             "format": NPY_FORMAT,
             "split": split,
             "dtype": "float32",
-            "representation": self.REPRESENTATION,
+            "representation": self.representation,
             "fps": self.fps,
             "num_frames": self.num_frames,
             "motion_dim": self.motion_dim,
@@ -248,7 +255,7 @@ def make_motion_dataset(
     batch_size,
     num_frames,
     fps,
-    motion_dim=366,
+    motion_dim=None,
     normalize=False,
     stats_path=None,
     rank=0,
@@ -259,6 +266,7 @@ def make_motion_dataset(
     pin_mem=True,
     persistent_workers=True,
     seed=0,
+    representation="MotionJEPAMotionRep",
 ):
     dataset = MotionDataset(
         root_path=root_path,
@@ -268,6 +276,7 @@ def make_motion_dataset(
         motion_dim=motion_dim,
         normalize=normalize,
         stats_path=stats_path,
+        representation=representation,
     )
     if not dataset:
         raise ValueError(f"No valid MotionJEPA samples found under {root_path}")

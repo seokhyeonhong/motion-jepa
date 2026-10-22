@@ -30,7 +30,10 @@ from dataset.preprocess_bones_seed import (  # noqa: E402
     finalize_processed_dataset,
     round_fps,
 )
-from motion_rep import MotionJEPAMotionRep  # noqa: E402
+from motion_rep.registry import (get_representation, add_representation_argument,
+                                 validate_representation_output)  # noqa: E402
+
+_REPRESENTATION = get_representation()
 from skeleton import SOMASkeleton30, parse_bvh_motion  # noqa: E402
 
 
@@ -161,7 +164,10 @@ def _init_worker(
     num_frames: int,
     fps: int,
     stride_frames: int,
+    representation: str = "MotionJEPAMotionRep",
 ) -> None:
+    global _REPRESENTATION
+    _REPRESENTATION = get_representation(representation)
     global _INPUT_DIR, _OUTPUT_ROOT, _NUM_FRAMES, _FPS, _STRIDE_FRAMES
     global _TARGET_SKELETON, _THREAD_CONFIG_PID
     _INPUT_DIR = Path(input_dir)
@@ -266,7 +272,7 @@ def _convert_one(source: SourceMotion) -> dict[str, Any]:
         # Applying SOMASkeleton77.to_standard_tpose() here would rotate them a
         # second time and produce an invalid pose.
         local_rotations = _TARGET_SKELETON.from_soma77(local_rotations)
-        representation = MotionJEPAMotionRep(_TARGET_SKELETON, _FPS)
+        representation = _REPRESENTATION(_TARGET_SKELETON, _FPS)
         metadata = _record_metadata(source)
         records: list[dict[str, Any]] = []
         for segment_index, (start_frame, end_frame) in enumerate(windows):
@@ -278,7 +284,7 @@ def _convert_one(source: SourceMotion) -> dict[str, Any]:
             motion = np.ascontiguousarray(
                 features.detach().cpu().numpy(), dtype=np.float32
             )
-            expected = (_NUM_FRAMES, MotionJEPAMotionRep.FEATURE_DIM)
+            expected = (_NUM_FRAMES, _REPRESENTATION.FEATURE_DIM)
             if motion.shape != expected:
                 raise ValueError(
                     f"unexpected feature shape {motion.shape}, expected {expected}"
@@ -337,6 +343,7 @@ def _ordered_results(
         args.num_frames,
         args.fps,
         calculate_stride(args.num_frames, args.overlap),
+        getattr(args, "representation", "MotionJEPAMotionRep"),
     )
     worker_count = min(max(1, int(args.workers)), len(sources))
     if worker_count == 1:
@@ -367,6 +374,7 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 
 def preprocess(args: argparse.Namespace) -> None:
+    validate_representation_output(args)
     args.input_dir = Path(args.input_dir).resolve()
     args.output = Path(args.output).resolve()
     args.manifest = (
@@ -445,6 +453,7 @@ def preprocess(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_representation_argument(parser)
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(

@@ -23,7 +23,7 @@ Outputs include latest/best checkpoints, configuration, iteration metrics, and a
 summary. `--resume` restores optimizer, scheduler, and RNG state and requires
 the same dataset, architecture, and recipe. Findings are written only when
 `--findings-root` is explicitly supplied; use a sequential numbered directory
-when requesting a findings report (for example, `findings/001-segmentation-base`).
+when requesting a findings report (for example, `findings/segmentation/000-base`).
 
 ## Frozen attentive probing
 

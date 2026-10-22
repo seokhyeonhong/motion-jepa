@@ -216,6 +216,7 @@ class OnlineRepresentationMetrics:
             meta_files=[str(metric_config.get("meta_file", "val.txt"))],
             num_frames=int(data["num_frames"]), fps=int(data["fps"]),
             motion_dim=int(data["motion_dim"]),
+            representation=data.get("representation", "MotionJEPAMotionRep"),
             normalize=bool(data.get("normalize", False)), stats_path=data.get("stats_path"),
         )
         count = min(self.num_samples, len(self.dataset))

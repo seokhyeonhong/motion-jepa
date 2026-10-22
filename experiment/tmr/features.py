@@ -145,6 +145,7 @@ def _raw_dataset(root, split, paired, stats_root):
     return MotionDataset(
         root, f"{split}.txt", provenance["num_frames"], provenance["fps"],
         motion_dim=provenance["raw_motion_dim"], normalize=True, stats_path=stats_root,
+        representation=provenance.get("representation", "MotionJEPAMotionRep"),
     )
 
 

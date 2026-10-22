@@ -207,6 +207,9 @@ def _resume_signature(args: dict, batches_per_pass: int) -> dict:
         "meta": {key: args["meta"].get(key) for key in ("seed", "use_bfloat16", "use_float16")},
         "batches_per_pass": batches_per_pass,
     }
+    # Old checkpoints implicitly used the original representation.
+    if data.get("representation") in ("LocalMotionJEPARep", "local_motion_jepa_365_v1"):
+        signature["data"]["representation"] = "local_motion_jepa_365_v1"
     settings = centering_sharpening_config(args)
     if settings is not None:
         signature["centering_sharpening"] = settings
@@ -462,6 +465,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         num_frames=int(data_args["num_frames"]),
         fps=int(data_args["fps"]),
         motion_dim=int(data_args["motion_dim"]),
+        representation=data_args.get("representation", "MotionJEPAMotionRep"),
         normalize=bool(data_args.get("normalize", False)),
         stats_path=data_args.get("stats_path"),
         rank=rank,

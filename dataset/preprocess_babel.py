@@ -31,7 +31,10 @@ from dataset.preprocess_bones_seed import (  # noqa: E402
     finalize_processed_dataset,
     round_fps,
 )
-from motion_rep import MotionJEPAMotionRep  # noqa: E402
+from motion_rep.registry import (get_representation, add_representation_argument,
+                                 validate_representation_output)  # noqa: E402
+
+_REPRESENTATION = get_representation()
 from skeleton import SOMASkeleton30, parse_bvh_motion  # noqa: E402
 
 
@@ -377,7 +380,9 @@ def build_work_items(
     return works, skips, dict(counts)
 
 
-def _init_worker(input_dir: str, output_root: str, min_frames: int = FPS) -> None:
+def _init_worker(input_dir: str, output_root: str, min_frames: int = FPS, representation: str = "MotionJEPAMotionRep") -> None:
+    global _REPRESENTATION
+    _REPRESENTATION = get_representation(representation)
     global _INPUT_DIR, _OUTPUT_ROOT, _TARGET_SKELETON, _THREAD_CONFIG_PID, _MIN_FRAMES
     _INPUT_DIR = Path(input_dir)
     _OUTPUT_ROOT = Path(output_root)
@@ -460,7 +465,7 @@ def _convert_one(work: SourceWork, class_names: tuple[str, ...]) -> dict[str, An
                 f"manifest has {manifest_frames} frames but BVH has {len(rotations)}"
             )
         rotations = _TARGET_SKELETON.from_soma77(rotations)
-        representation = MotionJEPAMotionRep(_TARGET_SKELETON, FPS)
+        representation = _REPRESENTATION(_TARGET_SKELETON, FPS)
         records: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         common_metadata = _conversion_metadata(conversion)
@@ -501,7 +506,7 @@ def _convert_one(work: SourceWork, class_names: tuple[str, ...]) -> dict[str, An
                 rotations[start:end], roots[start:end], to_canonicalize=True
             )
             motion = np.ascontiguousarray(features.detach().cpu().numpy(), dtype=np.float32)
-            if motion.shape != (end - start, MotionJEPAMotionRep.FEATURE_DIM):
+            if motion.shape != (end - start, _REPRESENTATION.FEATURE_DIM):
                 raise ValueError(f"unexpected encoded shape: {motion.shape}")
             if not np.isfinite(motion).all():
                 raise ValueError("encoded representation contains NaN or infinity")
@@ -584,7 +589,7 @@ def _ordered_results(
 ) -> Iterator[dict[str, Any]]:
     if not works:
         return
-    init_args = (str(args.input_dir), str(args.output), args.min_frames)
+    init_args = (str(args.input_dir), str(args.output), args.min_frames, getattr(args, "representation", "MotionJEPAMotionRep"))
     workers = min(max(1, int(args.workers)), len(works))
     if workers == 1:
         _init_worker(*init_args)
@@ -613,6 +618,7 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 
 def preprocess(args: argparse.Namespace) -> None:
+    validate_representation_output(args)
     args.input_dir = Path(args.input_dir).resolve()
     args.annotations_dir = Path(args.annotations_dir).resolve()
     args.labels_dir = Path(args.labels_dir).resolve()
@@ -764,6 +770,7 @@ def preprocess(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_representation_argument(parser)
     parser.add_argument("--subset", type=int, choices=(60, 120), required=True)
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--manifest", type=Path, help="Defaults to <input-dir>/conversion_manifest.jsonl.")

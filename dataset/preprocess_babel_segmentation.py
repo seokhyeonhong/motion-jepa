@@ -30,7 +30,10 @@ from dataset.preprocess_bones_seed import (  # noqa: E402
     SPLITS, _prepare_output, _save_record_motion, _validate_complete_dataset,
     finalize_processed_dataset, round_fps,
 )
-from motion_rep import MotionJEPAMotionRep  # noqa: E402
+from motion_rep.registry import (get_representation, add_representation_argument,
+                                 validate_representation_output)  # noqa: E402
+
+_REPRESENTATION = get_representation()
 from skeleton import SOMASkeleton30, parse_bvh_motion  # noqa: E402
 
 FPS = 30
@@ -105,7 +108,9 @@ def build_work_items(input_dir: Path, annotations_dir: Path, conversions: dict, 
     return works, errors, dict(counts)
 
 
-def _init_worker(input_dir: Path, output: Path, class_names: tuple[str, ...]):
+def _init_worker(input_dir: Path, output: Path, class_names: tuple[str, ...], representation: str = "MotionJEPAMotionRep"):
+    global _REPRESENTATION
+    _REPRESENTATION = get_representation(representation)
     global _INPUT, _OUTPUT, _SKELETON, _CLASSES
     torch.set_num_threads(1)
     try:
@@ -157,7 +162,7 @@ def _convert_source(work: dict):
         if int(conversion["output_num_frames"]) != len(rotations):
             raise ValueError("BVH frame count differs from conversion manifest")
         rotations = _SKELETON.from_soma77(rotations)
-        representation = MotionJEPAMotionRep(_SKELETON, FPS)
+        representation = _REPRESENTATION(_SKELETON, FPS)
         records = []
         dropped_tail_frames = 0
         for window_index, start in enumerate(range(0, len(rotations), NUM_FRAMES)):
@@ -167,7 +172,7 @@ def _convert_source(work: dict):
                 continue
             sample_id = f"{work['sid']:05d}/window_{window_index:04d}"
             motion = representation(rotations[start:end], roots[start:end], to_canonicalize=True)
-            if tuple(motion.shape) != (end - start, 366) or not torch.isfinite(motion).all():
+            if tuple(motion.shape) != (end - start, _REPRESENTATION.FEATURE_DIM) or not torch.isfinite(motion).all():
                 raise ValueError("Invalid encoded motion")
             label_relative = Path("labels") / work["split"] / f"{sample_id}.npz"
             label_path = _OUTPUT / label_relative
@@ -178,7 +183,7 @@ def _convert_source(work: dict):
                 "id": sample_id, "source_id": str(work["sid"]), "babel_sid": work["sid"],
                 "split": work["split"], "source_amass_relpath": work["source"],
                 "source_path": conversion["output_relpath"], "start_frame": start, "end_frame": end,
-                "fps": FPS, "length": end - start, "motion_dim": 366,
+                "fps": FPS, "length": end - start, "motion_dim": _REPRESENTATION.FEATURE_DIM,
                 "labels_path": label_relative.as_posix(), "labels_sha256": file_sha256(label_path),
                 "supervised_frames": int(supervision[start:end].sum()),
                 "frame_counts": {name: int(value[start:end].sum()) for name, value in flags.items()},
@@ -197,6 +202,7 @@ def _convert_source(work: dict):
 
 
 def preprocess(args: argparse.Namespace):
+    validate_representation_output(args)
     args.input_dir = Path(args.input_dir).resolve()
     args.annotations_dir = Path(args.annotations_dir).resolve()
     args.output = Path(args.output).resolve()
@@ -223,7 +229,9 @@ def preprocess(args: argparse.Namespace):
         if any(previous.get(key) != value for key, value in provenance.items()):
             raise ValueError("Existing segmentation provenance mismatch; use a new output directory")
         for split in SPLITS:
-            dataset = BabelSegmentationDataset(args.output, split, normalize=False)
+            dataset = BabelSegmentationDataset(args.output, split, normalize=False,
+                representation=getattr(args, "representation", "MotionJEPAMotionRep"),
+                motion_dim=get_representation(getattr(args, "representation", "MotionJEPAMotionRep")).FEATURE_DIM)
             for index in range(len(dataset)):
                 dataset[index]
         print(f"Reusing verified BABEL segmentation dataset: {args.output}")
@@ -236,7 +244,7 @@ def preprocess(args: argparse.Namespace):
     records = {split: [] for split in SPLITS}
     success = {split: 0 for split in SPLITS}
     dropped = Counter()
-    init_args = (args.input_dir, args.output, class_names)
+    init_args = (args.input_dir, args.output, class_names, getattr(args, "representation", "MotionJEPAMotionRep"))
     if args.workers == 1:
         _init_worker(*init_args)
         results = map(_convert_source, works)
@@ -295,7 +303,9 @@ def preprocess(args: argparse.Namespace):
     metadata["index_sha256"] = file_sha256(args.output / "index.json")
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n")
     for split in SPLITS:
-        dataset = BabelSegmentationDataset(args.output, split, normalize=False)
+        dataset = BabelSegmentationDataset(args.output, split, normalize=False,
+                representation=getattr(args, "representation", "MotionJEPAMotionRep"),
+                motion_dim=get_representation(getattr(args, "representation", "MotionJEPAMotionRep")).FEATURE_DIM)
         for index in range(len(dataset)):
             dataset[index]
     print(json.dumps({"frame_counts": frame_counts, "index_sha256": metadata["index_sha256"]}, indent=2))
@@ -304,6 +314,7 @@ def preprocess(args: argparse.Namespace):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
+    add_representation_argument(parser)
     parser.add_argument("--input-dir", type=Path, default=PROJECT_ROOT / "dataset/amass-soma77")
     parser.add_argument("--annotations-dir", type=Path, default=PROJECT_ROOT / "dataset/babel-annotation")
     parser.add_argument("--action-label-map", type=Path,

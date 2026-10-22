@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import torch
+from motion_rep.registry import get_representation
 from model import MODEL_FACTORIES, PREDICTOR_FACTORIES, TokenLayout
 from utils.schedulers import CosineWDSchedule, WarmupCosineSchedule
 
@@ -31,6 +32,12 @@ def normalize_architecture_signature(signature: dict) -> dict:
 
 
 def _validate_config(config: dict) -> None:
+    data = config.get("data", {})
+    if "representation" in data:
+        rep = get_representation(data["representation"])
+        if "motion_dim" in data and int(data["motion_dim"]) != rep.FEATURE_DIM:
+            raise ValueError(f"{data['representation']} requires motion_dim={rep.FEATURE_DIM}")
+        data["motion_dim"] = rep.FEATURE_DIM
     for option in ("position_encoding", "patch"):
         if option in config:
             raise ValueError(f"{option} configuration has been removed; JEPA uses frame tokens with fixed RoPE")

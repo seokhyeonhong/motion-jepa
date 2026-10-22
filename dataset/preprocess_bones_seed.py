@@ -31,7 +31,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from motion_rep import MotionJEPAMotionRep  # noqa: E402
+from motion_rep.registry import (get_representation, add_representation_argument,
+                                 validate_representation_output)  # noqa: E402
+
+_REPRESENTATION = get_representation()
 from skeleton import SOMASkeleton30, SOMASkeleton77, parse_bvh_motion  # noqa: E402
 
 
@@ -218,7 +221,10 @@ def _init_worker(
     fps: int,
     stride_frames: int,
     min_frames: int = 60,
+    representation: str = "MotionJEPAMotionRep",
 ) -> None:
+    global _REPRESENTATION
+    _REPRESENTATION = get_representation(representation)
     global _DATASET_ROOT, _OUTPUT_ROOT, _NUM_FRAMES, _MIN_FRAMES, _FPS, _STRIDE_FRAMES
     global _SOURCE_SKELETON, _TARGET_SKELETON, _THREAD_CONFIG_PID
     _DATASET_ROOT = Path(dataset_root)
@@ -271,7 +277,7 @@ def _convert_one(item: WorkItem) -> dict[str, Any]:
             }
         local_rotations, _ = _SOURCE_SKELETON.to_standard_tpose(local_rotations)
         local_rotations = _TARGET_SKELETON.from_soma77(local_rotations)
-        motion_rep = MotionJEPAMotionRep(_TARGET_SKELETON, fps)
+        motion_rep = _REPRESENTATION(_TARGET_SKELETON, fps)
         segmented = num_source_frames > _NUM_FRAMES
         records: list[dict[str, Any]] = []
         for segment_index, (start_frame, end_frame) in enumerate(clips):
@@ -283,7 +289,7 @@ def _convert_one(item: WorkItem) -> dict[str, Any]:
             motion = np.ascontiguousarray(
                 features.detach().cpu().numpy(), dtype=np.float32
             )
-            expected = (end_frame - start_frame, MotionJEPAMotionRep.FEATURE_DIM)
+            expected = (end_frame - start_frame, _REPRESENTATION.FEATURE_DIM)
             if motion.shape != expected:
                 raise ValueError(f"Unexpected feature shape {motion.shape}, expected {expected}")
             if not np.isfinite(motion).all():
@@ -379,6 +385,7 @@ def _ordered_results(items: list[WorkItem], args: argparse.Namespace) -> Iterato
         args.fps,
         calculate_stride(args.num_frames, args.overlap),
         args.min_frames,
+        getattr(args, "representation", "MotionJEPAMotionRep"),
     )
     worker_count = min(max(1, int(args.workers)), len(items))
     if worker_count == 1:
@@ -434,13 +441,13 @@ def _manifest(
         "motion_root": f"motions/{split}",
         "num_samples": len(records),
         "dtype": "float32",
-        "representation": MotionJEPAMotionRep.FORMAT_NAME,
+        "representation": get_representation(getattr(args, "representation", "MotionJEPAMotionRep")).FORMAT_NAME,
         "fps": args.fps,
         "num_frames": args.num_frames,
         "min_frames": args.min_frames,
         "preprocessing_version": preprocessing_version,
         "segmentation": segmentation,
-        "motion_dim": MotionJEPAMotionRep.FEATURE_DIM,
+        "motion_dim": get_representation(getattr(args, "representation", "MotionJEPAMotionRep")).FEATURE_DIM,
         "values": "npy_valid_frames_row_major",
         "split_index": f"{split}.txt",
         "split_sha256": hashlib.sha256(split_path.read_bytes()).hexdigest(),
@@ -493,6 +500,9 @@ def _validate_complete_dataset(
     """Return whether output is a complete, internally consistent NPY dataset."""
     try:
         metadata = json.loads((output / "meta.json").read_text(encoding="utf-8"))
+        rep = get_representation(metadata.get("representation"))
+        if metadata.get("motion_dim") != rep.FEATURE_DIM:
+            return False
         if metadata.get("motion_storage") != "npy_float32_v1":
             return False
         if metadata.get("preprocessing_version") != preprocessing_version:
@@ -535,7 +545,7 @@ def _validate_complete_dataset(
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             if manifest.get("format") != NPY_FORMAT:
                 return False
-            for key in ("num_frames", "min_frames", "preprocessing_version", "segmentation"):
+            for key in ("representation", "motion_dim", "num_frames", "min_frames", "preprocessing_version", "segmentation"):
                 if manifest.get(key) != metadata.get(key):
                     return False
             if manifest.get("split_sha256") != hashlib.sha256(split_path.read_bytes()).hexdigest():
@@ -613,12 +623,12 @@ def finalize_processed_dataset(
     _write_json(args.output / "index.json", all_records)
     metadata = {
         "source_dataset": source_dataset,
-        "representation": MotionJEPAMotionRep.FORMAT_NAME,
+        "representation": get_representation(getattr(args, "representation", "MotionJEPAMotionRep")).FORMAT_NAME,
         "producer": "motion-jepa",
         "motion_storage": "npy_float32_v1",
         "split_format": "sample_id,relative_npy_path,fps,actual_length",
         "skeleton": "soma30",
-        "motion_dim": MotionJEPAMotionRep.FEATURE_DIM,
+        "motion_dim": get_representation(getattr(args, "representation", "MotionJEPAMotionRep")).FEATURE_DIM,
         "fps": args.fps,
         "num_frames": args.num_frames,
         "min_frames": args.min_frames,
@@ -680,6 +690,7 @@ def finalize_processed_dataset(
 
 def preprocess(args: argparse.Namespace) -> None:
     """Write a complete NPY-backed dataset directly to its final directory."""
+    validate_representation_output(args)
     _validate_config(args)
     args.dataset_root = Path(args.dataset_root).resolve()
     args.splits_root = Path(args.splits_root).resolve()
@@ -756,6 +767,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert BONES-SEED SOMA BVHs to variable-length MotionJEPA v2 NPY clips."
     )
+    add_representation_argument(parser)
     parser.add_argument(
         "--dataset_root",
         type=Path,

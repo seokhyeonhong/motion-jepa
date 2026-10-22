@@ -33,8 +33,9 @@ class BabelSegmentationDataset(MotionDataset):
 
     def __init__(
         self, root: str | Path, split: str, *, num_frames: int = 150,
-        fps: int = 30, motion_dim: int = 366, stats_root: str | Path | None = None,
+        fps: int = 30, motion_dim: int | None = None, stats_root: str | Path | None = None,
         normalize: bool = True,
+        representation: str = "MotionJEPAMotionRep",
     ) -> None:
         if split not in {"train", "val", "test"}:
             raise ValueError(f"Unknown BABEL segmentation split: {split}")
@@ -73,6 +74,7 @@ class BabelSegmentationDataset(MotionDataset):
         super().__init__(
             root_path=self.root, meta_files=f"{split}.txt", num_frames=num_frames,
             fps=fps, motion_dim=motion_dim, normalize=normalize, stats_path=stats_root,
+            representation=representation,
         )
         self.records = []
         for entry in self.entries:

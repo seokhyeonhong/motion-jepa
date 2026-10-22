@@ -100,6 +100,7 @@ def run(args):
         split: BabelSegmentationDataset(
             root, split, num_frames=meta["num_frames"], fps=meta["fps"],
             motion_dim=meta["motion_dim"], stats_root=root / "stats",
+            representation=meta.get("representation", "MotionJEPAMotionRep"),
             normalize=args.mode == "supervised",
         )
         for split in ("train", "val", "test")
@@ -320,9 +321,9 @@ def build_parser():
     )
     parser.add_argument("--iterations", type=int, default=30000)
     parser.add_argument("--warmup-iterations", type=int, default=1500)
-    parser.add_argument("--eval-interval", type=int, default=300)
-    parser.add_argument("--checkpoint-interval", type=int, default=300)
-    parser.add_argument("--log-freq", type=int, default=300)
+    parser.add_argument("--eval-interval", type=int, default=3000)
+    parser.add_argument("--checkpoint-interval", type=int, default=3000)
+    parser.add_argument("--log-freq", type=int, default=30)
     parser.add_argument("--start-lr", type=float, default=0.)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-batch-size", type=int, default=256)

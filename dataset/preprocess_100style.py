@@ -34,7 +34,10 @@ from dataset.preprocess_bones_seed import (  # noqa: E402
     resample_motion_fps,
     round_fps,
 )
-from motion_rep import MotionJEPAMotionRep  # noqa: E402
+from motion_rep.registry import (get_representation, add_representation_argument,
+                                 validate_representation_output)  # noqa: E402
+
+_REPRESENTATION = get_representation()
 from skeleton import SOMASkeleton30, parse_bvh_motion  # noqa: E402
 
 
@@ -311,7 +314,9 @@ def _absolute_source_path(source: SourceMotion, dataset_root: Path | None) -> Pa
     return root / source.bvh_path
 
 
-def _init_worker(dataset_root: str, output_root: str, fps: int) -> None:
+def _init_worker(dataset_root: str, output_root: str, fps: int, representation: str = "MotionJEPAMotionRep") -> None:
+    global _REPRESENTATION
+    _REPRESENTATION = get_representation(representation)
     global _DATASET_ROOT, _OUTPUT_ROOT, _FPS
     global _TARGET_SKELETON, _THREAD_CONFIG_PID
     _DATASET_ROOT = Path(dataset_root)
@@ -358,7 +363,7 @@ def _convert_source(item: PlannedSource) -> dict[str, Any]:
         # 100STYLE_soma77 is already expressed on the standard SOMA77 skeleton.
         # Applying the SOMA77 rest-pose offsets again would double-transform it.
         local_rotations = _TARGET_SKELETON.from_soma77(local_rotations)
-        motion_rep = MotionJEPAMotionRep(_TARGET_SKELETON, fps)
+        motion_rep = _REPRESENTATION(_TARGET_SKELETON, fps)
         records = []
         for window in item.windows:
             features = motion_rep(
@@ -367,7 +372,7 @@ def _convert_source(item: PlannedSource) -> dict[str, Any]:
                 to_canonicalize=True,
             )
             motion = np.ascontiguousarray(features.detach().cpu().numpy(), dtype=np.float32)
-            expected = (window.end_frame - window.start_frame, MotionJEPAMotionRep.FEATURE_DIM)
+            expected = (window.end_frame - window.start_frame, _REPRESENTATION.FEATURE_DIM)
             if motion.shape != expected:
                 raise ValueError(f"Unexpected feature shape {motion.shape}, expected {expected}")
             if not np.isfinite(motion).all():
@@ -427,7 +432,7 @@ def _ordered_results(
 ) -> Iterator[dict[str, Any]]:
     if not items:
         return
-    init_args = (str(args.dataset_root), str(args.output), args.fps)
+    init_args = (str(args.dataset_root), str(args.output), args.fps, getattr(args, "representation", "MotionJEPAMotionRep"))
     worker_count = min(max(1, int(args.workers)), len(items))
     if worker_count == 1:
         _init_worker(*init_args)
@@ -472,6 +477,7 @@ def _validate_config(args: argparse.Namespace) -> None:
 
 def preprocess(args: argparse.Namespace) -> None:
     """Discover, split, convert, and finalize the 100STYLE NPY dataset."""
+    validate_representation_output(args)
     _validate_config(args)
     args.dataset_root = Path(args.dataset_root).resolve()
     args.frame_cuts = (
@@ -625,6 +631,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert 100STYLE SOMA77 BVHs to shuffled MotionJEPA NPY windows."
     )
+    add_representation_argument(parser)
     parser.add_argument(
         "--dataset_root",
         type=Path,

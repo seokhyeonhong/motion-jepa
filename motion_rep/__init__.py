@@ -2,4 +2,6 @@
 
 from .reps import MotionJEPAMotionRep, MotionJEPARepresentation, MotionRepBase
 
-__all__ = ["MotionJEPAMotionRep", "MotionJEPARepresentation", "MotionRepBase"]
+from .reps.local_motion_jepa_rep import LocalMotionJEPARep
+
+__all__ = ["LocalMotionJEPARep", "MotionJEPAMotionRep", "MotionJEPARepresentation", "MotionRepBase"]

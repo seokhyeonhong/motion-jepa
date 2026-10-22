@@ -1,0 +1,72 @@
+# Frame-token JEPA with built-in RoPE and length-aware masking.
+data:
+  batch_size: 512  # Per rank; global batch is batch_size * world_size.
+  root_path: ./dataset/bones-seed-local-processed-nframes150-min60
+  meta_files:
+    - train.txt
+  num_workers: 8
+  pin_mem: true
+  persistent_workers: true
+  drop_last: true
+  num_frames: 150
+  fps: 30
+  representation: LocalMotionJEPARep
+  motion_dim: 365
+  num_joints: 30
+  normalize: true
+  stats_path: stats
+
+logging:
+  folder: ./output/mot_base_1d-local-bs.512-it.200000-nframes60-150
+  write_tag: motion-jepa-1d
+  log_freq: 100
+  tensorboard: true
+  tensorboard_folder: tensorboard
+  checkpoint_interval: 50000  # Iterations; also saves at the final iteration.
+
+mask:
+  context_selection: random  # all | prefix | random
+  min_context_tokens: 1
+  min_context_ratio: 0.2  # Minimum valid context fraction for each sample.
+  allow_overlap: false
+  num_enc_masks: 1
+  num_pred_masks: 4
+  enc_frame_mask_ratio: [0.85, 1.0]
+  pred_frame_mask_ratio: [0.15, 0.2]
+
+meta:
+  seed: 0
+  load_checkpoint: false
+  read_checkpoint: null
+  model_name: mot_base_1d
+  predictor_name: mot_predictor_base_1d
+  use_bfloat16: true
+  use_float16: false
+
+optimization:
+  ema: [0.99925, 0.99925]
+  iterations: 200000
+  final_lr: 1.0e-6
+  final_weight_decay: 0.04
+  lr: 0.0005
+  start_lr: 0.0001
+  warmup_iterations: 20000
+  weight_decay: 0.04
+  clip_grad: 1.0
+
+# S-JEPA-style channel-distribution matching; disabled keeps Smooth L1.
+loss:
+  centering_sharpening:
+    enabled: false
+    center_momentum: 0.9
+    teacher_temperature: 0.06
+    student_temperature: 0.1
+
+online_metrics:
+  enabled: true
+  interval: 1000  # Iterations; also evaluates at initialization and completion.
+  meta_file: val.txt
+  num_samples: 1024
+  batch_size: 64
+  num_workers: 0
+  seed: 42

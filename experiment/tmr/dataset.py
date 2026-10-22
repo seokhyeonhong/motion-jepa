@@ -13,6 +13,7 @@ import torch
 from torch.utils.data import Dataset
 
 from dataset import MotionDataset
+from motion_rep.registry import get_representation
 from experiment.utils import _sha256_file
 
 
@@ -97,8 +98,9 @@ def build_paired_index(
         raise ValueError("max_samples_per_split must be positive")
     metadata = json.loads((root / "meta.json").read_text())
     fps, num_frames = int(metadata["fps"]), int(metadata["num_frames"])
-    if metadata.get("representation") != MotionDataset.REPRESENTATION:
-        raise ValueError("TMR requires a MotionJEPA raw representation dataset")
+    rep = get_representation(metadata.get("representation"))
+    if metadata.get("motion_dim") != rep.FEATURE_DIM:
+        raise ValueError("TMR dataset representation and motion_dim disagree")
     events_by_filename = {}
     with annotations.open(encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
@@ -166,6 +168,7 @@ def build_paired_index(
         "max_samples_per_split": max_samples_per_split,
         "fps": fps, "num_frames": num_frames,
         "raw_motion_dim": int(metadata["motion_dim"]),
+        "representation": rep.FORMAT_NAME,
     }
     return {
         "records": records, "catalog": catalog, "provenance": provenance,
