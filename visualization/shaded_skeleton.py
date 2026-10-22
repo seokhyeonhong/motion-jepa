@@ -61,6 +61,7 @@ class ShadedSkeletonRenderer:
         joint_radius: float = 0.025,
         finger_joint_radius: float = 0.015,
         bone_radius: float = 0.012,
+        prefix: str = "/motion_jepa",
     ):
         self.scene = scene
         self.skeleton = skeleton or SOMASkeleton77()
@@ -85,7 +86,7 @@ class ShadedSkeletonRenderer:
         identity = np.zeros((len(self.parents), 4), dtype=np.float32)
         identity[:, 0] = 1.0
         self.joints = scene.add_batched_meshes_simple(
-            "/motion_jepa/joints",
+            f"{prefix}/joints",
             vertices=np.asarray(sphere.vertices, dtype=np.float32),
             faces=np.asarray(sphere.faces, dtype=np.int32),
             batched_wxyzs=identity,
@@ -98,7 +99,7 @@ class ShadedSkeletonRenderer:
             visible=visible,
         )
         self.bones = scene.add_batched_meshes_simple(
-            "/motion_jepa/bones",
+            f"{prefix}/bones",
             vertices=np.asarray(cylinder.vertices, dtype=np.float32),
             faces=np.asarray(cylinder.faces, dtype=np.int32),
             batched_wxyzs=orientations,

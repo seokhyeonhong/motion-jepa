@@ -56,6 +56,10 @@ class LocalMotionJEPARep(MotionRepBase):
             root_positions = root_positions.unsqueeze(0)
         if local_rotations.shape[1] == 0:
             raise ValueError("Motion must contain at least one frame.")
+        # BVH rotations may be float64 while root positions are float32.
+        dtype = torch.promote_types(local_rotations.dtype, root_positions.dtype)
+        local_rotations = local_rotations.to(dtype=dtype)
+        root_positions = root_positions.to(dtype=dtype)
         global_rotations, global_positions, _ = self.skeleton.fk(
             local_rotations, root_positions
         )
@@ -95,6 +99,52 @@ class LocalMotionJEPARep(MotionRepBase):
             dim=-1,
         )
         return features[0] if unbatched else features
+
+    def from_global_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Convert unnormalized 366D features without FK or BVH parsing.
+
+        Accepts [T, 366] or [B, T, 366] valid-frame tensors. Existing global
+        velocities are rotated, not recomputed from quantized positions.
+        """
+        from .motion_jepa_motionrep import MotionJEPAMotionRep as Global
+
+        if features.ndim not in (2, 3) or features.shape[-1] != Global.FEATURE_DIM:
+            raise ValueError("Expected [T, 366] or [B, T, 366] features.")
+        if features.shape[-2] == 0 or not torch.is_floating_point(features):
+            raise ValueError("Features must be nonempty floating-point motions.")
+        if not torch.isfinite(features).all():
+            raise ValueError("Features contain NaN or infinity.")
+        unbatched = features.ndim == 2
+        if unbatched:
+            features = features.unsqueeze(0)
+        batch, frames = features.shape[:2]
+        heading = features[..., Global.ROOT_HEADING]
+        if not torch.allclose(heading.square().sum(-1), torch.ones_like(heading[..., 0]),
+                              atol=1e-4, rtol=1e-4):
+            raise ValueError("Expected unnormalized unit heading features.")
+        angle = torch.atan2(heading[..., 1], heading[..., 0])
+        rotation = y_rotation(-angle)
+        height = features[..., 1:2]
+        positions = features[..., Global.LOCAL_POSITIONS].reshape(batch, frames, 29, 3).clone()
+        # Original positions retain height above ground; local positions use pelvis origin.
+        positions[..., 1] -= height
+        positions = (rotation[:, :, None] @ positions.unsqueeze(-1)).squeeze(-1)
+        # 6D rotation encoding stores two columns, so rotate each directly.
+        columns = features[..., Global.GLOBAL_ROTATIONS].reshape(batch, frames, 30, 2, 3)
+        columns = (rotation[:, :, None, None] @ columns.unsqueeze(-1)).squeeze(-1)
+        velocities = features[..., Global.VELOCITIES].reshape(batch, frames, 30, 3)
+        velocities = (rotation[:, :, None] @ velocities.unsqueeze(-1)).squeeze(-1)
+        yaw_velocity = torch.zeros_like(angle)
+        if frames > 1:
+            delta = angle[:, 1:] - angle[:, :-1]
+            yaw_velocity[:, :-1] = torch.atan2(torch.sin(delta), torch.cos(delta)) * self.fps
+            yaw_velocity[:, -1] = yaw_velocity[:, -2]
+        result = torch.cat([
+            height, velocities[:, :, 0, [0, 2]], yaw_velocity.unsqueeze(-1),
+            positions.flatten(-2), columns.flatten(-3), velocities.flatten(-2),
+            features[..., Global.FOOT_CONTACTS],
+        ], dim=-1)
+        return result[0] if unbatched else result
 
     def encode(self, local_rotations, root_positions, canonicalize: bool = True):
         return self(local_rotations, root_positions, to_canonicalize=canonicalize)

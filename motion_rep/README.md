@@ -54,3 +54,38 @@ and joint velocities, and contacts. They discard initial XZ and yaw.
 Velocity channels use forward differences per second; the final difference is
 repeated. Decode fixes the initial XZ and yaw to zero. Encode valid frames before
 padding. Existing datasets are never converted by a training-time selector.
+
+## Converting an existing 366D dataset
+
+Skip BVH parsing and forward kinematics when an original processed dataset is
+already available:
+
+```sh
+python -m dataset.convert_to_local \\
+  --input dataset/bones-seed-processed-nframes150-min60 \\
+  --output dataset/bones-seed-local-from366-nframes150-min60 \\
+  --workers 8
+```
+
+The output must be a new directory. The converter reads unnormalized float32
+clips, preserves sample IDs, window boundaries, splits, annotations and foot
+contacts, rotates stored body features/velocities, and computes new train-only
+mean/std statistics. It uses float64 internally and writes float32 clips. Small
+rounding differences from direct BVH processing are expected because the source
+features were already stored as float32. Initial XZ/yaw cannot be recovered and
+are not needed by the local representation.
+
+Set the training config's `data.root_path` to the converted directory and
+`data.representation: LocalMotionJEPARep` (365D). The converter does not alter
+source files or old statistics. It records source metadata/index hashes in
+`representation_conversion`. On failure it writes `conversion-error.txt` and
+leaves no completion `meta.json`; it does not silently skip failed clips. A
+failed destination cannot be reused by this command; choose another new path.
+
+For tensor-level conversion:
+
+```python
+local = LocalMotionJEPARep(fps=30).from_global_features(original_features)
+```
+
+Input shape is `[T, 366]` or `[B, T, 366]`, with valid frames only.

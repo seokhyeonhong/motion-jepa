@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from motion_rep import MotionJEPAMotionRep
+from motion_rep.registry import get_representation
 from skeleton import SOMASkeleton30, SOMASkeleton77
 
 from .shaded_skeleton import ShadedSkeletonRenderer
@@ -101,9 +102,11 @@ def load_motion(
     fps: int,
     normalized: bool = False,
     stats_root: Path | None = None,
+    representation_name: str = "MotionJEPAMotionRep",
 ) -> tuple[dict[str, torch.Tensor], int]:
+    representation_class = get_representation(representation_name)
     features = np.load(entry.path, allow_pickle=False)
-    expected_shape = (entry.actual_length, MotionJEPAMotionRep.FEATURE_DIM)
+    expected_shape = (entry.actual_length, representation_class.FEATURE_DIM)
     if features.shape != expected_shape or features.dtype != np.float32:
         raise ValueError(
             f"NPY motion must be float32{expected_shape}, got "
@@ -122,7 +125,7 @@ def load_motion(
             )
         mean = np.load(mean_path, allow_pickle=False).astype(np.float32, copy=False)
         std = np.load(std_path, allow_pickle=False).astype(np.float32, copy=False)
-        expected_shape = (MotionJEPAMotionRep.FEATURE_DIM,)
+        expected_shape = (representation_class.FEATURE_DIM,)
         if mean.shape != expected_shape or std.shape != expected_shape:
             raise ValueError(
                 f"Normalization statistics must have shape {expected_shape}, got "
@@ -132,14 +135,28 @@ def load_motion(
             raise ValueError(f"Normalization statistics contain non-finite values: {stats_root}")
         std = np.where(std < 1.0e-6, 1.0, std)
         features = features * std + mean
-    representation = MotionJEPAMotionRep(SOMASkeleton30(), fps)
+    representation = representation_class(SOMASkeleton30(), fps)
     decoded = representation.inverse(torch.from_numpy(features))
     return representation.skeleton.expand_output(decoded), fps
 
 
+def zero_planar_root(motion, *, first_frame_only=False):
+    """Subtract initial or per-frame root XZ; retain height, yaw and articulation."""
+    result = {key: value.clone() for key, value in motion.items()}
+    offset = motion["root_positions"][:1].clone() if first_frame_only else motion["root_positions"].clone()
+    offset[..., 1] = 0
+    for key in ("root_positions", "smooth_root_pos"):
+        if key in result:
+            result[key] -= offset
+    result["posed_joints"] -= offset[:, None]
+    return result
+
+
 class MotionRenderer:
-    def __init__(self, client, motion: dict[str, torch.Tensor], show_mesh: bool, show_skeleton: bool):
+    def __init__(self, client, motion: dict[str, torch.Tensor], show_mesh: bool, show_skeleton: bool,
+                 prefix: str = "/motion_jepa"):
         self.client = client
+        self.prefix = prefix
         self.motion = motion
         self.skeleton = SOMASkeleton77()
         self.skin = SOMASkin(self.skeleton)
@@ -167,6 +184,7 @@ class MotionRenderer:
             first_joints,
             skeleton=self.skeleton,
             visible=show_skeleton,
+            prefix=prefix,
         )
         # Retain these public handle attributes for callers of MotionRenderer.
         self.joints = self.shaded_skeleton.joints
@@ -201,7 +219,7 @@ class MotionRenderer:
 
     def _create_mesh(self, vertices: np.ndarray) -> None:
         self.mesh = self.client.scene.add_mesh_simple(
-            "/motion_jepa/mesh",
+            f"{self.prefix}/mesh",
             vertices=vertices,
             faces=self.skin.faces,
             color=(152, 189, 255),
@@ -209,6 +227,9 @@ class MotionRenderer:
             side="double",
             visible=True,
         )
+
+    def set_skeleton_visible(self, visible: bool) -> None:
+        self.shaded_skeleton.visible = visible
 
     def set_mesh_visible(self, visible: bool) -> None:
         visible = bool(visible)
@@ -256,6 +277,59 @@ class MotionRenderer:
         self.shaded_skeleton.remove()
 
 
+class RootComparisonRenderer:
+    """Two synchronized renderers with separate display origins."""
+    def __init__(self, client, motion, show_mesh, show_skeleton):
+        motion = zero_planar_root(motion, first_frame_only=True)
+        fixed = zero_planar_root(motion)
+        roots = motion["root_positions"].numpy()
+        extent = np.ptp(roots[:, [0, 2]], axis=0)
+        spacing = float(max(extent.max() + 3.0, 4.0))
+        self.groups = [
+            client.scene.add_frame("/integrated", show_axes=True,
+                                   position=(-spacing/2, 0, 0)),
+            client.scene.add_frame("/fixed", show_axes=True, position=(spacing/2, 0, 0)),
+        ]
+        self.labels = [
+            client.scene.add_label("/integrated/title", "Root integration ON · starts at X/Z = 0",
+                                   position=(0, 2.5, 0)),
+            client.scene.add_label("/fixed/title", "Root integration OFF · X/Z = 0",
+                                   position=(0, 2.5, 0)),
+        ]
+        self.renderers = [
+            MotionRenderer(client, motion, show_mesh, show_skeleton, "/integrated/body"),
+            MotionRenderer(client, fixed, show_mesh, show_skeleton, "/fixed/body"),
+        ]
+        self.motion = motion
+        self.frame = 0
+        self.length = len(roots)
+        client.camera.position = np.array([0, spacing * .6 + 2, spacing * 1.6 + 3])
+        client.camera.look_at = np.array([0, 1, 0])
+
+    def set_frame(self, frame, show_contacts):
+        for renderer in self.renderers:
+            renderer.set_frame(frame, show_contacts)
+        self.frame = self.renderers[0].frame
+
+    def set_mesh_visible(self, visible):
+        for renderer in self.renderers:
+            renderer.set_mesh_visible(visible)
+
+    def set_mesh_opacity(self, opacity):
+        for renderer in self.renderers:
+            renderer.set_mesh_opacity(opacity)
+
+    def set_skeleton_visible(self, visible):
+        for renderer in self.renderers:
+            renderer.set_skeleton_visible(visible)
+
+    def clear(self):
+        for renderer in self.renderers:
+            renderer.clear()
+        for handle in self.labels + self.groups:
+            handle.remove()
+
+
 @dataclass
 class ViewerSession:
     client: Any
@@ -283,6 +357,7 @@ class MotionJEPADatasetViewer:
         normalized: bool = False,
         entries: list[MotionEntry] | None = None,
         label: str = "MotionJEPA Dataset Viewer",
+        compare_root: bool = False,
     ):
         try:
             import viser
@@ -291,6 +366,9 @@ class MotionJEPADatasetViewer:
         self.viser = viser
         self.root = root
         self.fps = read_dataset_fps(root)
+        self.representation_name = json.loads((root / "meta.json").read_text())["representation"]
+        get_representation(self.representation_name)
+        self.compare_root = compare_root
         self.normalized = normalized
         self.stats_root = root / "stats" if root.is_dir() else None
         self.entries = discover_entries(root, split, limit) if entries is None else list(entries)
@@ -329,6 +407,7 @@ class MotionJEPADatasetViewer:
             fps=self.fps,
             normalized=self.normalized,
             stats_root=self.stats_root,
+            representation_name=self.representation_name,
         )
         with self.lock:
             session.playing = False
@@ -337,7 +416,8 @@ class MotionJEPADatasetViewer:
             if previous_renderer is not None:
                 previous_renderer.clear()
             gui = session.gui or {}
-            session.renderer = MotionRenderer(
+            renderer_class = RootComparisonRenderer if self.compare_root else MotionRenderer
+            session.renderer = renderer_class(
                 session.client,
                 motion,
                 bool(gui.get("mesh").value) if "mesh" in gui else self.default_mesh,
@@ -383,6 +463,13 @@ class MotionJEPADatasetViewer:
             opacity = client.gui.add_slider("Mesh Opacity", 0.0, 1.0, 0.01, 0.9)
             skeleton = client.gui.add_checkbox("Show Skeleton", initial_value=not self.default_mesh)
             contacts = client.gui.add_checkbox("Show Foot Contacts", initial_value=False)
+        if self.compare_root:
+            client.gui.add_markdown(
+                "**Left:** integrated root trajectory. **Right:** root X/Z fixed at zero. "
+                "Both preserve root height, turning and joint articulation. "
+                "Display offsets separate the two coordinate origins."
+            )
+        root_info = client.gui.add_markdown("")
         session.gui = {
             "dropdown": dropdown,
             "info": info,
@@ -399,6 +486,11 @@ class MotionJEPADatasetViewer:
                 if session.renderer is None:
                     return
                 session.renderer.set_frame(value, bool(contacts.value))
+                root = session.renderer.motion["root_positions"][session.renderer.frame]
+                root_info.content = (
+                    f"**Root X/Z:** integrated ({float(root[0]):.3f}, {float(root[2]):.3f}) m"
+                    + (" · fixed (0.000, 0.000) m" if self.compare_root else "")
+                )
                 if frame.value != session.renderer.frame:
                     frame.value = session.renderer.frame
 
@@ -447,8 +539,7 @@ class MotionJEPADatasetViewer:
         def _(_event):
             with self.lock:
                 if session.renderer:
-                    session.renderer.joints.visible = bool(skeleton.value)
-                    session.renderer.bones.visible = bool(skeleton.value)
+                    session.renderer.set_skeleton_visible(bool(skeleton.value))
 
         @contacts.on_update
         def _(_event):

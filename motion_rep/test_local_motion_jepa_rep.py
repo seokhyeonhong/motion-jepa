@@ -82,6 +82,16 @@ class LocalMotionJEPARepTests(unittest.TestCase):
         velocities = features[..., self.rep.VELOCITIES].reshape(1, 3, 30, 3)
         torch.testing.assert_close(velocities[..., [0, 2]].norm(dim=-1), torch.ones(1, 3, 30))
 
+    def test_mixed_input_dtypes(self):
+        for rotation_dtype, root_dtype in ((torch.float64, torch.float32),
+                                           (torch.float32, torch.float64)):
+            rotations = self.rotations.to(rotation_dtype)
+            roots = self.roots.to(root_dtype)
+            expected = self.rep(rotations.double(), roots.double())
+            actual = self.rep(rotations, roots)
+            self.assertEqual(actual.dtype, torch.float64)
+            torch.testing.assert_close(actual, expected)
+
     def test_invalid_inputs(self):
         with self.assertRaises(ValueError):
             LocalMotionJEPARep(fps=0)

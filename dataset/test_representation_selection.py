@@ -15,6 +15,8 @@ from motion_rep.registry import get_representation, validate_representation_outp
 def make_dataset(root, name):
     args = preprocessing.parse_args(["--representation", name, "--output", str(root)])
     args.num_frames, args.min_frames = 12, 1
+    args.metadata_csv = root / "unused.csv"
+    args.splits_root = root / "unused-splits"
     root.mkdir()
     records = {split: [] for split in preprocessing.SPLITS}
     dim = get_representation(name).FEATURE_DIM
@@ -90,3 +92,16 @@ def test_local_training_online_metrics_and_resume(tmp_path, monkeypatch):
     bad["data"]["motion_dim"] = 366
     with pytest.raises(ValueError, match="requires motion_dim=365"):
         train.main(bad, device="cpu")
+
+
+def test_errors_saved_when_no_training_clips(tmp_path):
+    args = preprocessing.parse_args(["--output", str(tmp_path)])
+    (tmp_path / "motions").mkdir()
+    errors = [{"ok": False, "error": "RuntimeError: conversion failed"}]
+    with pytest.raises(RuntimeError, match="First error: RuntimeError: conversion failed"):
+        preprocessing.finalize_processed_dataset(
+            args, {split: [] for split in preprocessing.SPLITS}, errors,
+            {split: 0 for split in preprocessing.SPLITS},
+            source_dataset="fixture", segmentation=preprocessing.SEGMENTATION_POLICY,
+        )
+    assert json.loads((tmp_path / "errors.jsonl").read_text()) == errors[0]

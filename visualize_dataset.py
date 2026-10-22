@@ -27,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument("--host", default=os.environ.get("SERVER_NAME", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("SERVER_PORT", "6006")))
+    parser.add_argument("--compare-root", action="store_true",
+                        help="Synchronized integrated trajectory and root-XZ-zero comparison")
     parser.add_argument("--mesh", action="store_true")
     parser.add_argument("--normalized", action="store_true")
     return parser.parse_args()
@@ -44,6 +46,7 @@ def main() -> None:
         port=args.port,
         mesh=args.mesh,
         normalized=args.normalized,
+        compare_root=args.compare_root,
     )
     print(f"Found {len(viewer.entries)} NPY motion sample(s) under {args.input}")
     print(f"Open http://{args.host}:{args.port}")

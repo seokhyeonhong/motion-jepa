@@ -587,6 +587,9 @@ def finalize_processed_dataset(
     metadata_extra: dict[str, Any] | None = None,
 ) -> None:
     """Write manifests, training statistics, and metadata for converted records."""
+    with (args.output / "errors.jsonl").open("w", encoding="utf-8") as file:
+        for error in errors:
+            file.write(json.dumps(error, ensure_ascii=False) + "\n")
     for split in SPLITS:
         records = records_by_split.setdefault(split, [])
         _write_split(args.output / f"{split}.txt", records)
@@ -609,7 +612,12 @@ def finalize_processed_dataset(
         train_sq_sum = clip_sq_sum if train_sq_sum is None else train_sq_sum + clip_sq_sum
 
     if train_count == 0 or train_sum is None or train_sq_sum is None:
-        raise RuntimeError("No training motions were converted; statistics cannot be computed.")
+        detail = f" First error: {errors[0]['error']}" if errors else ""
+        raise RuntimeError(
+            "No training motions were converted; statistics cannot be computed. "
+            f"{len(errors)} source conversion errors saved to {args.output / 'errors.jsonl'}."
+            + detail
+        )
     mean = train_sum / train_count
     variance = np.maximum(train_sq_sum / train_count - np.square(mean), 1e-12)
     std = np.sqrt(variance)
@@ -672,9 +680,6 @@ def finalize_processed_dataset(
     if metadata_extra:
         metadata.update(metadata_extra)
     _write_json(args.output / "meta.json", metadata)
-    with (args.output / "errors.jsonl").open("w", encoding="utf-8") as file:
-        for error in errors:
-            file.write(json.dumps(error, ensure_ascii=False) + "\n")
 
     if not _validate_complete_dataset(
         args.output, preprocessing_version=preprocessing_version, segmentation=segmentation
