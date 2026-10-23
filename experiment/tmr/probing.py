@@ -64,6 +64,7 @@ def prepare_probe_datasets(datasets, provenance, configuration, device, *, batch
             extractor = FrozenFrameExtractor(
                 configuration["checkpoint"], configuration["feature_layer"],
                 encoder_key=configuration["encoder_key"], device=device,
+                representation=getattr(datasets["train"].raw_dataset, "representation", None),
             )
             feature_dim = extractor.feature_dim
             feature_metadata = dict(extractor.metadata)

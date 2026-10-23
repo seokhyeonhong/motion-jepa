@@ -12,6 +12,8 @@ from .features import prepare_caches
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
+    from experiment.representation import add_argument
+    add_argument(parser)
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--annotations-path", type=Path, default=DEFAULT_ANNOTATIONS_PATH)
     parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)
@@ -33,7 +35,10 @@ def build_parser():
 
 
 def main(argv=None):
-    metadata = prepare_caches(**vars(build_parser().parse_args(argv)))
+    from experiment.representation import select_defaults
+    args = build_parser().parse_args(argv)
+    select_defaults(args, "tmr")
+    metadata = prepare_caches(**vars(args))
     summary = {key: metadata[key] for key in (
         "input_source", "motion_dim", "text_dim", "split_counts", "filtered_counts"
     )}

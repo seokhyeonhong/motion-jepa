@@ -151,12 +151,14 @@ def _raw_dataset(root, split, paired, stats_root):
 
 def prepare_caches(
     *, dataset_root=DEFAULT_DATASET_ROOT, annotations_path=DEFAULT_ANNOTATIONS_PATH,
-    cache_root=DEFAULT_CACHE_ROOT, stats_path=None, text_model=DEFAULT_TEXT_MODEL,
+    cache_root=DEFAULT_CACHE_ROOT, stats_path=None, representation=None, text_model=DEFAULT_TEXT_MODEL,
     text_revision=None, text_adapter=None, text_adapter_revision=None, max_text_length=256, device="auto", text_batch_size=8, recompute_features=False, max_samples_per_split=None,
 ):
     if min(max_text_length, text_batch_size) < 1:
         raise ValueError("Lengths and batch sizes must be positive")
     root, cache = Path(dataset_root).expanduser().resolve(), Path(cache_root).expanduser().resolve()
+    from experiment.representation import validate_dataset
+    validate_dataset(root, representation)
     target_device = resolve_device(str(device))
     paired = build_paired_index(root, annotations_path, max_samples_per_split)
     if not paired["split_counts"]["train"]:
@@ -195,10 +197,12 @@ def prepare_caches(
 def load_prepared_datasets(
     dataset_root, annotations_path, cache_root, stats_path=None,
     text_model=DEFAULT_TEXT_MODEL, text_revision=None, max_text_length=256,
-    train_fraction=1.0, train_subset_seed=42, text_adapter=None, text_adapter_revision=None,
+    train_fraction=1.0, train_subset_seed=42, text_adapter=None, text_adapter_revision=None, representation=None,
 ):
     """Validate provenance without instantiating or deserializing a backbone."""
     root, cache = Path(dataset_root).expanduser().resolve(), Path(cache_root).expanduser().resolve()
+    from experiment.representation import validate_dataset
+    validate_dataset(root, representation)
     marker = cache / "raw" / "prepared.json"
     if not marker.is_file():
         raise FileNotFoundError(f"Prepared TMR cache is missing: {marker}; run prepare_cache")

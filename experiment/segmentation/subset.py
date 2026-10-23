@@ -20,6 +20,7 @@ class SegmentationSubset(Subset):
         self.class_indices_60 = dataset.class_indices_60
         self.num_frames = dataset.num_frames
         self.motion_dim = dataset.motion_dim
+        self.representation = getattr(dataset, "representation", None)
 
 
 def select_training_subset(dataset, fraction=1.0, seed=42):

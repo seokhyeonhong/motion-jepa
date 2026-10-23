@@ -168,7 +168,8 @@ def build_paired_index(
         "max_samples_per_split": max_samples_per_split,
         "fps": fps, "num_frames": num_frames,
         "raw_motion_dim": int(metadata["motion_dim"]),
-        "representation": rep.FORMAT_NAME,
+        # Preserve existing global-representation cache/checkpoint signatures.
+        **({"representation": rep.FORMAT_NAME} if rep.FORMAT_NAME != MotionDataset.REPRESENTATION else {}),
     }
     return {
         "records": records, "catalog": catalog, "provenance": provenance,

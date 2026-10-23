@@ -1,5 +1,6 @@
 """Processed-feature conversion and dataset serialization checks."""
 import json
+import hashlib
 
 import numpy as np
 import pytest
@@ -49,9 +50,18 @@ def test_dataset_conversion_statistics_and_source_untouched(tmp_path, workers):
             np.save(entry.path, original)
             expected[entry.path.relative_to(source)] = rep.from_global_features(
                 torch.from_numpy(original).double()).float().numpy()
+    index = source / "index.json"
+    records = json.loads(index.read_text())
+    for record in records:
+        record["motion_sha256"] = hashlib.sha256((source / record["motion_path"]).read_bytes()).hexdigest()
+    index.write_text(json.dumps(records))
     before = {path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()}
     metadata = convert_dataset(source, output, workers=workers)
     assert metadata["motion_dim"] == 365
+    converted_records = json.loads((output / "index.json").read_text())
+    for old, new in zip(records, converted_records):
+        assert new["motion_sha256"] == hashlib.sha256((output / new["motion_path"]).read_bytes()).hexdigest()
+        assert new["motion_sha256"] != old["motion_sha256"]
     for relative, values in expected.items():
         np.testing.assert_array_equal(np.load(output / relative), values)
     for relative, content in before.items():

@@ -65,11 +65,15 @@ def optimization_configuration(args):
 
 
 def data_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    from experiment.representation import select_defaults
+    select_defaults(args, "tmr")
     values = {name: getattr(args, name, None) for name in DATA_FIELDS}
     for name in ("dataset_root", "annotations_path", "cache_root", "stats_path"):
         if values[name] is not None:
             values[name] = str(Path(values[name]).expanduser().resolve())
     values["text_model"] = str(values["text_model"])
+    if getattr(args, "representation", None) is not None:
+        values["representation"] = args.representation
     if args.train_fraction != 1:
         values.update(train_fraction=args.train_fraction, train_subset_seed=args.seed)
     return values
@@ -215,6 +219,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _validate_args(args)
     probe_mode = getattr(args, "mode", "supervised") == "probe"
     default_output = PROJECT_ROOT / "output/tmr" / args.model_size
+    if getattr(args, "representation", None) == "LocalMotionJEPARep":
+        default_output /= "local-motion-jepa"
     if probe_mode:
         feature_name = f"layer-{args.feature_layer}" if args.feature_source == "jepa" else "raw"
         default_output /= f"probe-{feature_name}"
@@ -432,6 +438,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    from experiment.representation import add_argument
+    add_argument(parser)
     parser.add_argument("--mode", choices=("supervised", "probe"), default="supervised")
     parser.add_argument("--feature-source", choices=("raw", "jepa"), default="jepa")
     parser.add_argument("--feature-layer", type=int, default=12, help="One-based frozen JEPA block output to probe.")

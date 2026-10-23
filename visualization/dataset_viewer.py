@@ -14,6 +14,7 @@ import torch
 
 from motion_rep import MotionJEPAMotionRep
 from motion_rep.registry import get_representation
+from motion_rep.geometry import y_rotation
 from skeleton import SOMASkeleton30, SOMASkeleton77
 
 from .shaded_skeleton import ShadedSkeletonRenderer
@@ -152,6 +153,23 @@ def zero_planar_root(motion, *, first_frame_only=False):
     return result
 
 
+def remove_root_integration(motion):
+    """Remove planar translation and yaw, preserving height and body articulation."""
+    result = zero_planar_root(motion)
+    heading = result["global_root_heading"]
+    angle = torch.atan2(heading[..., 1], heading[..., 0])
+    rotation = y_rotation(-angle)
+    result["posed_joints"] = (
+        rotation[:, None] @ result["posed_joints"].unsqueeze(-1)
+    ).squeeze(-1)
+    result["global_rot_mats"] = rotation[:, None] @ result["global_rot_mats"]
+    result["local_rot_mats"][:, 0] = rotation @ result["local_rot_mats"][:, 0]
+    result["global_root_heading"] = torch.stack(
+        [torch.ones_like(angle), torch.zeros_like(angle)], dim=-1
+    )
+    return result
+
+
 class MotionRenderer:
     def __init__(self, client, motion: dict[str, torch.Tensor], show_mesh: bool, show_skeleton: bool,
                  prefix: str = "/motion_jepa"):
@@ -281,7 +299,7 @@ class RootComparisonRenderer:
     """Two synchronized renderers with separate display origins."""
     def __init__(self, client, motion, show_mesh, show_skeleton):
         motion = zero_planar_root(motion, first_frame_only=True)
-        fixed = zero_planar_root(motion)
+        fixed = remove_root_integration(motion)
         roots = motion["root_positions"].numpy()
         extent = np.ptp(roots[:, [0, 2]], axis=0)
         spacing = float(max(extent.max() + 3.0, 4.0))
@@ -293,7 +311,7 @@ class RootComparisonRenderer:
         self.labels = [
             client.scene.add_label("/integrated/title", "Root integration ON · starts at X/Z = 0",
                                    position=(0, 2.5, 0)),
-            client.scene.add_label("/fixed/title", "Root integration OFF · X/Z = 0",
+            client.scene.add_label("/fixed/title", "Root integration OFF · X/Z = 0, yaw = 0",
                                    position=(0, 2.5, 0)),
         ]
         self.renderers = [
@@ -465,8 +483,8 @@ class MotionJEPADatasetViewer:
             contacts = client.gui.add_checkbox("Show Foot Contacts", initial_value=False)
         if self.compare_root:
             client.gui.add_markdown(
-                "**Left:** integrated root trajectory. **Right:** root X/Z fixed at zero. "
-                "Both preserve root height, turning and joint articulation. "
+                "**Left:** integrated root trajectory. **Right:** root X/Z and yaw fixed at zero. "
+                "Both preserve root height and joint articulation; only the left integrates turning. "
                 "Display offsets separate the two coordinate origins."
             )
         root_info = client.gui.add_markdown("")
@@ -489,7 +507,7 @@ class MotionJEPADatasetViewer:
                 root = session.renderer.motion["root_positions"][session.renderer.frame]
                 root_info.content = (
                     f"**Root X/Z:** integrated ({float(root[0]):.3f}, {float(root[2]):.3f}) m"
-                    + (" · fixed (0.000, 0.000) m" if self.compare_root else "")
+                    + (" · fixed (0.000, 0.000) m, yaw 0°" if self.compare_root else "")
                 )
                 if frame.value != session.renderer.frame:
                     frame.value = session.renderer.frame

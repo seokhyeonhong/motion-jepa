@@ -18,7 +18,7 @@ class FrozenFrameExtractor:
     All selected blocks are read before the encoder's final LayerNorm. Task
     statistics are fitted separately on these features, using training frames.
     """
-    def __init__(self, checkpoint, layer, encoder_key="target_encoder", device="cpu", config_path=None):
+    def __init__(self, checkpoint, layer, encoder_key="target_encoder", device="cpu", config_path=None, representation=None):
         if encoder_key not in ("encoder", "target_encoder"):
             raise ValueError("encoder_key must be encoder or target_encoder")
         path = Path(checkpoint).expanduser().resolve()
@@ -30,6 +30,12 @@ class FrozenFrameExtractor:
         if not isinstance(config, dict):
             raise ValueError("Checkpoint must contain its pretraining config")
         data = config["data"]
+        if representation is not None:
+            from motion_rep.registry import get_representation
+            expected = get_representation(representation)
+            actual = get_representation(data.get("representation", "MotionJEPAMotionRep"))
+            if actual is not expected or int(data["motion_dim"]) != expected.FEATURE_DIM:
+                raise ValueError("Dataset representation differs from the JEPA checkpoint representation")
         name = config["meta"]["model_name"]
         factory = getattr(motion_transformer_1d, name, None)
         if factory is None or not name.startswith("mot_") or "predictor" in name:

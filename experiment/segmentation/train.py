@@ -72,6 +72,8 @@ def restore_rng(state, generator):
 
 
 def run(args):
+    from experiment.representation import select_defaults
+    select_defaults(args, "segmentation")
     fraction = getattr(args, "train_fraction", 1.0)
     if not math.isfinite(fraction) or not 0 < fraction <= 1:
         raise ValueError("train_fraction must be finite and in (0, 1]")
@@ -96,6 +98,9 @@ def run(args):
     _seed_all(args.seed)
     root = args.dataset_root.expanduser().resolve()
     meta = json.loads((root / "meta.json").read_text())
+    if getattr(args, "representation", None) is not None:
+        from experiment.representation import validate_dataset
+        validate_dataset(root, args.representation)
     datasets = {
         split: BabelSegmentationDataset(
             root, split, num_frames=meta["num_frames"], fps=meta["fps"],
@@ -112,6 +117,8 @@ def run(args):
         + (f"-layer-{args.feature_layer}" if args.feature_layer is not None else "")
     )
     default_output = PROJECT_ROOT / "output/segmentation" / run_name
+    if getattr(args, "representation", None) == "LocalMotionJEPARep":
+        default_output /= "local-motion-jepa"
     if fraction != 1:
         default_output /= f"frac{fraction:g}"
     output = (args.output_root or default_output / f"seed-{args.seed}").resolve()
@@ -302,6 +309,8 @@ def run(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
+    from experiment.representation import add_argument
+    add_argument(parser)
     parser.add_argument("--dataset-root", type=Path, default=PROJECT_ROOT / "dataset/babel-segmentation-120-processed-nframes30-150")
     parser.add_argument("--model-size", choices=tuple(MODEL_SPECS), default="base")
     parser.add_argument("--mode", choices=("supervised", "probe"), default="supervised")
@@ -339,13 +348,24 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    from experiment.representation import select_defaults
+    select_defaults(args, "segmentation")
     if args.describe:
+        from motion_rep.registry import get_representation
+        meta_path = args.dataset_root / "meta.json"
+        if meta_path.is_file():
+            from experiment.representation import validate_dataset
+            rep = validate_dataset(args.dataset_root, args.representation)
+            meta = json.loads(meta_path.read_text())
+        else:
+            rep = get_representation(args.representation or "MotionJEPAMotionRep")
+            meta = {"num_frames": 150}
         if args.mode == "probe":
-            feature_dim = 366 if args.feature_source == "raw" else MODEL_SPECS[args.model_size]["embed_dim"]
-            model = MotionSegmentationProbe(feature_dim, 120, 150, torch.zeros(feature_dim),
+            feature_dim = rep.FEATURE_DIM if args.feature_source == "raw" else MODEL_SPECS[args.model_size]["embed_dim"]
+            model = MotionSegmentationProbe(feature_dim, 120, meta["num_frames"], torch.zeros(feature_dim),
                                            torch.ones(feature_dim), num_heads=args.probe_heads)
         else:
-            model = MotionSegmentationTransformer(args.model_size)
+            model = MotionSegmentationTransformer(args.model_size, input_dim=rep.FEATURE_DIM, num_frames=meta["num_frames"])
         print(json.dumps({"architecture": model.config, "parameters": model.parameter_counts()}, indent=2))
         return
     print(json.dumps(run(args), indent=2))

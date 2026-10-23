@@ -151,3 +151,35 @@ remain readable by `experiment.probing_report` with an explicit epoch axis.
 The suite launcher accepts `--iterations`, `--warmup-iterations`, `--eval-interval`,
 `--checkpoint-interval`, `--log-freq`, and `--batch-size` overrides. Omitting them
 uses the task defaults above; use identical values for every compared fraction.
+
+
+### Motion representations
+
+Both supervised training and frozen JEPA probing accept datasets preprocessed
+with `MotionJEPAMotionRep` (366D) or `LocalMotionJEPARep` (365D).
+The representation and input width are read from the dataset's `meta.json`.
+Optionally pass `--representation LocalMotionJEPARep` to check that the selected
+dataset uses the intended format. This option validates existing features; it
+does not convert a global dataset into local coordinates.
+
+Use a separate dataset directory, its own training normalization statistics,
+and a new output directory for each representation. A frozen JEPA checkpoint
+must have been pretrained with the same representation as the task dataset;
+mismatches are rejected before feature extraction. Older checkpoints without
+a representation field are interpreted as the original global representation.
+
+Raw attentive probes require a head count dividing the feature width:
+use `--probe-heads 5` for 365D local raw features. JEPA feature probes use the
+encoder embedding width, so their usual six heads remain valid.
+
+```sh
+python -m experiment.segmentation --dataset-root /path/to/local-segmentation --representation LocalMotionJEPARep --mode supervised --output-root /path/to/new-segmentation-run
+```
+
+
+The prepared local datasets on this workspace can be selected directly with
+`--representation LocalMotionJEPARep`; standard dataset paths (and TMR's standard
+cache path) switch to their local counterparts. Explicit custom paths are
+preserved and validated. Local runs use a separate `local-motion-jepa` default
+output subdirectory. Omit the option or use `MotionJEPAMotionRep` for the original
+global defaults.

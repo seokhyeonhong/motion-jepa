@@ -143,6 +143,9 @@ def convert_dataset(source, output, workers=8):
                 shutil.copy2(source / name, output / name)
         if (source / "labels").is_dir():
             shutil.copytree(source / "labels", output / "labels")
+        for record in records:
+            if "motion_sha256" in record:
+                record["motion_sha256"] = _sha256(output / record["motion_path"])
         _write_json(output / "index.json", records)
         metadata.update(
             representation=LocalMotionJEPARep.FORMAT_NAME, motion_dim=365,

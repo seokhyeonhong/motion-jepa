@@ -1,7 +1,7 @@
 # Frame-token JEPA with built-in RoPE and length-aware masking.
 data:
   batch_size: 512  # Per rank; global batch is batch_size * world_size.
-  root_path: ./dataset/bones-seed-local-processed-nframes150-min60
+  root_path: ./dataset/bones-seed-local-from366-nframes150-min60
   meta_files:
     - train.txt
   num_workers: 8

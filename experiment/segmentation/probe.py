@@ -40,6 +40,7 @@ def prepare_probe_datasets(datasets, args, device):
             raise ValueError("JEPA probing requires --checkpoint and --feature-layer")
         extractor = FrozenFrameExtractor(
             args.checkpoint, args.feature_layer, encoder_key=args.encoder_key, device=device,
+            representation=getattr(datasets["train"], "representation", None),
         )
         feature_dim = extractor.feature_dim
         metadata = dict(extractor.metadata)
