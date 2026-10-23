@@ -150,8 +150,10 @@ def _assert_equal(a, b):
         assert a == b
 
 
-def _exercise_resume(root, enabled):
+def _exercise_resume(root, enabled, patchify=False):
     config = _config(root / "full", enabled)
+    if patchify:
+        config["meta"]["patchify"] = True
     train.main(config, device="cpu")
     resumed = copy.deepcopy(config)
     resumed["logging"]["folder"] = str(root / "resumed")
@@ -172,10 +174,11 @@ def _exercise_resume(root, enabled):
     return config, resumed, a
 
 
+@pytest.mark.parametrize("patchify", [False, True])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_training_exact_resume_and_legacy_disabled(tmp_path, monkeypatch, enabled):
+def test_training_exact_resume_and_legacy_disabled(tmp_path, monkeypatch, enabled, patchify):
     _patch_runtime(monkeypatch)
-    config, resumed, checkpoint = _exercise_resume(tmp_path, enabled)
+    config, resumed, checkpoint = _exercise_resume(tmp_path, enabled, patchify)
     if enabled:
         resumed["loss"]["centering_sharpening"]["teacher_temperature"] = 0.07
     else:

@@ -175,10 +175,16 @@ The default training config is `configs/mjepa_1d_base.yaml`, using the
 
 ## Frame-token JEPA
 
-JEPA uses one token per motion frame and temporal transformer attention.
+JEPA uses one token per motion frame by default and temporal transformer attention.
 Factories are available in `tiny`, `small`, `base`, `large`, `huge`, and `giant`
-sizes, for example `mot_base_1d` and `mot_predictor_base_1d`. The 2D and temporal
-patch transformers and their masking strategies have been removed.
+sizes, for example `mot_base_1d` and `mot_predictor_base_1d`. Set
+`meta.patchify: true` to project each group of three frames into one token with
+a Conv1d (kernel size 3, stride 3, no padding). The default is `false`.
+Patch mode produces `floor(num_frames / 3)` tokens, drops incomplete trailing
+groups, and considers a patch valid only when all three frames are valid.
+Encoder and predictor RoPE use patch-center times `(3 * token_index + 1) / fps`;
+masking and online metrics operate on the resulting token grid. The previous
+2D and temporal-patch model variants remain removed.
 
 RoPE is built into every encoder and predictor attention layer with theta 100
 and a time scale of 1. Positions are physical seconds (`frame_index / fps`).

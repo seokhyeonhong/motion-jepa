@@ -19,7 +19,7 @@ from .token_layout import TokenLayout
 
 
 class MotionTransformer1D(nn.Module):
-    """Encode one 366-D (or configurable-width) frame per temporal token."""
+    """Encode individual frames or non-overlapping three-frame patches."""
 
     def __init__(
         self,
@@ -34,6 +34,7 @@ class MotionTransformer1D(nn.Module):
         attn_drop_rate: float = 0.0,
         drop_path_rate: float = 0.0,
         norm_layer=partial(nn.LayerNorm, eps=1.0e-6),
+        patchify: bool = False,
     ) -> None:
         super().__init__()
         self.in_chans = int(in_chans)
@@ -42,11 +43,15 @@ class MotionTransformer1D(nn.Module):
         self.num_heads = int(num_heads)
         self.token_layout = TokenLayout(
             kind="1d",
-            patchified=False,
+            patchified=patchify,
             raw_num_frames=self.num_frames,
-            token_num_frames=self.num_frames,
+            token_num_frames=self.num_frames // (3 if patchify else 1),
+            temporal_patch_size=3 if patchify else 1,
         )
-        self.input_proj = nn.Linear(self.in_chans, self.embed_dim)
+        self.input_proj = (
+            nn.Conv1d(self.in_chans, self.embed_dim, kernel_size=3, stride=3)
+            if patchify else nn.Linear(self.in_chans, self.embed_dim)
+        )
         self.rotary = RotaryPosEmbed1D(
             self.embed_dim // self.num_heads
         )
@@ -85,8 +90,13 @@ class MotionTransformer1D(nn.Module):
                 or not isinstance(feature_layer, int)
                 or not 1 <= feature_layer <= len(self.blocks)):
             raise ValueError("feature_layer must be a 1-based transformer block index")
-        x = self.input_proj(motion)
-        times = temporal_token_positions(self.num_frames, fps, device=x.device)
+        x = (
+            self.input_proj(motion.transpose(1, 2)).transpose(1, 2)
+            if self.token_layout.patchified else self.input_proj(motion)
+        )
+        times = temporal_token_positions(
+            self.num_frames, fps, self.token_layout.temporal_patch_size, device=x.device
+        )
         active = None
         if valid_frames is not None:
             active = valid_frames.to(device=x.device, dtype=torch.bool)
@@ -95,6 +105,7 @@ class MotionTransformer1D(nn.Module):
                     f"valid_frames must have shape {tuple(motion.shape[:2])}, "
                     f"got {tuple(active.shape)}"
                 )
+            active = self.token_layout.valid_token_mask(active)
         if masks is not None:
             if not masks:
                 raise ValueError("At least one context mask is required")
@@ -126,7 +137,7 @@ class MotionTransformer1D(nn.Module):
 
 
 class MotionTransformerPredictor1D(nn.Module):
-    """Predict target-frame embeddings from packed context-frame embeddings."""
+    """Predict target-token embeddings from packed context-token embeddings."""
 
     def __init__(
         self,
@@ -141,6 +152,7 @@ class MotionTransformerPredictor1D(nn.Module):
         attn_drop_rate: float = 0.0,
         drop_path_rate: float = 0.0,
         norm_layer=partial(nn.LayerNorm, eps=1.0e-6),
+        patchify: bool = False,
     ) -> None:
         super().__init__()
         self.num_frames = int(num_frames)
@@ -148,9 +160,10 @@ class MotionTransformerPredictor1D(nn.Module):
         self.predictor_embed_dim = int(predictor_embed_dim)
         self.token_layout = TokenLayout(
             kind="1d",
-            patchified=False,
+            patchified=patchify,
             raw_num_frames=self.num_frames,
-            token_num_frames=self.num_frames,
+            token_num_frames=self.num_frames // (3 if patchify else 1),
+            temporal_patch_size=3 if patchify else 1,
         )
         self.input_proj = nn.Linear(self.embed_dim, self.predictor_embed_dim)
         self.rotary = RotaryPosEmbed1D(
@@ -206,7 +219,9 @@ class MotionTransformerPredictor1D(nn.Module):
             raise ValueError("Every encoder and target mask row must contain a valid token")
         x = self.input_proj(context)
         context_tokens = context.shape[1]
-        times = temporal_token_positions(self.num_frames, fps, device=x.device).unsqueeze(-1)
+        times = temporal_token_positions(
+            self.num_frames, fps, self.token_layout.temporal_patch_size, device=x.device
+        ).unsqueeze(-1)
         context_time = apply_index_masks(times, masks_enc).repeat(len(masks_pred), 1, 1)
         target_time = repeat_mask_blocks(
             apply_index_masks(times, masks_pred), batch_size, len(masks_enc)

@@ -116,15 +116,15 @@ def sample_masks(
     collator.load_state_dict(state)
     motion_dim = int(data["motion_dim"])
     fps = float(data.get("fps", 60))
+    valid_tokens = int(
+        layout.valid_token_lengths(torch.tensor([valid_raw_frames]))[0]
+    )
     batch = [
-        (torch.zeros(raw_num_frames, motion_dim), torch.tensor(fps), valid_raw_frames)
+        (torch.zeros(raw_num_frames, motion_dim), torch.tensor(fps), valid_tokens)
         for _ in range(batch_size)
     ]
     _, context_masks, target_masks = collator(batch)
     spatial_labels: tuple[str, ...] = ()
-    valid_tokens = int(
-        layout.valid_token_lengths(torch.tensor([valid_raw_frames]))[0]
-    )
     return SampledMasks(
         model_name=str(config["meta"]["model_name"]),
         layout=layout,

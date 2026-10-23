@@ -340,8 +340,8 @@ def _load_checkpoint(
 
 
 def _build_mask_collator(args: dict, layout: TokenLayout):
-    if layout.kind != "1d" or layout.patchified:
-        raise ValueError("Masking supports only 1D frame tokens")
+    if layout.kind != "1d":
+        raise ValueError("Masking supports only 1D tokens")
     mask = args["mask"]
     if "version" in mask:
         raise ValueError("mask.version has been removed; omit it to use length-aware masking")
@@ -603,7 +603,8 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         sampler.set_epoch(data_pass)
         sampler.start_index = batch_in_pass * int(data_args["batch_size"])
         for batch in loader:
-            masks_enc, masks_pred = mask_collator.sample_masks(batch[2].tolist())
+            token_lengths = layout.valid_token_lengths(batch[2])
+            masks_enc, masks_pred = mask_collator.sample_masks(token_lengths.tolist())
             started = time.perf_counter()
             motion = batch[0].to(device=device, dtype=torch.float32, non_blocking=True)
             fps = batch[1].to(device=device, dtype=torch.float32, non_blocking=True)

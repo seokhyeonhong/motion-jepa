@@ -42,6 +42,8 @@ def _validate_config(config: dict) -> None:
         if option in config:
             raise ValueError(f"{option} configuration has been removed; JEPA uses frame tokens with fixed RoPE")
     meta = config.get("meta", {})
+    if not isinstance(meta.get("patchify", False), bool):
+        raise ValueError("meta.patchify must be a boolean")
     for key, factories in (("model_name", MODEL_FACTORIES), ("predictor_name", PREDICTOR_FACTORIES)):
         if key in meta and meta[key] not in factories:
             raise ValueError(f"Unsupported {key} {meta[key]!r}; choose one of: {', '.join(factories)}")
@@ -66,10 +68,11 @@ def model_config_from_checkpoint(checkpoint: dict) -> dict:
 
 
 def init_mjepa_model(device: torch.device, num_frames: int, motion_dim: int,
-                     model_name: str, predictor_name: str):
+                     model_name: str, predictor_name: str, patchify: bool = False):
     _validate_config({"meta": {"model_name": model_name, "predictor_name": predictor_name}})
-    encoder = MODEL_FACTORIES[model_name](in_chans=motion_dim, num_frames=num_frames)
-    predictor = PREDICTOR_FACTORIES[predictor_name](num_frames=num_frames, embed_dim=encoder.embed_dim)
+    encoder = MODEL_FACTORIES[model_name](in_chans=motion_dim, num_frames=num_frames, patchify=patchify)
+    predictor = PREDICTOR_FACTORIES[predictor_name](
+        num_frames=num_frames, embed_dim=encoder.embed_dim, patchify=patchify)
     return encoder.to(device), predictor.to(device)
 
 
@@ -78,14 +81,15 @@ def init_mjepa_model_from_config(config: dict, device: torch.device):
     data, meta = config["data"], config["meta"]
     return init_mjepa_model(device, int(data["num_frames"]), int(data["motion_dim"]),
                             str(meta["model_name"]),
-                            str(meta["predictor_name"]))
+                            str(meta["predictor_name"]), patchify=meta.get("patchify", False))
 
 
 def init_mjepa_encoder_from_config(config: dict, device: torch.device):
     _validate_config(config)
     data, meta = config["data"], config["meta"]
     return MODEL_FACTORIES[str(meta["model_name"])](
-        in_chans=int(data["motion_dim"]), num_frames=int(data["num_frames"])).to(device)
+        in_chans=int(data["motion_dim"]), num_frames=int(data["num_frames"]),
+        patchify=meta.get("patchify", False)).to(device)
 
 
 def architecture_signature(encoder, predictor, *, model_name: str,
@@ -99,7 +103,9 @@ def architecture_signature(encoder, predictor, *, model_name: str,
 def architecture_signature_from_config(config: dict) -> dict:
     _validate_config(config)
     frames = int(config["data"]["num_frames"])
-    layout = TokenLayout("1d", False, frames, frames).signature()
+    patchify = config["meta"].get("patchify", False)
+    patch_size = 3 if patchify else 1
+    layout = TokenLayout("1d", patchify, frames, frames // patch_size, patch_size).signature()
     return {"model_name": str(config["meta"]["model_name"]),
             "predictor_name": str(config["meta"]["predictor_name"]),
             "motion_dim": int(config["data"]["motion_dim"]),

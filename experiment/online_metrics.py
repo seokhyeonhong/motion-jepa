@@ -242,8 +242,8 @@ class OnlineRepresentationMetrics:
     def evaluate(self, encoder, predictor, target_encoder, *, centering_sharpening=None) -> dict[str, Any]:
         if any(model.training for model in (encoder, predictor, target_encoder)):
             raise ValueError("Online metrics require eval-mode models")
-        if encoder.token_layout.kind != "1d" or encoder.token_layout.patchified:
-            raise ValueError("Online metrics require frame-token 1D models")
+        if encoder.token_layout.kind != "1d":
+            raise ValueError("Online metrics require 1D models")
         started = time.perf_counter()
         pooled = []
         temporal_std = temporal_variance = objective_sum = 0.0
@@ -252,7 +252,8 @@ class OnlineRepresentationMetrics:
         overall = _PredictionAccumulator()
         target_moments = _TargetMoments()
         for motion, fps, lengths in self._loader():
-            masks_enc, masks_pred = self.collator.sample_masks(lengths.tolist())
+            token_lengths = encoder.token_layout.valid_token_lengths(lengths)
+            masks_enc, masks_pred = self.collator.sample_masks(token_lengths.tolist())
             motion = motion.to(self.device, dtype=torch.float32)
             fps = fps.to(self.device, dtype=torch.float32)
             valid = torch.arange(motion.shape[1], device=self.device)[None] < lengths.to(self.device)[:, None]
@@ -266,7 +267,7 @@ class OnlineRepresentationMetrics:
                 target = repeat_mask_blocks(target, len(motion), len(masks_enc))
                 context = encoder(motion, fps, masks_enc, valid_frames=valid)
                 prediction = predictor(context, fps, masks_enc, masks_pred)
-            for features, length in zip(full.float().cpu(), lengths.tolist()):
+            for features, length in zip(full.float().cpu(), token_lengths.tolist()):
                 features = features[:length]
                 pooled.append(features.mean(0))
                 temporal_std += float(features.std(0, correction=0).mean())
