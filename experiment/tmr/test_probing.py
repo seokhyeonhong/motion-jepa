@@ -144,3 +144,40 @@ def test_probe_training_checkpoint_and_completed_resume(tmp_path, monkeypatch):
     resumed = train.run(args)
     assert resumed["test"] == result["test"]
     assert resumed["global_step"] == 1
+
+
+def test_patch_tokens_use_complete_lengths_and_train_only_statistics(monkeypatch):
+    from model.token_layout import TokenLayout
+    class Extractor:
+        feature_dim = 6
+        metadata = {}
+        token_layout = TokenLayout(kind="1d", patchified=True, raw_num_frames=4, token_num_frames=1, temporal_patch_size=3)
+        def __init__(self, *args, **kwargs): pass
+        def __call__(self, motion, fps, lengths): return motion[:, :3].mean(1, keepdim=True)
+        def release(self): pass
+    monkeypatch.setattr(probing, "FrozenFrameExtractor", Extractor)
+    datasets, metadata = fixtures()
+    for dataset in datasets.values():
+        dataset.records[0]["length"] = 3
+        dataset.raw_dataset.entries[0].length = 3
+    expected = torch.from_numpy(np.stack([v[:3].mean(0) for v in datasets["train"].raw_dataset.values]))
+    datasets, provenance, mean, std = probing.prepare_probe_datasets(datasets, metadata, configuration("jepa"), torch.device("cpu"), batch_size=2)
+    torch.testing.assert_close(mean, expected.mean(0))
+    torch.testing.assert_close(std, expected.std(0, correction=0))
+    assert provenance["motion_num_tokens"] == 1
+    assert all(len(d.motion_bank.values) == 3 for d in datasets.values())
+
+
+def test_transformer_probe_normalization_and_restore(monkeypatch):
+    monkeypatch.setitem(model_module.MODEL_SPECS, "base", dict(embed_dim=12, depth=2, num_heads=3))
+    config = model_module.AlignmentConfig(text_dim=8, motion_dim=6, num_frames=5, fps=10, motion_encoder="transformer_probe")
+    mean = torch.arange(6).float(); std = torch.ones(6)*2
+    model = model_module.TextMotionAlignment(config, motion_mean=mean, motion_std=std).eval()
+    x = torch.randn(2,5,6); mask = torch.arange(5)[None] < torch.tensor([3,5])[:,None]
+    expected = model.motion_encoder((x-mean)/std,mask)
+    torch.testing.assert_close(model.encode_motion(x,mask),expected)
+    restored = model_module.TextMotionAlignment(config).eval();restored.load_state_dict(model.state_dict(),strict=True)
+    torch.testing.assert_close(restored.encode_motion(x,mask),expected)
+    expected[:,0].sum().backward()
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+    assert len(model.motion_encoder.backbone.blocks)==2

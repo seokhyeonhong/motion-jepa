@@ -30,9 +30,12 @@ class AlignmentConfig:
     retrieval_dim: int = 256
     motion_encoder: str = "transformer"
     probe_heads: int = 6
+    patchify: bool = False
 
     def __post_init__(self):
-        if self.motion_encoder not in {"transformer", "attentive_probe"}:
+        if self.patchify and (self.motion_encoder != "transformer" or self.num_frames < 3):
+            raise ValueError("patchify requires a raw-motion transformer with at least three frames")
+        if self.motion_encoder not in {"transformer", "attentive_probe", "transformer_probe"}:
             raise ValueError("Invalid motion encoder")
         if self.probe_heads < 1 or (self.motion_encoder == "attentive_probe" and self.motion_dim % self.probe_heads):
             raise ValueError("probe_heads must divide motion feature dimension")
@@ -57,12 +60,12 @@ class AlignmentConfig:
 class SequenceEncoder(nn.Module):
     """Shared MotionJEPA backbone followed by a masked retrieval readout."""
 
-    def __init__(self, input_dim: int, config: AlignmentConfig, *, num_tokens: int, fps: float):
+    def __init__(self, input_dim: int, config: AlignmentConfig, *, num_tokens: int, fps: float, patchify: bool = False):
         super().__init__()
         self.input_dim = input_dim
         self.fps = fps
         self.backbone = MotionTransformer1D(
-            in_chans=input_dim, num_frames=num_tokens, **MODEL_SPECS[config.model_size],
+            in_chans=input_dim, num_frames=num_tokens, patchify=patchify, **MODEL_SPECS[config.model_size],
         )
         self.output_projection = (
             nn.Identity() if config.embed_dim == config.retrieval_dim
@@ -87,13 +90,16 @@ class SequenceEncoder(nn.Module):
         padding = self.backbone.num_frames - tokens.shape[1]
         cleaned = F.pad(cleaned, (0, 0, 0, padding))
         active = F.pad(active, (0, padding), value=False)
+        token_active = self.backbone.token_layout.valid_token_mask(active)
+        if not token_active.any(dim=1).all():
+            raise ValueError("Each sequence needs at least one complete motion patch")
         rates = torch.full(
             (len(tokens),), self.fps, device=tokens.device, dtype=torch.float32,
         )
         encoded = self.backbone(
             cleaned.to(self.backbone.input_proj.weight.dtype), rates, valid_frames=active,
         )
-        pooled = encoded.sum(dim=1) / active.sum(dim=1, keepdim=True).to(encoded.dtype)
+        pooled = encoded.sum(dim=1) / token_active.sum(dim=1, keepdim=True).to(encoded.dtype)
         return F.normalize(self.output_projection(pooled).float(), dim=-1)
 
 
@@ -117,12 +123,23 @@ class TextMotionAlignment(nn.Module):
         else:
             self.motion_encoder = SequenceEncoder(
                 config.motion_dim, config, num_tokens=config.num_frames, fps=config.fps,
+                patchify=config.patchify,
             )
+
+        if config.motion_encoder == "transformer_probe":
+            mean = torch.zeros(config.motion_dim) if motion_mean is None else torch.as_tensor(motion_mean).float()
+            std = torch.ones(config.motion_dim) if motion_std is None else torch.as_tensor(motion_std).float()
+            if mean.shape != (config.motion_dim,) or std.shape != mean.shape or not torch.isfinite(mean).all() or not torch.isfinite(std).all() or (std <= 0).any():
+                raise ValueError("Invalid frozen-feature normalization")
+            self.register_buffer("feature_mean", mean.clone())
+            self.register_buffer("feature_std", std.clone())
 
     def encode_text(self, tokens: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
         return self.text_encoder(tokens, valid_mask)
 
     def encode_motion(self, tokens: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        if self.config.motion_encoder == "transformer_probe":
+            tokens = (tokens - self.feature_mean) / self.feature_std
         values = self.motion_encoder(tokens, valid_mask)
         return F.normalize(values.float(), dim=-1) if self.config.motion_encoder == "attentive_probe" else values
 

@@ -221,3 +221,16 @@ cache path) switch to their local counterparts. Explicit custom paths are
 preserved and validated. Local runs use a separate `local-motion-jepa` default
 output subdirectory. Omit the option or use `MotionJEPAMotionRep` for the original
 global defaults.
+
+### Raw-motion temporal patches
+
+Supervised TMR accepts `--patchify` (default: `--no-patchify`). It uses the
+JEPA Conv1d motion tokenizer with kernel/stride 3 and no padding: 150 raw frames
+produce 50 tokens, with floor(valid_frames / 3) complete patches. Incomplete
+trailing patches are excluded from attention and mean pooling. Text tokenization,
+raw-frame normalization, data splits, and optimization settings are unchanged.
+Use `--representation LocalMotionJEPARep` for local inputs. The default patched
+output path includes `patchify/`; use distinct `--output-root` values for explicit
+comparison paths. Checkpoints save the option, and evaluation restores it
+automatically. Legacy checkpoints default to frame-wise tokenization.
+This option applies only to supervised raw-motion TMR, not frozen JEPA probes.

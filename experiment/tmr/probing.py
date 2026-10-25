@@ -73,9 +73,15 @@ def prepare_probe_datasets(datasets, provenance, configuration, device, *, batch
             feature_metadata = {"feature_source": "raw", "feature_dim": raw_dim}
         else:
             raise ValueError("Unknown probe feature source")
+        layout = getattr(extractor, "token_layout", None)
+        def token_lengths(lengths):
+            lengths = torch.as_tensor(lengths)
+            return layout.valid_token_lengths(lengths) if layout is not None else lengths
         moments = FeatureMoments(feature_dim)
         for split, dataset in datasets.items():
-            lengths = [record["length"] for record in dataset.records]
+            lengths = token_lengths([record["length"] for record in dataset.records]).tolist()
+            if any(length < 1 for length in lengths):
+                raise ValueError("Every clip must contain a complete motion token")
             bank = MemoryTokenBank(dataset.sample_ids, lengths, feature_dim)
             loader = DataLoader(
                 MotionRows(dataset), batch_size=batch_size, shuffle=False,
@@ -87,6 +93,7 @@ def prepare_probe_datasets(datasets, provenance, configuration, device, *, batch
                     features = motion.float()
                 else:
                     features = extractor(motion, fps, batch_lengths).detach().float().cpu()
+                batch_lengths = token_lengths(batch_lengths)
                 valid = torch.arange(features.shape[1])[None, :] < batch_lengths[:, None]
                 if split == "train":
                     moments.update(features, valid)
@@ -110,6 +117,8 @@ def prepare_probe_datasets(datasets, provenance, configuration, device, *, batch
             torch.cuda.empty_cache()
     result = dict(provenance)
     result["motion_dim"] = feature_dim
+    if layout is not None and layout.patchified:
+        result["motion_num_tokens"] = layout.token_num_frames
     result["probe"] = {**configuration, "extractor": feature_metadata}
     print(
         f"RAM motion features ready: {sum(dataset.motion_bank.values.numel() * 4 for dataset in datasets.values()) / 2**30:.2f} GiB; "

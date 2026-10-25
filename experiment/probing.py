@@ -40,7 +40,8 @@ class FrozenFrameExtractor:
         factory = getattr(motion_transformer_1d, name, None)
         if factory is None or not name.startswith("mot_") or "predictor" in name:
             raise ValueError(f"Unsupported encoder factory: {name}")
-        self.encoder = factory(in_chans=int(data["motion_dim"]), num_frames=int(data["num_frames"]))
+        self.encoder = factory(in_chans=int(data["motion_dim"]), num_frames=int(data["num_frames"]),
+                               patchify=config["meta"].get("patchify", False))
         if isinstance(layer, bool) or not isinstance(layer, int) or not 1 <= layer <= len(self.encoder.blocks):
             raise ValueError("feature_layer must be a 1-based transformer block index")
         state = saved[encoder_key]
@@ -48,6 +49,7 @@ class FrozenFrameExtractor:
         self.encoder.load_state_dict(state, strict=True)
         self.device = torch.device(device)
         self.feature_dim = self.encoder.embed_dim
+        self.token_layout = self.encoder.token_layout
         self.num_frames = self.encoder.num_frames
         self.input_dim = self.encoder.in_chans
         self.layer = layer
@@ -77,6 +79,8 @@ class FrozenFrameExtractor:
             "pretraining_input_stats": str(stats) if stats else None,
             "extraction_dtype": "float32", "cache_storage": "anonymous_cpu_ram_only",
         }
+        if self.token_layout.patchified:
+            self.metadata["token_layout"] = self.token_layout.signature()
         if stats is not None:
             self.metadata["pretraining_stats_sha256"] = {
                 k: _sha256_file(stats / (k + ".npy")) for k in ("mean", "std")
