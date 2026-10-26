@@ -72,6 +72,8 @@ def restore_rng(state, generator):
 
 
 def _validate_motion_depth(args):
+    if getattr(args, "patchify", False) and args.mode != "supervised":
+        raise ValueError("--patchify requires --mode supervised")
     depth = getattr(args, "motion_depth", None)
     if depth is not None:
         if isinstance(depth, bool) or not isinstance(depth, int) or depth <= 0:
@@ -128,6 +130,8 @@ def run(args):
     )
     if getattr(args, "motion_depth", None) is not None:
         run_name += f"-depth-{args.motion_depth}"
+    if getattr(args, "patchify", False):
+        run_name += "-patch"
     default_output = PROJECT_ROOT / "output/segmentation" / run_name
     if getattr(args, "representation", None) == "LocalMotionJEPARep":
         default_output /= "local-motion-jepa"
@@ -165,7 +169,7 @@ def run(args):
         model = MotionSegmentationTransformer(
             args.model_size, input_dim=meta["motion_dim"],
             num_classes=datasets["train"].num_classes, num_frames=meta["num_frames"],
-            motion_depth=getattr(args, "motion_depth", None),
+            motion_depth=getattr(args, "motion_depth", None), patchify=getattr(args, "patchify", False),
         ).to(device)
     signature = {
         "architecture": model.config, "dataset_root": str(root),
@@ -326,6 +330,7 @@ def build_parser():
     add_argument(parser)
     parser.add_argument("--dataset-root", type=Path, default=PROJECT_ROOT / "dataset/babel-segmentation-120-processed-nframes30-150")
     parser.add_argument("--model-size", choices=tuple(MODEL_SPECS), default="base")
+    parser.add_argument("--patchify", action="store_true", help="Three-frame raw motion patches with per-frame segmentation logits")
     parser.add_argument("--motion-depth", type=int, help="Override supervised motion block count; keep model-size width and heads")
     parser.add_argument("--mode", choices=("supervised", "probe"), default="supervised")
     parser.add_argument("--feature-source", choices=("raw", "jepa"), default="jepa")
@@ -380,7 +385,7 @@ def main():
             model = MotionSegmentationProbe(feature_dim, 120, meta["num_frames"], torch.zeros(feature_dim),
                                            torch.ones(feature_dim), num_heads=args.probe_heads)
         else:
-            model = MotionSegmentationTransformer(args.model_size, input_dim=rep.FEATURE_DIM, num_frames=meta["num_frames"], motion_depth=args.motion_depth)
+            model = MotionSegmentationTransformer(args.model_size, input_dim=rep.FEATURE_DIM, num_frames=meta["num_frames"], motion_depth=args.motion_depth, patchify=args.patchify)
         print(json.dumps({"architecture": model.config, "parameters": model.parameter_counts()}, indent=2))
         return
     print(json.dumps(run(args), indent=2))

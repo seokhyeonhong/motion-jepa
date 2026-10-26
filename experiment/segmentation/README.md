@@ -193,3 +193,19 @@ preset. Explicit depths get separate default output directories (e.g.
 `base-depth-6`), and the effective depth is saved in the checkpoint architecture.
 This option does not apply to the attentive probe head. Existing strict resume
 checks still require matching architecture, source hashes, and training settings.
+
+### Raw motion patchification
+
+Add `--mode supervised --model-size base --patchify` (optionally
+`--motion-depth 6`). A stride-3/kernel-3 Conv1d embeds consecutive frames;
+a linear head predicts three separate 120-class frame logits per token.
+150 frames become 50 tokens and return 150 frame predictions. Labels,
+supervision masks, loss and evaluation populations remain frame-level.
+
+Invalid input frames are zeroed. A patch is active when any constituent frame
+is valid, retaining supervision on incomplete final patches; fully padded
+patches are masked. Non-multiple-of-three input lengths are padded internally
+and cropped after decoding. This differs from retrieval's complete-patch-only
+policy, intentionally preserving all segmentation frames. The policy is saved
+in the architecture signature. Defaults remain frame-level, dropout 0.0 and
+weight decay 0.01. Patch runs have a separate default output suffix `-patch`.

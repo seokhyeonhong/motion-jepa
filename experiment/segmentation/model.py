@@ -7,7 +7,7 @@ from model.modules import initialize_transformer
 from model.specs import MODEL_SPECS
 
 class MotionSegmentationTransformer(nn.Module):
-    def __init__(self, model_size="base", input_dim=366, num_classes=120, num_frames=150, motion_depth=None):
+    def __init__(self, model_size="base", input_dim=366, num_classes=120, num_frames=150, motion_depth=None, patchify=False):
         super().__init__()
         if model_size not in MODEL_SPECS:
             raise ValueError(f"Unknown model size: {model_size}")
@@ -24,9 +24,18 @@ class MotionSegmentationTransformer(nn.Module):
             **spec,"input_dim":input_dim,"num_classes":num_classes,
             "num_frames":num_frames,"position_encoding":"rope","rope_theta":100.,
             "rope_time_scale":1.,"mlp_ratio":4.,"dropout":0.,"pretrained":False}
-        self.encoder=MotionTransformer1D(in_chans=input_dim,num_frames=num_frames,
-            **spec)
-        self.head=nn.Linear(spec["embed_dim"],num_classes)
+        if not isinstance(patchify, bool):
+            raise ValueError("patchify must be a boolean")
+        self.patchify = patchify
+        encoder_frames = ((num_frames + 2) // 3) * 3 if patchify else num_frames
+        if patchify:
+            self.config.update(model_version="raw_rope_patch_v1", patchify=True,
+                temporal_patch_size=3, encoder_num_frames=encoder_frames,
+                patch_validity="any_valid_frame_zero_padded",
+                frame_decoder="linear_three_frame_logits")
+        self.encoder=MotionTransformer1D(in_chans=input_dim,num_frames=encoder_frames,
+            patchify=patchify, **spec)
+        self.head=nn.Linear(spec["embed_dim"],num_classes * (3 if patchify else 1))
         self.head.apply(initialize_transformer)
 
     def forward(self,motion,valid_frames,fps):
@@ -41,8 +50,20 @@ class MotionSegmentationTransformer(nn.Module):
         if fps.shape!=(motion.shape[0],) or not torch.isfinite(fps).all() or not (fps>0).all():
             raise ValueError("Expected finite positive FPS per sample")
         motion=motion.masked_fill(~active.unsqueeze(-1),0)
-        tokens=self.encoder(motion,fps,masks=None,valid_frames=active)
-        return self.head(tokens).masked_fill(~active.unsqueeze(-1),0)
+        encoder_active = active
+        if self.patchify:
+            padding = self.encoder.num_frames - self.num_frames
+            motion = torch.nn.functional.pad(motion, (0, 0, 0, padding))
+            padded_active = torch.nn.functional.pad(active, (0, padding), value=False)
+            # Keep partial patches so every real frame retains supervision.
+            # Invalid inputs were zeroed above; fully padded patches stay masked.
+            patch_active = padded_active.reshape(len(active), -1, 3).any(dim=-1)
+            encoder_active = patch_active.repeat_interleave(3, dim=1)
+        tokens=self.encoder(motion,fps,masks=None,valid_frames=encoder_active)
+        logits = self.head(tokens)
+        if self.patchify:
+            logits = logits.reshape(len(active), -1, self.num_classes)[:, :self.num_frames]
+        return logits.masked_fill(~active.unsqueeze(-1),0)
 
     def parameter_counts(self):
         encoder=sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
