@@ -31,8 +31,14 @@ class AlignmentConfig:
     motion_encoder: str = "transformer"
     probe_heads: int = 6
     patchify: bool = False
+    motion_depth: int | None = None
 
     def __post_init__(self):
+        if self.motion_depth is not None:
+            if isinstance(self.motion_depth, bool) or not isinstance(self.motion_depth, int) or self.motion_depth < 1:
+                raise ValueError("motion_depth must be a positive integer")
+            if self.motion_encoder == "attentive_probe":
+                raise ValueError("motion_depth requires a Transformer motion encoder")
         if self.patchify and (self.motion_encoder != "transformer" or self.num_frames < 3):
             raise ValueError("patchify requires a raw-motion transformer with at least three frames")
         if self.motion_encoder not in {"transformer", "attentive_probe", "transformer_probe"}:
@@ -60,12 +66,15 @@ class AlignmentConfig:
 class SequenceEncoder(nn.Module):
     """Shared MotionJEPA backbone followed by a masked retrieval readout."""
 
-    def __init__(self, input_dim: int, config: AlignmentConfig, *, num_tokens: int, fps: float, patchify: bool = False):
+    def __init__(self, input_dim: int, config: AlignmentConfig, *, num_tokens: int, fps: float, patchify: bool = False, depth: int | None = None):
         super().__init__()
         self.input_dim = input_dim
         self.fps = fps
+        spec = dict(MODEL_SPECS[config.model_size])
+        if depth is not None:
+            spec["depth"] = depth
         self.backbone = MotionTransformer1D(
-            in_chans=input_dim, num_frames=num_tokens, patchify=patchify, **MODEL_SPECS[config.model_size],
+            in_chans=input_dim, num_frames=num_tokens, patchify=patchify, **spec,
         )
         self.output_projection = (
             nn.Identity() if config.embed_dim == config.retrieval_dim
@@ -123,7 +132,7 @@ class TextMotionAlignment(nn.Module):
         else:
             self.motion_encoder = SequenceEncoder(
                 config.motion_dim, config, num_tokens=config.num_frames, fps=config.fps,
-                patchify=config.patchify,
+                patchify=config.patchify, depth=config.motion_depth,
             )
 
         if config.motion_encoder == "transformer_probe":

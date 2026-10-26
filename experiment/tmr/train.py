@@ -187,6 +187,11 @@ def load_alignment_checkpoint(path: Path) -> dict[str, Any]:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if getattr(args, "motion_depth", None) is not None:
+        if args.motion_depth < 1:
+            raise ValueError("--motion-depth must be positive")
+        if args.mode == "probe" and args.probe_architecture != "transformer":
+            raise ValueError("--motion-depth requires --probe-architecture transformer in probe mode")
     if getattr(args, "mode", "supervised") == "probe":
         if getattr(args, "patchify", False):
             raise ValueError("--patchify is only supported in supervised raw-motion mode")
@@ -232,6 +237,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         default_output /= "patchify"
     if args.train_fraction != 1:
         default_output /= f"frac{args.train_fraction:g}"
+    if getattr(args, "motion_depth", None) is not None:
+        default_output /= f"motion-depth-{args.motion_depth}"
     default_output /= f"seed-{args.seed}"
     output = Path(args.output_root or default_output)
     output = output.expanduser().resolve()
@@ -271,8 +278,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         motion_encoder="transformer_probe" if transformer_probe else "attentive_probe" if probe_mode else "transformer",
         probe_heads=args.probe_heads if probe_mode else 6,
         patchify=getattr(args, "patchify", False),
+        motion_depth=getattr(args, "motion_depth", None),
     )
     model_settings = asdict(model_config)
+    if model_config.motion_depth is None:
+        model_settings.pop("motion_depth")
     if not model_config.patchify:
         model_settings.pop("patchify")
     if not probe_mode:
@@ -463,6 +473,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--probe-architecture", choices=("attentive", "transformer"), default="attentive")
     parser.add_argument("--probe-heads", type=int, default=6)
     parser.add_argument("--model-size", choices=tuple(MODEL_SPECS), default="base", help="Text and motion encoder size; defaults to base.")
+    parser.add_argument("--motion-depth", type=int, help="Override only motion Transformer block count; text encoder and width/heads retain the size preset.")
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--annotations-path", type=Path, default=DEFAULT_ANNOTATIONS_PATH)
     parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)
