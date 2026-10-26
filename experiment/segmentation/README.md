@@ -183,3 +183,13 @@ cache path) switch to their local counterparts. Explicit custom paths are
 preserved and validated. Local runs use a separate `local-motion-jepa` default
 output subdirectory. Omit the option or use `MotionJEPAMotionRep` for the original
 global defaults.
+
+### Motion depth override
+
+For raw supervised segmentation, add `--model-size base --motion-depth 6`
+to use six motion Transformer blocks with Base width 384 and six attention heads.
+Any positive block count is accepted. Omitting the option preserves the model-size
+preset. Explicit depths get separate default output directories (e.g.
+`base-depth-6`), and the effective depth is saved in the checkpoint architecture.
+This option does not apply to the attentive probe head. Existing strict resume
+checks still require matching architecture, source hashes, and training settings.

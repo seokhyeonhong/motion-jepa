@@ -7,21 +7,26 @@ from model.modules import initialize_transformer
 from model.specs import MODEL_SPECS
 
 class MotionSegmentationTransformer(nn.Module):
-    def __init__(self, model_size="base", input_dim=366, num_classes=120, num_frames=150):
+    def __init__(self, model_size="base", input_dim=366, num_classes=120, num_frames=150, motion_depth=None):
         super().__init__()
         if model_size not in MODEL_SPECS:
             raise ValueError(f"Unknown model size: {model_size}")
         for name,value in (("input_dim",input_dim),("num_classes",num_classes),("num_frames",num_frames)):
             if isinstance(value,bool) or not isinstance(value,int) or value<=0:
                 raise ValueError(f"{name} must be a positive integer")
+        spec = dict(MODEL_SPECS[model_size])
+        if motion_depth is not None:
+            if isinstance(motion_depth, bool) or not isinstance(motion_depth, int) or motion_depth <= 0:
+                raise ValueError("motion_depth must be a positive integer")
+            spec["depth"] = motion_depth
         self.input_dim,self.num_classes,self.num_frames=input_dim,num_classes,num_frames
         self.config={"model_version":"raw_rope_v1","model_size":model_size,
-            **MODEL_SPECS[model_size],"input_dim":input_dim,"num_classes":num_classes,
+            **spec,"input_dim":input_dim,"num_classes":num_classes,
             "num_frames":num_frames,"position_encoding":"rope","rope_theta":100.,
             "rope_time_scale":1.,"mlp_ratio":4.,"dropout":0.,"pretrained":False}
         self.encoder=MotionTransformer1D(in_chans=input_dim,num_frames=num_frames,
-            **MODEL_SPECS[model_size])
-        self.head=nn.Linear(MODEL_SPECS[model_size]["embed_dim"],num_classes)
+            **spec)
+        self.head=nn.Linear(spec["embed_dim"],num_classes)
         self.head.apply(initialize_transformer)
 
     def forward(self,motion,valid_frames,fps):

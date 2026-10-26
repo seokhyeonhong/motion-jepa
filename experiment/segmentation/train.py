@@ -71,7 +71,17 @@ def restore_rng(state, generator):
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
+def _validate_motion_depth(args):
+    depth = getattr(args, "motion_depth", None)
+    if depth is not None:
+        if isinstance(depth, bool) or not isinstance(depth, int) or depth <= 0:
+            raise ValueError("motion_depth must be a positive integer")
+        if args.mode != "supervised":
+            raise ValueError("--motion-depth requires --mode supervised")
+
+
 def run(args):
+    _validate_motion_depth(args)
     from experiment.representation import select_defaults
     select_defaults(args, "segmentation")
     fraction = getattr(args, "train_fraction", 1.0)
@@ -116,6 +126,8 @@ def run(args):
         f"{args.model_size}-probe-{args.feature_source}"
         + (f"-layer-{args.feature_layer}" if args.feature_layer is not None else "")
     )
+    if getattr(args, "motion_depth", None) is not None:
+        run_name += f"-depth-{args.motion_depth}"
     default_output = PROJECT_ROOT / "output/segmentation" / run_name
     if getattr(args, "representation", None) == "LocalMotionJEPARep":
         default_output /= "local-motion-jepa"
@@ -153,6 +165,7 @@ def run(args):
         model = MotionSegmentationTransformer(
             args.model_size, input_dim=meta["motion_dim"],
             num_classes=datasets["train"].num_classes, num_frames=meta["num_frames"],
+            motion_depth=getattr(args, "motion_depth", None),
         ).to(device)
     signature = {
         "architecture": model.config, "dataset_root": str(root),
@@ -313,6 +326,7 @@ def build_parser():
     add_argument(parser)
     parser.add_argument("--dataset-root", type=Path, default=PROJECT_ROOT / "dataset/babel-segmentation-120-processed-nframes30-150")
     parser.add_argument("--model-size", choices=tuple(MODEL_SPECS), default="base")
+    parser.add_argument("--motion-depth", type=int, help="Override supervised motion block count; keep model-size width and heads")
     parser.add_argument("--mode", choices=("supervised", "probe"), default="supervised")
     parser.add_argument("--feature-source", choices=("raw", "jepa"), default="jepa")
     parser.add_argument("--feature-layer", type=int, help="One-based JEPA block output to probe")
@@ -350,6 +364,7 @@ def main():
     args = build_parser().parse_args()
     from experiment.representation import select_defaults
     select_defaults(args, "segmentation")
+    _validate_motion_depth(args)
     if args.describe:
         from motion_rep.registry import get_representation
         meta_path = args.dataset_root / "meta.json"
@@ -365,7 +380,7 @@ def main():
             model = MotionSegmentationProbe(feature_dim, 120, meta["num_frames"], torch.zeros(feature_dim),
                                            torch.ones(feature_dim), num_heads=args.probe_heads)
         else:
-            model = MotionSegmentationTransformer(args.model_size, input_dim=rep.FEATURE_DIM, num_frames=meta["num_frames"])
+            model = MotionSegmentationTransformer(args.model_size, input_dim=rep.FEATURE_DIM, num_frames=meta["num_frames"], motion_depth=args.motion_depth)
         print(json.dumps({"architecture": model.config, "parameters": model.parameter_counts()}, indent=2))
         return
     print(json.dumps(run(args), indent=2))
