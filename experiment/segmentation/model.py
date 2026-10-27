@@ -96,3 +96,60 @@ class MotionSegmentationProbe(nn.Module):
     def parameter_counts(self):
         total = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return dict(encoder=0, probe=total, total=total)
+
+
+class MotionSegmentationPatchTransformerProbe(nn.Module):
+    """Concatenated frozen patch features into one Base-width Transformer."""
+
+    def __init__(self, input_dim, num_classes, num_frames, mean, std):
+        super().__init__()
+        if any(isinstance(v, bool) or not isinstance(v, int) or v <= 0
+               for v in (input_dim, num_classes, num_frames)) or num_frames % 3:
+            raise ValueError("Positive dimensions and a frame count divisible by three are required")
+        mean, std = torch.as_tensor(mean).float(), torch.as_tensor(std).float()
+        if mean.shape != (input_dim,) or std.shape != mean.shape:
+            raise ValueError("Feature normalization must match concatenated input width")
+        if not torch.isfinite(mean).all() or not torch.isfinite(std).all() or (std <= 0).any():
+            raise ValueError("Feature normalization must be finite with positive std")
+        self.input_dim, self.num_frames, self.num_classes = input_dim, num_frames, num_classes
+        self.register_buffer("feature_mean", mean.clone())
+        self.register_buffer("feature_std", std.clone())
+        self.encoder = MotionTransformer1D(
+            in_chans=input_dim, num_frames=num_frames // 3,
+            embed_dim=384, depth=1, num_heads=6, patchify=False,
+        )
+        self.head = nn.Linear(384, 3 * num_classes)
+        self.head.apply(initialize_transformer)
+        self.config = {
+            "model_version": "jepa_patch_motion_transformer_probe_v1",
+            "input_dim": input_dim, "num_frames": num_frames, "num_classes": num_classes,
+            "depth": 1, "embed_dim": 384, "num_heads": 6, "mlp_ratio": 4.,
+            "dropout": 0., "patchify": False, "feature_patch_size": 3,
+            "position_encoding": "rope", "normalization": "training_patch_feature_mean_std",
+            "frame_decoder": "linear_three_frame_logits",
+            "patch_validity": "any_valid_frame_zero_padded",
+        }
+
+    def forward(self, features, valid_frames, fps):
+        if features.ndim != 3 or features.shape[1:] != (self.num_frames // 3, self.input_dim):
+            raise ValueError("Invalid patch feature shape")
+        if valid_frames.dtype != torch.bool or valid_frames.shape != (len(features), self.num_frames):
+            raise ValueError("Expected boolean frame validity mask")
+        valid_frames = valid_frames.to(features.device)
+        active = valid_frames.reshape(len(features), -1, 3).any(-1)
+        if not active.any(1).all():
+            raise ValueError("Each sample must contain a valid frame")
+        fps = torch.as_tensor(fps, device=features.device, dtype=torch.float32)
+        if fps.shape != (len(features),) or not torch.isfinite(fps).all() or (fps <= 0).any():
+            raise ValueError("Expected finite positive FPS per sample")
+        x = features.masked_fill(~active[..., None], 0)
+        x = ((x - self.feature_mean) / self.feature_std).masked_fill(~active[..., None], 0)
+        # Patch centers are three raw frames apart; a constant RoPE offset cancels.
+        x = self.encoder(x, fps / 3, valid_frames=active)
+        logits = self.head(x).reshape(len(features), self.num_frames, self.num_classes)
+        return logits.masked_fill(~valid_frames[..., None], 0)
+
+    def parameter_counts(self):
+        encoder = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
+        head = sum(p.numel() for p in self.head.parameters() if p.requires_grad)
+        return dict(encoder=encoder, head=head, total=encoder + head)

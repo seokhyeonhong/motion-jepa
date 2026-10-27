@@ -21,7 +21,7 @@ from experiment.utils import (
 from utils.schedulers import WarmupCosineSchedule
 from model.specs import MODEL_SPECS
 from .metrics import FrameMetricAccumulator
-from .model import MotionSegmentationProbe, MotionSegmentationTransformer
+from .model import MotionSegmentationProbe, MotionSegmentationTransformer, MotionSegmentationPatchTransformerProbe
 from .subset import select_training_subset
 
 
@@ -45,7 +45,7 @@ def evaluate_split(model, loader, device):
     for motion, fps, lengths, labels, supervised, _ in loader:
         motion, fps = motion.to(device), fps.to(device)
         labels, supervised = labels.to(device, dtype=torch.float32), supervised.to(device)
-        valid = torch.arange(motion.shape[1], device=device)[None] < lengths.to(device)[:, None]
+        valid = torch.arange(labels.shape[1], device=device)[None] < lengths.to(device)[:, None]
         selected = supervised.bool() & valid
         count = int(selected.sum())
         if count == 0:
@@ -82,6 +82,15 @@ def restore_rng(state, generator):
 
 
 def _validate_motion_depth(args):
+    from .probe import selected_feature_layers
+    layers = selected_feature_layers(args)
+    architecture = getattr(args, "probe_architecture", "attentive")
+    if getattr(args, "feature_layers", None) is not None and (
+            args.mode != "probe" or args.feature_source != "jepa" or architecture != "patch-transformer"):
+        raise ValueError("--feature-layers requires JEPA --mode probe --probe-architecture patch-transformer")
+    if architecture == "patch-transformer" and (
+            args.mode != "probe" or args.feature_source != "jepa" or args.checkpoint is None or layers is None):
+        raise ValueError("patch-transformer requires JEPA probe mode, checkpoint, and selected layers")
     if getattr(args, "patchify", False) and args.mode != "supervised":
         raise ValueError("--patchify requires --mode supervised")
     depth = getattr(args, "motion_depth", None)
@@ -138,6 +147,9 @@ def run(args):
         f"{args.model_size}-probe-{args.feature_source}"
         + (f"-layer-{args.feature_layer}" if args.feature_layer is not None else "")
     )
+    if getattr(args, "probe_architecture", "attentive") == "patch-transformer":
+        from .probe import selected_feature_layers
+        run_name += "-patch-transformer-layers-" + "-".join(map(str, selected_feature_layers(args)))
     if getattr(args, "motion_depth", None) is not None:
         run_name += f"-depth-{args.motion_depth}"
     if getattr(args, "patchify", False):
@@ -169,9 +181,11 @@ def run(args):
         from .probe import prepare_probe_datasets
         datasets, mean, std, feature_metadata = prepare_probe_datasets(datasets, args, device)
         _seed_all(args.seed)
-        model = MotionSegmentationProbe(
+        patch_probe = getattr(args, "probe_architecture", "attentive") == "patch-transformer"
+        probe_class = MotionSegmentationPatchTransformerProbe if patch_probe else MotionSegmentationProbe
+        model = probe_class(
             feature_metadata["feature_dim"], datasets["train"].num_classes,
-            meta["num_frames"], mean, std, num_heads=args.probe_heads,
+            meta["num_frames"], mean, std, **({} if patch_probe else {"num_heads": args.probe_heads}),
         ).to(device)
     else:
         if args.checkpoint is not None or args.feature_layer is not None:
@@ -257,7 +271,7 @@ def run(args):
         model.train()
         motion, fps = motion.to(device), fps.to(device)
         labels, supervised = labels.to(device, dtype=torch.float32), supervised.to(device)
-        valid = torch.arange(motion.shape[1], device=device)[None] < lengths.to(device)[:, None]
+        valid = torch.arange(labels.shape[1], device=device)[None] < lengths.to(device)[:, None]
         selected = supervised.bool() & valid
         count = int(selected.sum())
         if not count:
@@ -315,6 +329,9 @@ def run(args):
         "parameters": model.parameter_counts(), "checkpoint": str(best),
         "metrics": str(output / "metrics.json"), "signature": signature,
     }
+    if getattr(args, "probe_architecture", "attentive") == "patch-transformer":
+        from .probe import selected_feature_layers
+        summary["feature_layers"] = selected_feature_layers(args)
     _atomic_json_save(summary, output / "summary.json")
     if findings is not None:
         findings.mkdir(parents=True, exist_ok=True)
@@ -342,7 +359,12 @@ def build_parser():
     parser.add_argument("--motion-depth", type=int, help="Override supervised motion block count; keep model-size width and heads")
     parser.add_argument("--mode", choices=("supervised", "probe"), default="supervised")
     parser.add_argument("--feature-source", choices=("raw", "jepa"), default="jepa")
-    parser.add_argument("--feature-layer", type=int, help="One-based JEPA block output to probe")
+    feature_selection = parser.add_mutually_exclusive_group()
+    feature_selection.add_argument("--feature-layer", type=int, help="One-based JEPA block output (legacy scalar)")
+    feature_selection.add_argument("--feature-layers", type=int, nargs="+",
+                                   help="Ordered JEPA layers to concatenate, e.g. 3 6 9 12")
+    parser.add_argument("--probe-architecture", choices=("attentive", "patch-transformer"),
+                        default="attentive", help="Attentive frame head or one Base-width Transformer on patch features")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--encoder-key", choices=("encoder", "target_encoder"), default="target_encoder")
     parser.add_argument("--precompute-batch-size", type=int, default=256)
@@ -390,8 +412,14 @@ def main():
             meta = {"num_frames": 150}
         if args.mode == "probe":
             feature_dim = rep.FEATURE_DIM if args.feature_source == "raw" else MODEL_SPECS[args.model_size]["embed_dim"]
-            model = MotionSegmentationProbe(feature_dim, 120, meta["num_frames"], torch.zeros(feature_dim),
-                                           torch.ones(feature_dim), num_heads=args.probe_heads)
+            if args.probe_architecture == "patch-transformer":
+                from .probe import selected_feature_layers
+                feature_dim *= len(selected_feature_layers(args))
+                model = MotionSegmentationPatchTransformerProbe(
+                    feature_dim, 120, meta["num_frames"], torch.zeros(feature_dim), torch.ones(feature_dim))
+            else:
+                model = MotionSegmentationProbe(feature_dim, 120, meta["num_frames"], torch.zeros(feature_dim),
+                                               torch.ones(feature_dim), num_heads=args.probe_heads)
         else:
             model = MotionSegmentationTransformer(args.model_size, input_dim=rep.FEATURE_DIM, num_frames=meta["num_frames"], motion_depth=args.motion_depth, patchify=args.patchify)
         print(json.dumps({"architecture": model.config, "parameters": model.parameter_counts()}, indent=2))

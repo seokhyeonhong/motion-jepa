@@ -238,3 +238,63 @@ drops its incomplete final batch, but prefetching continues across passes.
 Workers persist when num_workers is positive; probe mode remains single-process.
 This changes the trainer code signature, so old checkpoints do not pass the
 existing strict resume-signature check.
+
+
+### Concatenated frozen patch JEPA features
+
+Use the one-block Base-width segmentation decoder with an ordered layer list:
+
+```bash
+python -m experiment.segmentation.train \
+  --mode probe --feature-source jepa --probe-architecture patch-transformer \
+  --checkpoint output/mot_base_1d-bs.512-it.200000-nframes60-150_allctx_patch/motion-jepa-1d-it200000.pth.tar \
+  --encoder-key target_encoder --feature-layers 3 6 9 12 \
+  --representation MotionJEPAMotionRep \
+  --dataset-root dataset/babel-segmentation-120-processed-nframes30-150 \
+  --train-fraction 1.0 --seed 42 --iterations 30000 --warmup-iterations 1500 \
+  --eval-interval 3000 --checkpoint-interval 3000 --batch-size 128 \
+  --eval-batch-size 256 --precompute-batch-size 128 --num-workers 8 \
+  --lr 0.0003 --final-lr 0.000003 --weight-decay 0.01 \
+  --output-root output/segmentation/global-patch-jepa-concat-3-6-9-12/seed-42
+```
+
+Set the dataset and checkpoint paths for the current server. Pretraining input
+statistics are resolved from the checkpoint configuration, as with existing JEPA
+probes; that statistics directory must also be accessible.
+
+- Layers are one-based and concatenated in the requested order. Use
+  `--feature-layers 3 6` for two layers or `--feature-layers 3` for one.
+  The legacy `--feature-layer 3` also works; the two flags are mutually exclusive.
+  Empty, duplicate, nonpositive, and out-of-range layer selections are rejected.
+- The frozen EMA encoder is evaluated once per batch, through the highest
+  requested layer. Features are captured before the encoder's final LayerNorm.
+  This decoder requires a three-frame patch checkpoint. All cached features
+  remain in CPU RAM, and the frozen backbone is released before head training.
+- Each layer/channel uses its own mean/std fitted only on valid training patch
+  tokens. Concatenation changes channels, never temporal order: four Base layers
+  give `[B,50,1536]`, projected to `[B,50,384]`.
+- The trainable decoder has an input projection, exactly one Base-width
+  MotionTransformer1D block (384 width, six heads, RoPE, MLP ratio 4), final
+  LayerNorm, and a 384-to-360 frame classifier. There is no second patchification.
+  Every token emits three ordered 120-label frame logits.
+- Invalid raw frames are zeroed after input normalization. A patch is active
+  when any of its frames is valid, preserving partial-patch tail supervision.
+  Fully padded patches and invalid output frames remain masked. This matches
+  the completed single-layer patch segmentation experiments.
+- Dropout remains 0.0; weight decay defaults to 0.01. The original attentive
+  frame-probe path remains the default. The raw supervised `--patchify` and
+  `--motion-depth` flags do not apply to this decoder.
+- The ordered layer list and fusion protocol are saved in checkpoint feature
+  provenance and the summary. Resume requires the same list/order, source,
+  dataset, and settings; it does not reinterpret old checkpoints.
+
+For 120 labels and Base JEPA features, trainable parameter counts are:
+
+| Selected layers | Concatenated width | Trainable parameters |
+| --- | ---: | ---: |
+| One | 384 | 2,061,672 |
+| Two | 768 | 2,209,128 |
+| Four | 1536 | 2,504,040 |
+
+The frozen JEPA backbone is excluded. All widths retain the same 384-wide
+Transformer block; only the input projection grows.
