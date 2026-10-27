@@ -298,3 +298,36 @@ For 120 labels and Base JEPA features, trainable parameter counts are:
 
 The frozen JEPA backbone is excluded. All widths retain the same 384-wide
 Transformer block; only the input projection grows.
+
+
+### LoRA fine-tuning of JEPA
+
+Use `--mode lora --checkpoint PATH` for the entire JEPA encoder with rank-8
+attention LoRA followed directly by a single linear segmentation head.
+Original JEPA weights remain frozen; LoRA adapters and the linear head train.
+No intermediate concatenation, MLP, extra Transformer or feature-statistics
+calibration is used. `--mode probe` retains all existing frozen probing options.
+
+```sh
+python -m experiment.segmentation.train --mode lora --lora-rank 8 \
+  --checkpoint output/mot_base_1d-bs.512-it.200000-nframes60-150_allctx_patch/motion-jepa-1d-it200000.pth.tar \
+  --output-root output/segmentation/global-patch-lora-linear/seed-42
+```
+
+The final encoder output includes JEPA's original LayerNorm. A patch checkpoint
+uses Linear(width, 3*120), reshaped to frame-level logits; a frame checkpoint uses
+Linear(width, 120). Layout and depth are read from the checkpoint. Omit
+feature-layer and probe-architecture arguments for LoRA. Intermediate layers or
+concatenations are rejected. Global/local dataset representation must match JEPA.
+
+`--lora-rank` defaults to 8; `--lora-alpha` defaults to rank (scale=1).
+Adapters target fused attention QKV and output projections in every JEPA block.
+B initializes to zero, preserving initial JEPA outputs. There is no adapter
+dropout; frozen-backbone dropout stays disabled. Inputs retain checkpoint
+pretraining normalization, and padded frames are masked.
+
+Training is online, using persistent training workers when num-workers > 0.
+Checkpoints include frozen weights, adapters, linear head, input statistics,
+optimizer and RNG state. Strict resume checks provenance, rank, alpha and recipe.
+Parameter reports separate trainable adapters/head from frozen weights.
+For Base patch rank8: 221184 adapter + 138600 head = 359784 trainable parameters.

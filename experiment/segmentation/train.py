@@ -86,11 +86,19 @@ def _validate_motion_depth(args):
     layers = selected_feature_layers(args)
     architecture = getattr(args, "probe_architecture", "attentive")
     if getattr(args, "feature_layers", None) is not None and (
-            args.mode != "probe" or args.feature_source != "jepa" or architecture != "patch-transformer"):
+            args.mode != "lora" and (args.mode != "probe" or args.feature_source != "jepa" or architecture != "patch-transformer")):
         raise ValueError("--feature-layers requires JEPA --mode probe --probe-architecture patch-transformer")
-    if architecture == "patch-transformer" and (
-            args.mode != "probe" or args.feature_source != "jepa" or args.checkpoint is None or layers is None):
+    if args.mode != "lora" and architecture == "patch-transformer" and (
+            args.mode not in ("probe", "lora") or args.feature_source != "jepa" or args.checkpoint is None or layers is None):
         raise ValueError("patch-transformer requires JEPA probe mode, checkpoint, and selected layers")
+    if args.mode == "lora":
+        if args.feature_source != "jepa" or args.checkpoint is None:
+            raise ValueError("LoRA requires JEPA checkpoint and selected layers")
+        if args.lora_rank <= 0 or (args.lora_alpha is not None and
+                (not math.isfinite(args.lora_alpha) or args.lora_alpha <= 0)):
+            raise ValueError("LoRA rank and alpha must be positive and finite")
+        if args.precompute_batch_size <= 0:
+            raise ValueError("precompute_batch_size must be positive")
     if getattr(args, "patchify", False) and args.mode != "supervised":
         raise ValueError("--patchify requires --mode supervised")
     depth = getattr(args, "motion_depth", None)
@@ -147,13 +155,15 @@ def run(args):
         f"{args.model_size}-probe-{args.feature_source}"
         + (f"-layer-{args.feature_layer}" if args.feature_layer is not None else "")
     )
-    if getattr(args, "probe_architecture", "attentive") == "patch-transformer":
+    if args.mode != "lora" and getattr(args, "probe_architecture", "attentive") == "patch-transformer":
         from .probe import selected_feature_layers
         run_name += "-patch-transformer-layers-" + "-".join(map(str, selected_feature_layers(args)))
     if getattr(args, "motion_depth", None) is not None:
         run_name += f"-depth-{args.motion_depth}"
     if getattr(args, "patchify", False):
         run_name += "-patch"
+    if args.mode == "lora":
+        run_name += f"-lora-r{args.lora_rank}"
     default_output = PROJECT_ROOT / "output/segmentation" / run_name
     if getattr(args, "representation", None) == "LocalMotionJEPARep":
         default_output /= "local-motion-jepa"
@@ -177,7 +187,12 @@ def run(args):
     print(f"Segmentation samples: train={len(datasets['train'])} (fraction={fraction:g}), "
           f"val={len(datasets['val'])}, test={len(datasets['test'])}", flush=True)
     feature_metadata = None
-    if args.mode == "probe":
+    if args.mode == "lora":
+        from .lora import prepare_lora_model
+        model = prepare_lora_model(datasets["train"], args, device,
+                                   saved["model"] if args.resume else None)
+        feature_metadata = model.feature_metadata
+    elif args.mode == "probe":
         from .probe import prepare_probe_datasets
         datasets, mean, std, feature_metadata = prepare_probe_datasets(datasets, args, device)
         _seed_all(args.seed)
@@ -224,7 +239,12 @@ def run(args):
         signature["normalization"] = "training_feature_statistics_excluding_padding"
         for path in (Path(__file__).with_name("probe.py"), PROJECT_ROOT / "experiment/probing.py"):
             signature["code_hashes"][str(path.relative_to(PROJECT_ROOT))] = _sha256_file(path)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.mode == "lora":
+        signature["normalization"] = "pretraining_input_statistics_only"
+        path = Path(__file__).with_name("lora.py")
+        signature["code_hashes"][str(path.relative_to(PROJECT_ROOT))] = _sha256_file(path)
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
+                                 lr=args.lr, weight_decay=args.weight_decay)
     scheduler = WarmupCosineSchedule(
         optimizer, warmup_steps=args.warmup_iterations, start_lr=args.start_lr,
         ref_lr=args.lr, final_lr=args.final_lr, T_max=args.iterations,
@@ -319,7 +339,7 @@ def run(args):
     model.load_state_dict(_torch_load_checkpoint(best)["model"], strict=True)
     test = evaluate_split(model, loaders["test"], device) if len(datasets["test"]) else None
     summary = {
-        "input_source": args.feature_source if args.mode == "probe" else "raw",
+        "input_source": args.feature_source if args.mode in ("probe", "lora") else "raw",
         "mode": args.mode, "feature_layer": args.feature_layer,
         "iterations_completed": global_step, "global_step": global_step, "train_fraction": fraction,
         "samples_seen": global_step * args.batch_size,
@@ -329,7 +349,7 @@ def run(args):
         "parameters": model.parameter_counts(), "checkpoint": str(best),
         "metrics": str(output / "metrics.json"), "signature": signature,
     }
-    if getattr(args, "probe_architecture", "attentive") == "patch-transformer":
+    if args.mode != "lora" and getattr(args, "probe_architecture", "attentive") == "patch-transformer":
         from .probe import selected_feature_layers
         summary["feature_layers"] = selected_feature_layers(args)
     _atomic_json_save(summary, output / "summary.json")
@@ -357,7 +377,7 @@ def build_parser():
     parser.add_argument("--model-size", choices=tuple(MODEL_SPECS), default="base")
     parser.add_argument("--patchify", action="store_true", help="Three-frame raw motion patches with per-frame segmentation logits")
     parser.add_argument("--motion-depth", type=int, help="Override supervised motion block count; keep model-size width and heads")
-    parser.add_argument("--mode", choices=("supervised", "probe"), default="supervised")
+    parser.add_argument("--mode", choices=("supervised", "probe", "lora"), default="supervised")
     parser.add_argument("--feature-source", choices=("raw", "jepa"), default="jepa")
     feature_selection = parser.add_mutually_exclusive_group()
     feature_selection.add_argument("--feature-layer", type=int, help="One-based JEPA block output (legacy scalar)")
@@ -366,6 +386,8 @@ def build_parser():
     parser.add_argument("--probe-architecture", choices=("attentive", "patch-transformer"),
                         default="attentive", help="Attentive frame head or one Base-width Transformer on patch features")
     parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--lora-rank", type=int, default=8)
+    parser.add_argument("--lora-alpha", type=float, help="LoRA scaling numerator; defaults to rank")
     parser.add_argument("--encoder-key", choices=("encoder", "target_encoder"), default="target_encoder")
     parser.add_argument("--precompute-batch-size", type=int, default=256)
     parser.add_argument("--probe-heads", type=int, default=6)
@@ -410,7 +432,10 @@ def main():
         else:
             rep = get_representation(args.representation or "MotionJEPAMotionRep")
             meta = {"num_frames": 150}
-        if args.mode == "probe":
+        if args.mode == "lora":
+            from .lora import LoRASegmentation
+            model = LoRASegmentation(args, meta["num_frames"], 120, args.representation)
+        elif args.mode == "probe":
             feature_dim = rep.FEATURE_DIM if args.feature_source == "raw" else MODEL_SPECS[args.model_size]["embed_dim"]
             if args.probe_architecture == "patch-transformer":
                 from .probe import selected_feature_layers

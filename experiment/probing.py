@@ -42,6 +42,8 @@ class FrozenFrameExtractor:
             raise ValueError(f"Unsupported encoder factory: {name}")
         self.encoder = factory(in_chans=int(data["motion_dim"]), num_frames=int(data["num_frames"]),
                                patchify=config["meta"].get("patchify", False))
+        if layer is None:
+            layer = len(self.encoder.blocks)
         if isinstance(layer, bool) or not isinstance(layer, int) or not 1 <= layer <= len(self.encoder.blocks):
             raise ValueError("feature_layer must be a 1-based transformer block index")
         state = saved[encoder_key]
