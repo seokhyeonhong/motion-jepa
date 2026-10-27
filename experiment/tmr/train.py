@@ -202,13 +202,18 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--motion-depth must be positive")
         if args.mode == "probe" and args.probe_architecture != "transformer":
             raise ValueError("--motion-depth requires --probe-architecture transformer in probe mode")
+    if getattr(args, "feature_layers", None) is not None and (args.mode != "probe" or args.feature_source != "jepa"):
+        raise ValueError("--feature-layers requires JEPA probe mode")
     if getattr(args, "mode", "supervised") == "probe":
         if getattr(args, "patchify", False):
             raise ValueError("--patchify is only supported in supervised raw-motion mode")
         if args.precompute_batch_size < 1 or args.probe_heads < 1:
             raise ValueError("Precompute batch size and probe head count must be positive")
-        if args.feature_source == "jepa" and (args.checkpoint is None or args.feature_layer < 1):
-            raise ValueError("JEPA probing requires --checkpoint and a positive --feature-layer")
+        if args.feature_source == "jepa":
+            from .probing import selected_feature_layers
+            selected_feature_layers(args)
+            if args.checkpoint is None:
+                raise ValueError("JEPA probing requires --checkpoint")
         if args.feature_source == "raw" and args.checkpoint is not None:
             raise ValueError("Raw probing does not use --checkpoint")
     if not math.isfinite(args.train_fraction) or not 0 < args.train_fraction <= 1:
@@ -239,7 +244,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if getattr(args, "representation", None) == "LocalMotionJEPARep":
         default_output /= "local-motion-jepa"
     if probe_mode:
-        feature_name = f"layer-{args.feature_layer}" if args.feature_source == "jepa" else "raw"
+        from .probing import selected_feature_layers
+        layers = selected_feature_layers(args) if args.feature_source == "jepa" else None
+        feature_name = ("layer-" if len(layers) == 1 else "layers-") + "-".join(map(str, layers)) if layers else "raw"
         default_output /= f"probe-{feature_name}"
         if getattr(args, "probe_architecture", "attentive") == "transformer":
             default_output /= "transformer"
@@ -473,7 +480,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Use non-overlapping three-frame motion patches in supervised mode; text is unchanged.")
     parser.add_argument("--mode", choices=("supervised", "probe"), default="supervised")
     parser.add_argument("--feature-source", choices=("raw", "jepa"), default="jepa")
-    parser.add_argument("--feature-layer", type=int, default=12, help="One-based frozen JEPA block output to probe.")
+    layer_options = parser.add_mutually_exclusive_group()
+    layer_options.add_argument("--feature-layer", type=int, help="One-based frozen JEPA block output; defaults to 12.")
+    layer_options.add_argument("--feature-layers", type=int, nargs="+", help="Ordered JEPA block outputs to concatenate along channels.")
     parser.add_argument("--checkpoint", type=Path, help="Frozen JEPA checkpoint, required for JEPA probing.")
     parser.add_argument("--encoder-key", default="target_encoder", choices=("encoder", "target_encoder"))
     parser.add_argument("--precompute-batch-size", type=int, default=256)

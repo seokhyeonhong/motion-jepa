@@ -235,3 +235,11 @@ output path includes `patchify/`; use distinct `--output-root` values for explic
 comparison paths. Checkpoints save the option, and evaluation restores it
 automatically. Legacy checkpoints default to frame-wise tokenization.
 This option applies only to supervised raw-motion TMR, not frozen JEPA probes.
+
+### Multi-layer frozen JEPA input
+
+Use `--mode probe --feature-source jepa --checkpoint <checkpoint> --feature-layers 3 6 9 12` to concatenate block outputs in that order along the channel dimension. For Base JEPA this gives 1536 input channels. Works with frame or patch checkpoints and either attentive or Transformer motion heads; for example add `--probe-architecture transformer --motion-depth 3`. Text architecture is unchanged.
+
+`--feature-layer 6` remains supported; omitting both layer options still selects layer 12. The options are mutually exclusive and duplicate/out-of-range layers are rejected. A one-element list is equivalent to the scalar option, including checkpoint provenance. Multi-layer provenance records the ordered list, so changing layers or order cannot silently resume a different run.
+
+Extraction uses one frozen forward pass, CPU RAM features, and selected-training-only channel statistics. TMR retains complete-patch masking (unlike segmentation's partial final patch handling). Four layers require approximately four times the feature-bank RAM. No training settings are changed automatically.
