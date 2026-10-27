@@ -209,3 +209,32 @@ and cropped after decoding. This differs from retrieval's complete-patch-only
 policy, intentionally preserving all segmentation frames. The policy is saved
 in the architecture signature. Defaults remain frame-level, dropout 0.0 and
 weight decay 0.01. Patch runs have a separate default output suffix `-patch`.
+
+### Additional validation metrics
+
+Macro-F1 averages per-class frame F1 over the full vocabulary (120 or 60),
+with undefined F1 set to zero. Predictions use sigmoid >= 0.5.
+Segment F1@10/25/50 uses temporal IoU thresholds 0.10/0.25/0.50,
+one-to-one same-class matching, and micro aggregation across classes.
+Each class has independent intervals, allowing overlapping BABEL labels.
+Intervals are evaluated within each processed window; ignored frames break
+intervals, and neither padding nor window boundaries join intervals.
+These are window-level multilabel metrics, not stitched source-sequence scores.
+
+Re-evaluate an existing raw supervised best checkpoint without changing history:
+
+```sh
+python -m experiment.segmentation.evaluate_checkpoint path/to/best.pth.tar
+```
+
+The evaluator verifies the checkpoint's dataset hashes and writes
+`extended-validation-metrics.json` beside the checkpoint. Use
+`--dataset-root` if the same dataset resides at a different mount path.
+
+### Training data loading
+
+Training uses a continuous stream of shuffled batches. Every dataset pass still
+drops its incomplete final batch, but prefetching continues across passes.
+Workers persist when num_workers is positive; probe mode remains single-process.
+This changes the trainer code signature, so old checkpoints do not pass the
+existing strict resume-signature check.
