@@ -197,6 +197,14 @@ def load_alignment_checkpoint(path: Path) -> dict[str, Any]:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if args.mode == "lora":
+        if args.checkpoint is None or args.feature_source != "jepa":
+            raise ValueError("LoRA requires a JEPA checkpoint")
+        if args.feature_layer is not None or args.feature_layers is not None or args.patchify:
+            raise ValueError("LoRA uses the final JEPA output and checkpoint tokenization")
+        if args.lora_rank < 1 or (args.lora_alpha is not None and
+                (not math.isfinite(args.lora_alpha) or args.lora_alpha <= 0)):
+            raise ValueError("LoRA rank and alpha must be positive and finite")
     if getattr(args, "motion_depth", None) is not None:
         if args.motion_depth < 1:
             raise ValueError("--motion-depth must be positive")
@@ -250,6 +258,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         default_output /= f"probe-{feature_name}"
         if getattr(args, "probe_architecture", "attentive") == "transformer":
             default_output /= "transformer"
+    if args.mode == "lora":
+        default_output /= f"lora-rank-{args.lora_rank}"
     if getattr(args, "patchify", False):
         default_output /= "patchify"
     if args.train_fraction != 1:
@@ -313,7 +323,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if probe_config is not None:
         config["probe"] = probe_config
     model = TextMotionAlignment(model_config, motion_mean=motion_mean, motion_std=motion_std).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.mode == "lora":
+        from .lora import attach_lora, lora_configuration
+        config["lora"] = lora_configuration(args)
+        provenance = attach_lora(model, datasets, provenance, config["lora"], device)
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
+                                  lr=args.lr, weight_decay=args.weight_decay)
     scheduler = WarmupCosineSchedule(
         optimizer, warmup_steps=args.warmup_iterations, start_lr=args.start_lr,
         ref_lr=args.lr, final_lr=args.final_lr, T_max=args.iterations,
@@ -465,6 +480,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "trainable_parameters": counts["total"],
             "parameter_counts": counts, "model": model_settings,
             **({"probe": probe_config} if probe_mode else {}),
+            **({"lora": config["lora"]} if args.mode == "lora" else {}),
             "best_checkpoint": str(best_path), "latest_checkpoint": str(latest_path),
             "tensorboard_dir": str(Path(args.tensorboard_dir or output / "tensorboard").expanduser().resolve()) if args.tensorboard else None,
         }
@@ -478,12 +494,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_argument(parser)
     parser.add_argument("--patchify", action=argparse.BooleanOptionalAction, default=False,
                         help="Use non-overlapping three-frame motion patches in supervised mode; text is unchanged.")
-    parser.add_argument("--mode", choices=("supervised", "probe"), default="supervised")
+    parser.add_argument("--mode", choices=("supervised", "probe", "lora"), default="supervised")
     parser.add_argument("--feature-source", choices=("raw", "jepa"), default="jepa")
     layer_options = parser.add_mutually_exclusive_group()
     layer_options.add_argument("--feature-layer", type=int, help="One-based frozen JEPA block output; defaults to 12.")
     layer_options.add_argument("--feature-layers", type=int, nargs="+", help="Ordered JEPA block outputs to concatenate along channels.")
-    parser.add_argument("--checkpoint", type=Path, help="Frozen JEPA checkpoint, required for JEPA probing.")
+    parser.add_argument("--checkpoint", type=Path, help="JEPA checkpoint, required for frozen probing or online LoRA.")
+    parser.add_argument("--lora-rank", type=int, default=8)
+    parser.add_argument("--lora-alpha", type=float, help="Defaults to rank (scale 1).")
     parser.add_argument("--encoder-key", default="target_encoder", choices=("encoder", "target_encoder"))
     parser.add_argument("--precompute-batch-size", type=int, default=256)
     parser.add_argument("--probe-architecture", choices=("attentive", "transformer"), default="attentive")

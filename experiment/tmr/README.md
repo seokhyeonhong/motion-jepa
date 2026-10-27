@@ -243,3 +243,26 @@ Use `--mode probe --feature-source jepa --checkpoint <checkpoint> --feature-laye
 `--feature-layer 6` remains supported; omitting both layer options still selects layer 12. The options are mutually exclusive and duplicate/out-of-range layers are rejected. A one-element list is equivalent to the scalar option, including checkpoint provenance. Multi-layer provenance records the ordered list, so changing layers or order cannot silently resume a different run.
 
 Extraction uses one frozen forward pass, CPU RAM features, and selected-training-only channel statistics. TMR retains complete-patch masking (unlike segmentation's partial final patch handling). Four layers require approximately four times the feature-bank RAM. No training settings are changed automatically.
+
+
+### Online JEPA LoRA
+
+Use --mode lora --checkpoint <JEPA checkpoint> --motion-depth 1 --lora-rank 8
+(or rank 16) for online adaptation. The default rank is 8; alpha defaults to the
+rank, giving scale 1. QKV and attention-output projections in every JEPA block
+receive adapters. Original JEPA parameters stay frozen. The final normalized
+JEPA output feeds a trainable motion Transformer; --motion-depth controls only
+that Transformer, while the text encoder keeps its model-size depth (12 for Base).
+
+Tokenization comes from the checkpoint; omit --patchify and feature-layer
+arguments. TMR retains complete-patch masking. Online LoRA uses the checkpoint's
+pretraining input statistics without a frozen-feature cache or fixed feature
+standardization. Frozen probes retain their train-only feature normalization, so
+the normalization protocols differ and should be disclosed in comparisons.
+Single-layer and concatenated frozen probes remain supported.
+
+Checkpoints include the frozen encoder, adapters, retrieval heads, input statistics,
+rank/alpha, and source-checkpoint provenance. Resume and standalone evaluation
+reconstruct the same architecture and reject changed provenance. Parameter counts
+report trainable adapters plus motion head, and the unchanged trainable text stream;
+frozen JEPA weights are excluded.

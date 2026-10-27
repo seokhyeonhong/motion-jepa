@@ -32,9 +32,12 @@ def run(args: argparse.Namespace) -> dict[str, float]:
             batch_size=args.batch_size, num_workers=args.num_workers,
         )
         args.num_workers = 0
+    model = TextMotionAlignment(AlignmentConfig(**config["model"])).to(device)
+    if "lora" in config:
+        from .lora import attach_lora
+        provenance = attach_lora(model, datasets, provenance, config["lora"], device)
     if provenance != checkpoint["provenance"]:
         raise ValueError("Evaluation feature provenance differs from the training checkpoint")
-    model = TextMotionAlignment(AlignmentConfig(**config["model"])).to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
     metrics = evaluate_split(
         model, datasets[args.split], device, batch_size=args.batch_size,
