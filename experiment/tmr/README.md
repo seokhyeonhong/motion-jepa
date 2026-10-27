@@ -154,10 +154,11 @@ python -m experiment.tmr --mode probe --feature-source raw \
   --output-root output/tmr/probe-raw-iterations/frac0.01/seed-42
 ```
 
-The trainer runs a fixed number of iterations and restarts its shuffled DataLoader
-when exhausted. Training
-uses `drop_last=True` to keep every optimizer batch the same size; incomplete
-tails are dropped and the subset is reshuffled on the next pass. A subset smaller
+The trainer runs a fixed number of iterations using a continuous stream of
+shuffled batches. Workers persist when num_workers is positive, and prefetching
+continues across dataset passes. Incomplete tails are dropped to keep every
+optimizer batch the same size; the subset is reshuffled on the next pass.
+RAM feature probing retains its zero-worker loader. A subset smaller
 than the requested batch size is rejected rather than silently shrinking batches.
 Choose a common batch size that fits the smallest fraction. Validation/test loaders
 retain all samples, including their final partial batches. `--eval-batch-size`

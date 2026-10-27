@@ -25,6 +25,16 @@ from .model import MotionSegmentationProbe, MotionSegmentationTransformer
 from .subset import select_training_subset
 
 
+def shuffled_training_batches(size, batch_size, generator):
+    """Repeat shuffled passes, dropping each pass's incomplete final batch."""
+    if size < batch_size or batch_size < 1:
+        raise ValueError("Training requires at least one complete batch")
+    while True:
+        order = torch.randperm(size, generator=generator).tolist()
+        for start in range(0, size - batch_size + 1, batch_size):
+            yield order[start:start + batch_size]
+
+
 @torch.inference_mode()
 def evaluate_split(model, loader, device):
     model.eval()
@@ -206,9 +216,11 @@ def run(args):
         ref_lr=args.lr, final_lr=args.final_lr, T_max=args.iterations,
     )
     generator = torch.Generator().manual_seed(args.seed)
+    workers = 0 if args.mode == "probe" else args.num_workers
     loader = DataLoader(
-        datasets["train"], batch_size=args.batch_size, shuffle=True, drop_last=True,
-        num_workers=0 if args.mode == "probe" else args.num_workers, generator=generator,
+        datasets["train"],
+        batch_sampler=shuffled_training_batches(len(datasets["train"]), args.batch_size, generator),
+        num_workers=workers, generator=generator, persistent_workers=workers > 0,
         pin_memory=device.type == "cuda",
     )
     loaders = {
@@ -240,11 +252,7 @@ def run(args):
     _atomic_json_save(history, output / "metrics.json")
     batches = iter(loader)
     for global_step in range(global_step + 1, args.iterations + 1):
-        try:
-            batch = next(batches)
-        except StopIteration:
-            batches = iter(loader)
-            batch = next(batches)
+        batch = next(batches)
         motion, fps, lengths, labels, supervised, _ = batch
         model.train()
         motion, fps = motion.to(device), fps.to(device)

@@ -57,6 +57,16 @@ OPTIMIZATION_FIELDS = (
 )
 
 
+def shuffled_training_batches(size, batch_size, generator):
+    """Repeat shuffled passes, dropping each pass's incomplete final batch."""
+    if size < batch_size or batch_size < 1:
+        raise ValueError("Training requires at least one complete batch")
+    while True:
+        order = torch.randperm(size, generator=generator).tolist()
+        for start in range(0, size - batch_size + 1, batch_size):
+            yield order[start:start + batch_size]
+
+
 def optimization_configuration(args):
     values = {name: getattr(args, name) for name in OPTIMIZATION_FIELDS}
     if getattr(args, "validation_only", False):
@@ -303,9 +313,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     generator = torch.Generator().manual_seed(args.seed)
     loader = DataLoader(
-        datasets["train"], batch_size=args.batch_size, shuffle=True, drop_last=True,
+        datasets["train"],
+        batch_sampler=shuffled_training_batches(len(datasets["train"]), args.batch_size, generator),
         num_workers=args.num_workers, generator=generator, collate_fn=collate_pairs,
-        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0, pin_memory=device.type == "cuda",
     )
     best_step, best_score, global_step = 0, -math.inf, 0
     weighted_loss, sample_count = 0.0, 0
@@ -349,11 +360,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         started = time.monotonic()
         batches = iter(loader)
         for global_step in range(global_step + 1, args.iterations + 1):
-            try:
-                batch = next(batches)
-            except StopIteration:
-                batches = iter(loader)
-                batch = next(batches)
+            batch = next(batches)
             model.train()
             learning_rate = scheduler.step()
             count = len(batch["caption_ids"])
