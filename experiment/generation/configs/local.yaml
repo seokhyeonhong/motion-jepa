@@ -1,0 +1,37 @@
+data:
+  root_path: ./dataset/bones-seed-local-from366-nframes150-min60
+  representation: LocalMotionJEPARep
+  num_frames: 150
+  fps: 30
+  normalize: true
+  stats_path: stats
+model:
+  size: base
+  feature_layer: 6
+alignment:
+  weight: 1.0
+  loss: mse
+  checkpoint: null
+  config: null
+  layer: null
+shortcut:
+  base_steps: 128
+  fraction: 0.25
+  weight: 1.0
+  ema: 0.999
+training:
+  batch_size: 64
+  iterations: 200000
+  lr: 0.0001
+  final_lr: 1.0e-06
+  warmup: 5000
+  weight_decay: 0.01
+  clip_grad: 1.0
+  bf16: true
+  seed: 0
+  workers: 8
+  log_interval: 100
+  checkpoint_interval: 10000
+validation:
+  samples: 1024
+  interval: 1000

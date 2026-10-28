@@ -99,9 +99,9 @@ class MotionSegmentationProbe(nn.Module):
 
 
 class MotionSegmentationPatchTransformerProbe(nn.Module):
-    """Concatenated frozen patch features into one Base-width Transformer."""
+    """Concatenated frozen patch features into one preset-width Transformer."""
 
-    def __init__(self, input_dim, num_classes, num_frames, mean, std):
+    def __init__(self, input_dim, num_classes, num_frames, mean, std, model_size="base"):
         super().__init__()
         if any(isinstance(v, bool) or not isinstance(v, int) or v <= 0
                for v in (input_dim, num_classes, num_frames)) or num_frames % 3:
@@ -114,16 +114,20 @@ class MotionSegmentationPatchTransformerProbe(nn.Module):
         self.input_dim, self.num_frames, self.num_classes = input_dim, num_frames, num_classes
         self.register_buffer("feature_mean", mean.clone())
         self.register_buffer("feature_std", std.clone())
+        if model_size not in MODEL_SPECS:
+            raise ValueError(f"Unknown model size: {model_size}")
+        spec = MODEL_SPECS[model_size]
+        width, heads = spec["embed_dim"], spec["num_heads"]
         self.encoder = MotionTransformer1D(
             in_chans=input_dim, num_frames=num_frames // 3,
-            embed_dim=384, depth=1, num_heads=6, patchify=False,
+            embed_dim=width, depth=1, num_heads=heads, patchify=False,
         )
-        self.head = nn.Linear(384, 3 * num_classes)
+        self.head = nn.Linear(width, 3 * num_classes)
         self.head.apply(initialize_transformer)
         self.config = {
             "model_version": "jepa_patch_motion_transformer_probe_v1",
             "input_dim": input_dim, "num_frames": num_frames, "num_classes": num_classes,
-            "depth": 1, "embed_dim": 384, "num_heads": 6, "mlp_ratio": 4.,
+            "depth": 1, "embed_dim": width, "num_heads": heads, "mlp_ratio": 4.,
             "dropout": 0., "patchify": False, "feature_patch_size": 3,
             "position_encoding": "rope", "normalization": "training_patch_feature_mean_std",
             "frame_decoder": "linear_three_frame_logits",

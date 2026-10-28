@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import math
 import random
@@ -35,8 +36,12 @@ def shuffled_training_batches(size, batch_size, generator):
             yield order[start:start + batch_size]
 
 
+def _autocast(device, enabled):
+    return torch.autocast("cuda", dtype=torch.bfloat16) if enabled and device.type == "cuda" else nullcontext()
+
+
 @torch.inference_mode()
-def evaluate_split(model, loader, device):
+def evaluate_split(model, loader, device, use_bfloat16=False):
     model.eval()
     metrics = FrameMetricAccumulator(
         loader.dataset.num_classes, loader.dataset.class_indices_60,
@@ -50,7 +55,9 @@ def evaluate_split(model, loader, device):
         count = int(selected.sum())
         if count == 0:
             continue
-        logits = model(motion, valid, fps)
+        with _autocast(device, use_bfloat16):
+            logits = model(motion, valid, fps)
+        logits = logits.float()
         loss = F.binary_cross_entropy_with_logits(logits[selected], labels[selected])
         if not torch.isfinite(loss):
             raise ValueError("Non-finite segmentation loss")
@@ -202,7 +209,7 @@ def run(args):
         probe_class = MotionSegmentationMLPProbe if args.probe_architecture == "mlp" else MotionSegmentationPatchTransformerProbe if patch_probe else MotionSegmentationProbe
         model = probe_class(
             feature_metadata["feature_dim"], datasets["train"].num_classes,
-            meta["num_frames"], mean, std, **({"model_size": args.model_size, "motion_depth": args.motion_depth} if args.probe_architecture == "mlp" else {} if patch_probe else {"num_heads": args.probe_heads}),
+            meta["num_frames"], mean, std, **({"model_size": args.model_size, "motion_depth": args.motion_depth} if args.probe_architecture == "mlp" else {"model_size": args.model_size} if patch_probe else {"num_heads": args.probe_heads}),
         ).to(device)
     else:
         if args.checkpoint is not None or args.feature_layer is not None:
@@ -226,7 +233,7 @@ def run(args):
         "optimization": {name: getattr(args, name) for name in (
             "seed", "iterations", "warmup_iterations", "eval_interval", "checkpoint_interval", "log_freq",
             "batch_size", "eval_batch_size", "num_workers", "start_lr", "lr", "final_lr",
-            "weight_decay", "gradient_clip",
+            "weight_decay", "gradient_clip", "use_bfloat16",
         )},
         "objective": "supervised_frame_bce",
         "normalization": "dataset_training_statistics",
@@ -300,8 +307,9 @@ def run(args):
             raise ValueError("Training batch has no supervised frames; cannot perform an optimizer iteration")
         learning_rate = scheduler.step()
         optimizer.zero_grad(set_to_none=True)
-        logits = model(motion, valid, fps)
-        loss = F.binary_cross_entropy_with_logits(logits[selected], labels[selected])
+        with _autocast(device, args.use_bfloat16):
+            logits = model(motion, valid, fps)
+        loss = F.binary_cross_entropy_with_logits(logits[selected].float(), labels[selected])
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite segmentation loss at iteration {global_step}")
         loss.backward()
@@ -314,7 +322,7 @@ def run(args):
                   f"loss={loss_sum / frame_count:.6f} lr={learning_rate:.3e}", flush=True)
         improved = False
         if global_step % args.eval_interval == 0 or global_step == args.iterations:
-            val = evaluate_split(model, loaders["val"], device)
+            val = evaluate_split(model, loaders["val"], device, args.use_bfloat16)
             score = val["babel-120"]["frame_map"]
             if score is None:
                 raise ValueError("Validation has no positive classes")
@@ -339,7 +347,7 @@ def run(args):
                 _atomic_torch_save(checkpoint, best)
             _atomic_torch_save(checkpoint, latest)
     model.load_state_dict(_torch_load_checkpoint(best)["model"], strict=True)
-    test = evaluate_split(model, loaders["test"], device) if len(datasets["test"]) else None
+    test = evaluate_split(model, loaders["test"], device, args.use_bfloat16) if len(datasets["test"]) else None
     summary = {
         "input_source": args.feature_source if args.mode in ("probe", "lora") else "raw",
         "mode": args.mode, "feature_layer": args.feature_layer,
@@ -414,6 +422,8 @@ def build_parser():
     parser.add_argument("--final-lr", type=float, default=3e-6)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--gradient-clip", type=float, default=1.0)
+    parser.add_argument("--use-bfloat16", action=argparse.BooleanOptionalAction, default=True,
+                        help="CUDA BF16 mixed precision (default); disable with --no-use-bfloat16")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--describe", action="store_true")
     return parser
@@ -445,7 +455,7 @@ def main():
                 probe_class = MotionSegmentationMLPProbe if args.probe_architecture == "mlp" else MotionSegmentationPatchTransformerProbe
                 model = probe_class(
                     feature_dim, 120, meta["num_frames"], torch.zeros(feature_dim), torch.ones(feature_dim),
-                    **({"model_size": args.model_size, "motion_depth": args.motion_depth} if args.probe_architecture == "mlp" else {}))
+                    **({"model_size": args.model_size, "motion_depth": args.motion_depth} if args.probe_architecture == "mlp" else {"model_size": args.model_size}))
             else:
                 model = MotionSegmentationProbe(feature_dim, 120, meta["num_frames"], torch.zeros(feature_dim),
                                                torch.ones(feature_dim), num_heads=args.probe_heads)
