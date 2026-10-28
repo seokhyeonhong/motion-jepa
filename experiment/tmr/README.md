@@ -277,3 +277,23 @@ a linear projection to 256 dimensions, and L2 normalization. Hidden width comes
 from the size preset: tiny 192, small 256, base 384. Text keeps its preset
 Transformer depth. Training-only feature normalization is saved in checkpoints.
 MLP is currently a frozen probe option, not a LoRA or raw-supervised head.
+
+
+### Full JEPA backbone fine-tuning
+
+Use `--mode finetune --checkpoint <JEPA checkpoint> --encoder-key target_encoder`
+to train every JEPA backbone parameter with a single linear retrieval head.
+The motion path uses the checkpoint's input statistics and tokenization, final
+normalized JEPA features, masked mean pooling over complete valid patches,
+a linear projection to 256D, and L2 normalization. No LoRA or additional motion
+Transformer is used. The text encoder retains the model-size depth (12 for Base).
+Do not supply `--motion-depth`, `--patchify`, or feature-layer options in this mode.
+The same optimizer and learning-rate schedule apply to backbone and head.
+Checkpoints include the adapted backbone, linear head, input statistics, and
+source provenance; resume and standalone evaluation reconstruct this mode.
+
+For the frozen comparison, use `--mode probe --feature-source jepa
+--feature-layers 3 6 9 12 --probe-architecture transformer --motion-depth 12`.
+This keeps JEPA frozen and trains 12 motion Transformer layers plus the unchanged
+Base text encoder. Select each subset using `--train-fraction 1`, `0.1`, or `0.01`
+and give each run a distinct `--output-root`.

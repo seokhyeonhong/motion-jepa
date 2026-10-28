@@ -36,6 +36,9 @@ def run(args: argparse.Namespace) -> dict[str, float]:
     if "lora" in config:
         from .lora import attach_lora
         provenance = attach_lora(model, datasets, provenance, config["lora"], device)
+    if "finetune" in config:
+        from .finetune import attach_finetune
+        provenance = attach_finetune(model, datasets, provenance, config["finetune"], device)
     if provenance != checkpoint["provenance"]:
         raise ValueError("Evaluation feature provenance differs from the training checkpoint")
     model.load_state_dict(checkpoint["model"], strict=True)

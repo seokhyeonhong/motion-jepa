@@ -199,6 +199,11 @@ def load_alignment_checkpoint(path: Path) -> dict[str, Any]:
 def _validate_args(args: argparse.Namespace) -> None:
     if args.probe_architecture == "mlp" and args.mode != "probe":
         raise ValueError("--probe-architecture mlp requires --mode probe")
+    if args.mode == "finetune":
+        if args.checkpoint is None or args.feature_source != "jepa":
+            raise ValueError("Full fine-tuning requires a JEPA checkpoint")
+        if args.feature_layer is not None or args.feature_layers is not None or args.patchify or args.motion_depth is not None:
+            raise ValueError("Full fine-tuning uses the final JEPA output and one linear head")
     if args.mode == "lora":
         if args.checkpoint is None or args.feature_source != "jepa":
             raise ValueError("LoRA requires a JEPA checkpoint")
@@ -260,6 +265,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         default_output /= f"probe-{feature_name}"
         if getattr(args, "probe_architecture", "attentive") == "transformer":
             default_output /= "transformer"
+    if args.mode == "finetune":
+        default_output /= "full-finetune-linear"
     if args.mode == "lora":
         default_output /= f"lora-rank-{args.lora_rank}"
     if getattr(args, "patchify", False):
@@ -330,6 +337,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         from .lora import attach_lora, lora_configuration
         config["lora"] = lora_configuration(args)
         provenance = attach_lora(model, datasets, provenance, config["lora"], device)
+    if args.mode == "finetune":
+        from .finetune import attach_finetune, finetune_configuration
+        config["finetune"] = finetune_configuration(args)
+        provenance = attach_finetune(model, datasets, provenance, config["finetune"], device)
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                                   lr=args.lr, weight_decay=args.weight_decay)
     scheduler = WarmupCosineSchedule(
@@ -484,6 +495,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "parameter_counts": counts, "model": model_settings,
             **({"probe": probe_config} if probe_mode else {}),
             **({"lora": config["lora"]} if args.mode == "lora" else {}),
+            **({"finetune": config["finetune"]} if args.mode == "finetune" else {}),
             "best_checkpoint": str(best_path), "latest_checkpoint": str(latest_path),
             "tensorboard_dir": str(Path(args.tensorboard_dir or output / "tensorboard").expanduser().resolve()) if args.tensorboard else None,
         }
@@ -497,7 +509,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_argument(parser)
     parser.add_argument("--patchify", action=argparse.BooleanOptionalAction, default=False,
                         help="Use non-overlapping three-frame motion patches in supervised mode; text is unchanged.")
-    parser.add_argument("--mode", choices=("supervised", "probe", "lora"), default="supervised")
+    parser.add_argument("--mode", choices=("supervised", "probe", "lora", "finetune"), default="supervised")
     parser.add_argument("--feature-source", choices=("raw", "jepa"), default="jepa")
     layer_options = parser.add_mutually_exclusive_group()
     layer_options.add_argument("--feature-layer", type=int, help="One-based frozen JEPA block output; defaults to 12.")
