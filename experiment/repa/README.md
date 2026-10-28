@@ -6,23 +6,23 @@ it does not load JEPA weights into the generator.
 
 ## Training
 
-Choose experiment/generation/configs/local.yaml (365D) or global.yaml (366D).
+Choose experiment/repa/configs/local.yaml (365D) or global.yaml (366D).
 Both use prepared Bones-SEED train/validation splits, 150-frame capacity and 30 FPS.
 Teacher paths are deliberately required when alignment is enabled.
 
     # Flow-only baseline
-    python -m experiment.generation train --config experiment/generation/configs/local.yaml --output output/generation/local-flow --alignment-weight 0 --shortcut-fraction 0
+    python -m experiment.repa train --config experiment/repa/configs/local.yaml --output output/repa/local-flow --alignment-weight 0 --shortcut-fraction 0
 
     # Shortcut baseline without JEPA
-    python -m experiment.generation train --config experiment/generation/configs/local.yaml --output output/generation/local-shortcut --alignment-weight 0
+    python -m experiment.repa train --config experiment/repa/configs/local.yaml --output output/repa/local-shortcut --alignment-weight 0
 
     # Shortcut plus raw MSE alignment (default)
-    python -m experiment.generation train --config experiment/generation/configs/local.yaml --output output/generation/local-mse --teacher-checkpoint /path/to/checkpoint.pth.tar --teacher-config /path/to/pretraining.yaml
+    python -m experiment.repa train --config experiment/repa/configs/local.yaml --output output/repa/local-mse --teacher-checkpoint /path/to/checkpoint.pth.tar --teacher-config /path/to/pretraining.yaml
 
     # Cosine comparison: identical setup, independent output directory
-    python -m experiment.generation train --config experiment/generation/configs/local.yaml --output output/generation/local-cosine --teacher-checkpoint /path/to/checkpoint.pth.tar --teacher-config /path/to/pretraining.yaml --alignment-loss cosine
+    python -m experiment.repa train --config experiment/repa/configs/local.yaml --output output/repa/local-cosine --teacher-checkpoint /path/to/checkpoint.pth.tar --teacher-config /path/to/pretraining.yaml --alignment-loss cosine
 
-Use torchrun --standalone --nproc_per_node=2 -m experiment.generation train ...
+Use torchrun --standalone --nproc_per_node=2 -m experiment.repa train ...
 for DDP. Batch size is per rank. CPU/Gloo is supported with --device cpu.
 A selected teacher must have the same representation and frame capacity. Its input
 statistics can differ: training inputs are denormalized and renormalized
@@ -43,12 +43,12 @@ clipping. EMA decay is 0.999. No text/class conditioning or classifier-free guid
 ## Resume and validation
 
 Repeat the original training command and overrides, adding
---resume output/generation/local-mse/latest.pt. Resume validates config, world
+--resume output/repa/local-mse/latest.pt. Resume validates config, world
 size, statistics and teacher identity and restores optimizer/scheduler, per-rank
 random state and sampler position. Use --max-steps 2 for a bounded additional
 two-step check without changing the learning-rate schedule.
 
-    python -m experiment.generation evaluate --checkpoint output/generation/local-mse/latest.pt --output output/generation/local-mse/validation.json
+    python -m experiment.repa evaluate --checkpoint output/repa/local-mse/latest.pt --output output/repa/local-mse/validation.json
 
 Validation uses a fixed subset and fixed random draws. Logged losses, feature
 norms, cosine similarity and consistency by step size diagnose optimization;
@@ -58,7 +58,7 @@ configuration, statistics and teacher provenance.
 
 ## Sampling
 
-    python -m experiment.generation sample --checkpoint output/generation/local-mse/latest.pt --output output/generation/local-mse/samples-4 --steps 4 --count 16 --length 150 --fps 30 --seed 0
+    python -m experiment.repa sample --checkpoint output/repa/local-mse/latest.pt --output output/repa/local-mse/samples-4 --steps 4 --count 16 --length 150 --fps 30 --seed 0
 
 Supported step counts: 1, 2, 4, 8, 16, 32, 64, 128 (up to configured base resolution).
 Sampling loads only the generator EMA, not the JEPA teacher or alignment projector.
@@ -69,4 +69,4 @@ Latency includes integration calls and excludes checkpoint loading and export.
 
 ## Tests
 
-    python -m pytest experiment/generation/test_generation.py model/test_patchify_1d.py
+    python -m pytest experiment/repa/test_generation.py model/test_patchify_1d.py

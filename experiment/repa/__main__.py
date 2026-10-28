@@ -1,4 +1,4 @@
-"""Run with python -m experiment.generation."""
+"""Run with python -m experiment.repa."""
 import argparse
 from pathlib import Path
 import yaml

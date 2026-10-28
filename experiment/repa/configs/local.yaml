@@ -1,6 +1,6 @@
 data:
-  root_path: ./dataset/bones-seed-processed-nframes150-min60
-  representation: MotionJEPAMotionRep
+  root_path: ./dataset/bones-seed-local-from366-nframes150-min60
+  representation: LocalMotionJEPARep
   num_frames: 150
   fps: 30
   normalize: true
@@ -20,7 +20,7 @@ shortcut:
   weight: 1.0
   ema: 0.999
 training:
-  batch_size: 64
+  batch_size: 512
   iterations: 200000
   lr: 0.0001
   final_lr: 1.0e-06
