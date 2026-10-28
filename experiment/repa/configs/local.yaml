@@ -35,3 +35,13 @@ training:
 validation:
   samples: 1024
   interval: 1000
+generation_evaluation:
+  enabled: true
+  interval: 10000
+  samples: 1024
+  batch_size: 32
+  sampling_steps:
+  - 128
+  seed: 42
+  checkpoint_dir: null
+  on_completion: false

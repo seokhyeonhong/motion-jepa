@@ -2,7 +2,7 @@
 import argparse
 from pathlib import Path
 import yaml
-from .runner import train, evaluate_checkpoint, sample_checkpoint
+from .runner import train, evaluate_checkpoint, sample_checkpoint, quality_checkpoint
 
 
 def main():
@@ -21,6 +21,10 @@ def main():
     evaluation = commands.add_parser("evaluate")
     evaluation.add_argument("--checkpoint", required=True)
     evaluation.add_argument("--output", required=True)
+    quality = commands.add_parser("quality", help="Kimodo TMR-FID and foot skating on EMA samples")
+    quality.add_argument("--checkpoint", required=True)
+    quality.add_argument("--output", required=True)
+    quality.add_argument("--config", type=Path, help="Override only generation_evaluation settings")
     sampling = commands.add_parser("sample")
     sampling.add_argument("--checkpoint", required=True)
     sampling.add_argument("--output", required=True)
@@ -29,7 +33,7 @@ def main():
     sampling.add_argument("--length", type=int, default=150)
     sampling.add_argument("--fps", type=float, default=30.)
     sampling.add_argument("--seed", type=int, default=0)
-    for command in (training, evaluation, sampling):
+    for command in (training, evaluation, sampling, quality):
         command.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     args = parser.parse_args()
     if args.command == "train":
@@ -46,6 +50,8 @@ def main():
         train(config, args.output, args.resume, args.device, args.max_steps)
     elif args.command == "evaluate":
         evaluate_checkpoint(args.checkpoint, args.output, args.device)
+    elif args.command == "quality":
+        quality_checkpoint(args.checkpoint, args.output, args.device, args.config)
     else:
         sample_checkpoint(args.checkpoint, args.output, args.steps, args.count, args.length, args.fps, args.seed, args.device)
 

@@ -18,8 +18,21 @@ class TMRMotionRep(torch.nn.Module):
         self.ps = [torch.Size([3]), torch.Size([2]), torch.Size([29,3]),
                    torch.Size([30,3]), torch.Size([4])]
         self.slice_dict = {"root_pos": slice(0,3)}
-        mean = np.load(stats_path / "mean.npy", allow_pickle=False)
-        std = np.load(stats_path / "std.npy", allow_pickle=False)
+        if (stats_path / "global_root/mean.npy").is_file():
+            self.stats_files = [stats_path / part / (name+".npy")
+                                for part in ("global_root", "body") for name in ("mean", "std")]
+            mean = np.concatenate([np.load(stats_path / part / "mean.npy", allow_pickle=False)
+                                   for part in ("global_root", "body")])
+            std = np.concatenate([np.load(stats_path / part / "std.npy", allow_pickle=False)
+                                  for part in ("global_root", "body")])
+        else:
+            self.stats_files = [stats_path / "mean.npy", stats_path / "std.npy"]
+            mean = np.load(self.stats_files[0], allow_pickle=False)
+            std = np.load(self.stats_files[1], allow_pickle=False)
+            if mean.shape != (190,) or std.shape != (190,):
+                raise ValueError("Flat TMR stats must contain global-root, local-root and body channels")
+            selected = list(range(5)) + list(range(9,190))
+            mean, std = mean[selected], std[selected]
         if mean.shape != (186,) or std.shape != (186,) or not np.isfinite(mean).all() or not np.isfinite(std).all() or (std < 0).any():
             raise ValueError("Invalid Kimodo TMR normalization statistics")
         self.register_buffer("mean", torch.as_tensor(mean).float(), persistent=False)

@@ -206,8 +206,10 @@ def train(config, output, resume=None, device_name="auto", max_steps=None):
     saved_rng = None
     if resume:
         saved = _torch_load_checkpoint(Path(resume))
-        if saved["config"] != config or saved["world_size"] != world:
-            raise ValueError("Resume requires the same configuration and world size")
+        saved_training = {k:v for k,v in saved["config"].items() if k != "generation_evaluation"}
+        current_training = {k:v for k,v in config.items() if k != "generation_evaluation"}
+        if saved_training != current_training or saved["world_size"] != world:
+            raise ValueError("Resume requires the same training configuration and world size")
         if not np.array_equal(saved["mean"], mean) or not np.array_equal(saved["std"], std):
             raise ValueError("Resume normalization statistics changed")
         if saved["teacher"] != (teacher.metadata if teacher else None):
@@ -235,6 +237,9 @@ def train(config, output, resume=None, device_name="auto", max_steps=None):
         (output / "config.yaml").write_text(yaml.safe_dump(config))
         from torch.utils.tensorboard import SummaryWriter
         writer = SummaryWriter(str(output / "tensorboard"), purge_step=step if resume else None)
+    from .quality import evaluation_settings, initialize_evaluator, quality_due, distributed_quality
+    quality_settings = evaluation_settings(config)
+    evaluator = initialize_evaluator(config, val_ds, mean, std, device, rank, world, output)
     sampler = OffsetDistributedSampler(train_ds, world, rank, shuffle=True, seed=opt["seed"], drop_last=True)
     loader = DataLoader(train_ds, batch_size=opt["batch_size"], sampler=sampler,
                         num_workers=opt["workers"], drop_last=True,
@@ -277,6 +282,8 @@ def train(config, output, resume=None, device_name="auto", max_steps=None):
                     print(json.dumps({"step": step, "validation": values}), flush=True)
                     for key, value in values.items():
                         writer.add_scalar("validation/" + key, value, step)
+            if quality_due(quality_settings, step, final=step == opt["iterations"]):
+                distributed_quality(evaluator, ema, step, output, writer, rank, world)
             if step % opt["checkpoint_interval"] == 0 or step == limit:
                 save_checkpoint(output / "latest.pt", model, ema, optimizer, scheduler, config, step,
                                 epoch, offset, mean, std, teacher, rank, world)
@@ -351,3 +358,27 @@ def sample_checkpoint(checkpoint, output, steps, count, length, fps, seed, devic
                 "steps": steps, "model_evaluations": steps, "seconds": elapsed, "seconds_per_sample": elapsed / count}
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2))
     print(json.dumps(metadata))
+
+
+def quality_checkpoint(checkpoint, output, device_name, config_path=None):
+    """Evaluate generation quality without loading the JEPA training teacher."""
+    from .quality import initialize_evaluator, distributed_quality, evaluation_settings
+    device, rank, world = setup(device_name)
+    saved = _torch_load_checkpoint(Path(checkpoint))
+    config = copy.deepcopy(saved["config"])
+    if config_path:
+        supplied = yaml.safe_load(Path(config_path).read_text())
+        config["generation_evaluation"] = supplied["generation_evaluation"]
+    if evaluation_settings(config) is None:
+        raise ValueError("Enable generation_evaluation in the saved config or supply --config")
+    ds = dataset(config, "val")
+    mean, std = statistics(ds)
+    if not np.array_equal(mean, saved["mean"]) or not np.array_equal(std, saved["std"]):
+        raise ValueError("Evaluation normalization statistics changed")
+    ema = MotionShortcutTransformer(in_chans=len(mean), num_frames=config["data"]["num_frames"],
+                                   **config["model"]).to(device)
+    ema.load_state_dict(saved["ema"])
+    evaluator = initialize_evaluator(config, ds, mean, std, device, rank, world, output)
+    distributed_quality(evaluator, ema, saved["step"], output, None, rank, world)
+    if world > 1:
+        dist.destroy_process_group()

@@ -350,3 +350,14 @@ option requires frozen patch JEPA features; LoRA remains a separate mode.
 CUDA segmentation training and evaluation default to BF16 autocast. Parameters, optimizer state, BCE loss and metric accumulation remain FP32. Use `--no-use-bfloat16` for FP32. CPU execution remains FP32. Precision is recorded in the checkpoint optimization signature; existing protected experiment snapshots are unchanged.
 
 Patch Transformer probes accept `--model-size`: Large uses width512/8heads and Huge width768/12heads. The probe remains one block; preset encoder depths are not used.
+
+
+# Best saved validation metrics
+python -m experiment.segmentation.print_metrics <experiment_directory>
+
+# Metrics for a specific checkpoint
+python -m experiment.segmentation.print_metrics <checkpoint.pth.tar>
+
+# Latest evaluated iteration or JSON output
+python -m experiment.segmentation.print_metrics <experiment_directory> --iteration latest
+python -m experiment.segmentation.print_metrics <experiment_directory> --json

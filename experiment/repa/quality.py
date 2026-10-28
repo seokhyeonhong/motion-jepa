@@ -13,10 +13,6 @@ from experiment.utils import _atomic_json_save, _sha256_file
 from motion_rep.registry import get_representation
 from skeleton.definitions import SOMASkeleton30
 from .objectives import sample_motion
-from .kimodo_eval.encoder import ACTORStyleEncoder
-from .kimodo_eval.representation import TMRMotionRep
-from .kimodo_eval.fid import calculate_activation_statistics, calculate_frechet_distance
-from .kimodo_eval.foot_skate import FootSkateFromHeight, FootSkateFromContacts, FootSkateRatio
 
 UPSTREAM_COMMIT = "e1c219c99b4b94ba48be1fb6a1cbc64ecee4c954"
 MODEL_REPO = "nvidia/TMR-SOMA-RP-v1"
@@ -70,12 +66,15 @@ def evaluation_context(device):
 class MotionEmbeddingModel:
     """Only the released TMR motion encoder; never loads an LLM/text encoder."""
     def __init__(self, checkpoint_dir, device):
+        from .kimodo_eval.encoder import ACTORStyleEncoder
+        from .kimodo_eval.representation import TMRMotionRep
+        downloaded = checkpoint_dir is None
         if checkpoint_dir is None:
             from huggingface_hub import snapshot_download
             checkpoint_dir = snapshot_download(
                 MODEL_REPO, revision=MODEL_REVISION,
                 allow_patterns=["config.yaml", "last_weights/motion_encoder.pt",
-                                "stats/motion/mean.npy", "stats/motion/std.npy", "LICENSE"])
+                                "stats/motion/*", "LICENSE"])
         root = Path(checkpoint_dir)
         config = yaml.safe_load((root / "config.yaml").read_text())
         rep = config["motion_rep"]
@@ -92,10 +91,10 @@ class MotionEmbeddingModel:
         self.encoder.load_state_dict(state.get("state_dict", state), strict=True)
         self.encoder.requires_grad_(False).eval()
         self.identity = {
-            "repo": MODEL_REPO, "revision": MODEL_REVISION if checkpoint_dir is None else root.name,
+            "repo": MODEL_REPO, "revision": MODEL_REVISION if downloaded else None,
             "motion_encoder_sha256": _sha256_file(weights),
             "config_sha256": _sha256_file(root / "config.yaml"),
-            "stats_sha256": {name: _sha256_file(root / "stats/motion" / (name+".npy")) for name in ("mean", "std")},
+            "stats_sha256": {str(path.relative_to(root)): _sha256_file(path) for path in self.rep.stats_files},
             "unit_vector": True, "sample_mean": True, "upstream_commit": UPSTREAM_COMMIT,
         }
 
@@ -112,6 +111,7 @@ class MotionEmbeddingModel:
 
 class GenerationEvaluator:
     def __init__(self, config, ds, mean, std, device):
+        from .kimodo_eval.foot_skate import FootSkateFromHeight, FootSkateFromContacts, FootSkateRatio
         self.settings = evaluation_settings(config)
         self.config, self.ds, self.device = config, ds, device
         self.mean = torch.as_tensor(mean, device=device)
@@ -155,6 +155,7 @@ class GenerationEvaluator:
             ema.train(was_training)
 
     def _run(self, ema, step):
+        from .kimodo_eval.fid import calculate_activation_statistics, calculate_frechet_distance
         cfg = self.settings
         reference_features, reference_feet = [], {}
         generated = {steps: {"features": [], "feet": {}} for steps in cfg["sampling_steps"]}
