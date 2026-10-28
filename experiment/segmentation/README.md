@@ -361,3 +361,4 @@ python -m experiment.segmentation.print_metrics <checkpoint.pth.tar>
 # Latest evaluated iteration or JSON output
 python -m experiment.segmentation.print_metrics <experiment_directory> --iteration latest
 python -m experiment.segmentation.print_metrics <experiment_directory> --json
+Full JEPA fine-tuning: `--mode finetune --checkpoint PATH --encoder-key target_encoder`. Trains the entire checkpoint encoder and a final linear frame decoder (no LoRA or extra Transformer). Uses checkpoint input statistics, online raw motion, persistent workers, and the configured BF16/FP32 precision. Omit intermediate feature-layer arguments.

@@ -1,4 +1,4 @@
-"""Online JEPA segmentation with frozen base weights and attention LoRA adapters."""
+"""Online JEPA segmentation with attention LoRA or full-backbone fine-tuning."""
 import math
 
 import torch
@@ -45,10 +45,14 @@ class LoRASegmentation(nn.Module):
         self.patch_size = 3 if self.patch else 1
         self.register_buffer("input_mean", ex.mean.clone())
         self.register_buffer("input_std", ex.std.clone())
+        self.full_finetune = getattr(args, "mode", "lora") == "finetune"
         rank, alpha = args.lora_rank, args.lora_alpha
-        for block in self.encoder.blocks:
-            block.attn.qkv = LoRALinear(block.attn.qkv, rank, alpha)
-            block.attn.proj = LoRALinear(block.attn.proj, rank, alpha)
+        if self.full_finetune:
+            self.encoder.requires_grad_(True)
+        else:
+            for block in self.encoder.blocks:
+                block.attn.qkv = LoRALinear(block.attn.qkv, rank, alpha)
+                block.attn.proj = LoRALinear(block.attn.proj, rank, alpha)
         self.head = nn.Linear(ex.feature_dim, self.patch_size * num_classes)
         self.feature_metadata = dict(ex.metadata, feature_layers=[final_layer],
                                      feature_location="final_encoder_output_after_layernorm",
@@ -62,11 +66,17 @@ class LoRASegmentation(nn.Module):
                            head="linear", output_dim=self.patch_size * num_classes,
                            num_frames=num_frames, num_classes=num_classes,
                            feature_patch_size=self.patch_size)
+        if self.full_finetune:
+            for key in ("lora_rank", "lora_alpha", "lora_targets", "adapted_blocks"):
+                self.config.pop(key)
+            self.config.update(model_version="jepa_segmentation_full_finetune_linear_v1",
+                               trainable_backbone=True)
         self.to(device)
 
     def train(self, mode=True):
         super().train(mode)
-        self.encoder.eval()
+        if not self.full_finetune:
+            self.encoder.eval()
         return self
 
     def extract(self, motion, valid, fps):
@@ -92,6 +102,8 @@ class LoRASegmentation(nn.Module):
     def parameter_counts(self):
         adapters = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
         head = sum(p.numel() for p in self.head.parameters() if p.requires_grad)
+        if self.full_finetune:
+            return dict(encoder=adapters, head=head, total=adapters + head, frozen_backbone=0)
         return dict(lora=adapters, head=head, total=adapters + head,
                     frozen_backbone=sum(p.numel() for p in self.encoder.parameters() if not p.requires_grad))
 
