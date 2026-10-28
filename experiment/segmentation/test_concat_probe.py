@@ -160,7 +160,8 @@ def test_cache_separate_channel_stats_and_no_validation_leakage(checkpoint):
     assert cached["val"].sample_ids == ["val-0", "val-1"]
 
 
-def test_cli_and_resume_layer_order_contract(tmp_path, monkeypatch, checkpoint):
+@pytest.mark.parametrize("architecture", ["patch-transformer", "mlp"])
+def test_cli_and_resume_layer_order_contract(tmp_path, monkeypatch, checkpoint, architecture):
     root = tmp_path / "data"
     root.mkdir()
     (root / "stats").mkdir()
@@ -171,7 +172,7 @@ def test_cli_and_resume_layer_order_contract(tmp_path, monkeypatch, checkpoint):
     np.save(root / "stats/std.npy", np.ones(6))
     monkeypatch.setattr(train, "BabelSegmentationDataset", lambda root, split, **kw: PatchFrames(split))
     args = train.build_parser().parse_args([
-        "--mode", "probe", "--probe-architecture", "patch-transformer",
+        "--mode", "probe", "--probe-architecture", architecture,
         "--feature-layers", "1", "3", "--checkpoint", str(checkpoint),
         "--dataset-root", str(root), "--output-root", str(tmp_path / "run"),
         "--device", "cpu", "--iterations", "2", "--warmup-iterations", "0",

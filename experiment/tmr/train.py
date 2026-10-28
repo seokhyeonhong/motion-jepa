@@ -197,6 +197,8 @@ def load_alignment_checkpoint(path: Path) -> dict[str, Any]:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if args.probe_architecture == "mlp" and args.mode != "probe":
+        raise ValueError("--probe-architecture mlp requires --mode probe")
     if args.mode == "lora":
         if args.checkpoint is None or args.feature_source != "jepa":
             raise ValueError("LoRA requires a JEPA checkpoint")
@@ -208,8 +210,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     if getattr(args, "motion_depth", None) is not None:
         if args.motion_depth < 1:
             raise ValueError("--motion-depth must be positive")
-        if args.mode == "probe" and args.probe_architecture != "transformer":
-            raise ValueError("--motion-depth requires --probe-architecture transformer in probe mode")
+        if args.mode == "probe" and args.probe_architecture not in {"transformer", "mlp"}:
+            raise ValueError("--motion-depth requires --probe-architecture transformer or mlp in probe mode")
     if getattr(args, "feature_layers", None) is not None and (args.mode != "probe" or args.feature_source != "jepa"):
         raise ValueError("--feature-layers requires JEPA probe mode")
     if getattr(args, "mode", "supervised") == "probe":
@@ -295,14 +297,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.num_workers = 0
         _seed_all(args.seed)
     transformer_probe = probe_mode and getattr(args, "probe_architecture", "attentive") == "transformer"
+    mlp_probe = probe_mode and args.probe_architecture == "mlp"
     layout = provenance.get("probe", {}).get("extractor", {}).get("token_layout", {})
-    patch_size = layout.get("temporal_patch_size", 1) if transformer_probe else 1
+    patch_size = layout.get("temporal_patch_size", 1) if (transformer_probe or mlp_probe) else 1
     model_config = AlignmentConfig(
         text_dim=provenance["text_dim"], motion_dim=provenance["motion_dim"],
         model_size=args.model_size,
         num_frames=provenance["provenance"]["num_frames"] // patch_size,
         fps=provenance["provenance"]["fps"] / patch_size,
-        motion_encoder="transformer_probe" if transformer_probe else "attentive_probe" if probe_mode else "transformer",
+        motion_encoder="mlp_probe" if mlp_probe else "transformer_probe" if transformer_probe else "attentive_probe" if probe_mode else "transformer",
         probe_heads=args.probe_heads if probe_mode else 6,
         patchify=getattr(args, "patchify", False),
         motion_depth=getattr(args, "motion_depth", None),
@@ -504,10 +507,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-alpha", type=float, help="Defaults to rank (scale 1).")
     parser.add_argument("--encoder-key", default="target_encoder", choices=("encoder", "target_encoder"))
     parser.add_argument("--precompute-batch-size", type=int, default=256)
-    parser.add_argument("--probe-architecture", choices=("attentive", "transformer"), default="attentive")
+    parser.add_argument("--probe-architecture", choices=("attentive", "transformer", "mlp"), default="attentive")
     parser.add_argument("--probe-heads", type=int, default=6)
     parser.add_argument("--model-size", choices=tuple(MODEL_SPECS), default="base", help="Text and motion encoder size; defaults to base.")
-    parser.add_argument("--motion-depth", type=int, help="Override only motion Transformer block count; text encoder and width/heads retain the size preset.")
+    parser.add_argument("--motion-depth", type=int, help="Override motion Transformer blocks or MLP hidden Linear+GELU stages (MLP default: 2); text encoder retains the size preset.")
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--annotations-path", type=Path, default=DEFAULT_ANNOTATIONS_PATH)
     parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)

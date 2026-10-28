@@ -331,3 +331,16 @@ Checkpoints include frozen weights, adapters, linear head, input statistics,
 optimizer and RNG state. Strict resume checks provenance, rank, alpha and recipe.
 Parameter reports separate trainable adapters/head from frozen weights.
 For Base patch rank8: 221184 adapter + 138600 head = 359784 trainable parameters.
+
+
+### Frozen patch-feature MLP probe
+
+Use `--mode probe --probe-architecture mlp --model-size base --motion-depth 2`
+with a patch JEPA checkpoint and `--feature-layer 3` or
+`--feature-layers 3 6 9 12`. Hidden width follows tiny/small/base (192/256/384).
+`motion-depth` counts Linear+GELU stages and defaults to 2. Each patch is
+processed independently, then a linear head produces 3x120 frame logits;
+there is no temporal pooling or extra attention. Partial patches retain valid
+frame supervision, padded outputs are masked, and train-only feature statistics
+are checkpointed. Existing BCE-with-logits training remains unchanged. This
+option requires frozen patch JEPA features; LoRA remains a separate mode.

@@ -266,3 +266,14 @@ rank/alpha, and source-checkpoint provenance. Resume and standalone evaluation
 reconstruct the same architecture and reject changed provenance. Parameter counts
 report trainable adapters plus motion head, and the unchanged trainable text stream;
 frozen JEPA weights are excluded.
+
+
+### MLP frozen-feature probe
+
+Use `--mode probe --probe-architecture mlp --model-size base --motion-depth 2`
+with either `--feature-layer` or `--feature-layers 3 6 9 12`. The MLP applies
+`motion-depth` token-wise Linear+GELU stages (default 2), masked mean pooling,
+a linear projection to 256 dimensions, and L2 normalization. Hidden width comes
+from the size preset: tiny 192, small 256, base 384. Text keeps its preset
+Transformer depth. Training-only feature normalization is saved in checkpoints.
+MLP is currently a frozen probe option, not a LoRA or raw-supervised head.

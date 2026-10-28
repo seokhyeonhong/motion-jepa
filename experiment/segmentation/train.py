@@ -21,7 +21,7 @@ from experiment.utils import (
 from utils.schedulers import WarmupCosineSchedule
 from model.specs import MODEL_SPECS
 from .metrics import FrameMetricAccumulator
-from .model import MotionSegmentationProbe, MotionSegmentationTransformer, MotionSegmentationPatchTransformerProbe
+from .model import MotionSegmentationProbe, MotionSegmentationTransformer, MotionSegmentationPatchTransformerProbe, MotionSegmentationMLPProbe
 from .subset import select_training_subset
 
 
@@ -86,11 +86,13 @@ def _validate_motion_depth(args):
     layers = selected_feature_layers(args)
     architecture = getattr(args, "probe_architecture", "attentive")
     if getattr(args, "feature_layers", None) is not None and (
-            args.mode != "lora" and (args.mode != "probe" or args.feature_source != "jepa" or architecture != "patch-transformer")):
+            args.mode != "lora" and (args.mode != "probe" or args.feature_source != "jepa" or architecture not in {"patch-transformer", "mlp"})):
         raise ValueError("--feature-layers requires JEPA --mode probe --probe-architecture patch-transformer")
-    if args.mode != "lora" and architecture == "patch-transformer" and (
+    if args.mode != "lora" and architecture in {"patch-transformer", "mlp"} and (
             args.mode not in ("probe", "lora") or args.feature_source != "jepa" or args.checkpoint is None or layers is None):
         raise ValueError("patch-transformer requires JEPA probe mode, checkpoint, and selected layers")
+    if architecture == "mlp" and args.mode != "probe":
+        raise ValueError("MLP requires frozen JEPA probe mode")
     if args.mode == "lora":
         if args.feature_source != "jepa" or args.checkpoint is None:
             raise ValueError("LoRA requires JEPA checkpoint and selected layers")
@@ -105,8 +107,8 @@ def _validate_motion_depth(args):
     if depth is not None:
         if isinstance(depth, bool) or not isinstance(depth, int) or depth <= 0:
             raise ValueError("motion_depth must be a positive integer")
-        if args.mode != "supervised":
-            raise ValueError("--motion-depth requires --mode supervised")
+        if args.mode != "supervised" and not (args.mode == "probe" and architecture == "mlp"):
+            raise ValueError("--motion-depth requires supervised mode or an MLP probe")
 
 
 def run(args):
@@ -155,9 +157,9 @@ def run(args):
         f"{args.model_size}-probe-{args.feature_source}"
         + (f"-layer-{args.feature_layer}" if args.feature_layer is not None else "")
     )
-    if args.mode != "lora" and getattr(args, "probe_architecture", "attentive") == "patch-transformer":
+    if args.mode != "lora" and getattr(args, "probe_architecture", "attentive") in {"patch-transformer", "mlp"}:
         from .probe import selected_feature_layers
-        run_name += "-patch-transformer-layers-" + "-".join(map(str, selected_feature_layers(args)))
+        run_name += "-" + args.probe_architecture + "-layers-" + "-".join(map(str, selected_feature_layers(args)))
     if getattr(args, "motion_depth", None) is not None:
         run_name += f"-depth-{args.motion_depth}"
     if getattr(args, "patchify", False):
@@ -196,11 +198,11 @@ def run(args):
         from .probe import prepare_probe_datasets
         datasets, mean, std, feature_metadata = prepare_probe_datasets(datasets, args, device)
         _seed_all(args.seed)
-        patch_probe = getattr(args, "probe_architecture", "attentive") == "patch-transformer"
-        probe_class = MotionSegmentationPatchTransformerProbe if patch_probe else MotionSegmentationProbe
+        patch_probe = getattr(args, "probe_architecture", "attentive") in {"patch-transformer", "mlp"}
+        probe_class = MotionSegmentationMLPProbe if args.probe_architecture == "mlp" else MotionSegmentationPatchTransformerProbe if patch_probe else MotionSegmentationProbe
         model = probe_class(
             feature_metadata["feature_dim"], datasets["train"].num_classes,
-            meta["num_frames"], mean, std, **({} if patch_probe else {"num_heads": args.probe_heads}),
+            meta["num_frames"], mean, std, **({"model_size": args.model_size, "motion_depth": args.motion_depth} if args.probe_architecture == "mlp" else {} if patch_probe else {"num_heads": args.probe_heads}),
         ).to(device)
     else:
         if args.checkpoint is not None or args.feature_layer is not None:
@@ -349,7 +351,7 @@ def run(args):
         "parameters": model.parameter_counts(), "checkpoint": str(best),
         "metrics": str(output / "metrics.json"), "signature": signature,
     }
-    if args.mode != "lora" and getattr(args, "probe_architecture", "attentive") == "patch-transformer":
+    if args.mode != "lora" and getattr(args, "probe_architecture", "attentive") in {"patch-transformer", "mlp"}:
         from .probe import selected_feature_layers
         summary["feature_layers"] = selected_feature_layers(args)
     _atomic_json_save(summary, output / "summary.json")
@@ -376,15 +378,15 @@ def build_parser():
     parser.add_argument("--dataset-root", type=Path, default=PROJECT_ROOT / "dataset/babel-segmentation-120-processed-nframes30-150")
     parser.add_argument("--model-size", choices=tuple(MODEL_SPECS), default="base")
     parser.add_argument("--patchify", action="store_true", help="Three-frame raw motion patches with per-frame segmentation logits")
-    parser.add_argument("--motion-depth", type=int, help="Override supervised motion block count; keep model-size width and heads")
+    parser.add_argument("--motion-depth", type=int, help="Override supervised motion blocks or MLP hidden Linear+GELU stages (MLP default: 2); retain preset width")
     parser.add_argument("--mode", choices=("supervised", "probe", "lora"), default="supervised")
     parser.add_argument("--feature-source", choices=("raw", "jepa"), default="jepa")
     feature_selection = parser.add_mutually_exclusive_group()
     feature_selection.add_argument("--feature-layer", type=int, help="One-based JEPA block output (legacy scalar)")
     feature_selection.add_argument("--feature-layers", type=int, nargs="+",
                                    help="Ordered JEPA layers to concatenate, e.g. 3 6 9 12")
-    parser.add_argument("--probe-architecture", choices=("attentive", "patch-transformer"),
-                        default="attentive", help="Attentive frame head or one Base-width Transformer on patch features")
+    parser.add_argument("--probe-architecture", choices=("attentive", "patch-transformer", "mlp"),
+                        default="attentive", help="Attentive frame head, patch Transformer, or token-wise MLP on patch features")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, help="LoRA scaling numerator; defaults to rank")
@@ -437,11 +439,13 @@ def main():
             model = LoRASegmentation(args, meta["num_frames"], 120, args.representation)
         elif args.mode == "probe":
             feature_dim = rep.FEATURE_DIM if args.feature_source == "raw" else MODEL_SPECS[args.model_size]["embed_dim"]
-            if args.probe_architecture == "patch-transformer":
+            if args.probe_architecture in {"patch-transformer", "mlp"}:
                 from .probe import selected_feature_layers
                 feature_dim *= len(selected_feature_layers(args))
-                model = MotionSegmentationPatchTransformerProbe(
-                    feature_dim, 120, meta["num_frames"], torch.zeros(feature_dim), torch.ones(feature_dim))
+                probe_class = MotionSegmentationMLPProbe if args.probe_architecture == "mlp" else MotionSegmentationPatchTransformerProbe
+                model = probe_class(
+                    feature_dim, 120, meta["num_frames"], torch.zeros(feature_dim), torch.ones(feature_dim),
+                    **({"model_size": args.model_size, "motion_depth": args.motion_depth} if args.probe_architecture == "mlp" else {}))
             else:
                 model = MotionSegmentationProbe(feature_dim, 120, meta["num_frames"], torch.zeros(feature_dim),
                                                torch.ones(feature_dim), num_heads=args.probe_heads)

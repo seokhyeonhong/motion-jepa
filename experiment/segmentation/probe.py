@@ -109,7 +109,7 @@ def prepare_probe_datasets(datasets, args, device):
     if args.precompute_batch_size <= 0 or args.probe_heads <= 0:
         raise ValueError("precompute_batch_size and probe_heads must be positive")
     layers = selected_feature_layers(args)
-    patch = getattr(args, "probe_architecture", "attentive") == "patch-transformer"
+    patch = getattr(args, "probe_architecture", "attentive") in {"patch-transformer", "mlp"}
     if getattr(args, "feature_layers", None) is not None and not patch:
         raise ValueError("--feature-layers requires --probe-architecture patch-transformer")
     if patch and args.feature_source != "jepa":
