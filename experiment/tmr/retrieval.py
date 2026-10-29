@@ -10,6 +10,8 @@ import torch
 def _rank_metrics(ranks: torch.Tensor, prefix: str) -> dict[str, float]:
     return {
         f"{prefix}_r1": float((ranks <= 1).float().mean()),
+        f"{prefix}_r2": float((ranks <= 2).float().mean()),
+        f"{prefix}_r3": float((ranks <= 3).float().mean()),
         f"{prefix}_r5": float((ranks <= 5).float().mean()),
         f"{prefix}_r10": float((ranks <= 10).float().mean()),
         f"{prefix}_medr": float(torch.quantile(ranks.float(), 0.5)),
@@ -31,6 +33,11 @@ def evaluate_retrieval(
     the motion's candidates. Score ties use ascending gallery index. Similarity
     matrices are at most ``chunk_size x chunk_size``; source-overlap filtering is
     exclusively a training-loss behavior and is not applied to retrieval.
+    matched_cosine_similarity and mm_dist average cosine similarity and Euclidean
+    distance over all annotated motion-caption pairs (equal weight per pair).
+    Distances use the supplied retrieval embeddings, without extra normalization;
+    cosine divides by their norms. These are model-space diagnostics, not scores
+    from an external fixed T2M evaluator.
     """
     if (
         motion_embeddings.ndim != 2 or text_embeddings.ndim != 2
@@ -137,6 +144,29 @@ def evaluate_retrieval(
                 text_ranks[ti:tend] += mrank.sum(dim=0)
 
     metrics = {**_rank_metrics(text_ranks, "t2m"), **_rank_metrics(motion_ranks, "m2t")}
+    # Visit only annotated positive pairs, with bounded temporary feature tensors.
+    cosine_sum = torch.zeros((), dtype=torch.float64, device=device)
+    distance_sum = torch.zeros((), dtype=torch.float64, device=device)
+    pair_count = 0
+    with torch.autocast(device_type=device.type, enabled=False):
+        for mi in range(0, count_m, chunk_size):
+            positive_ids = motion_positive_text[mi:mi + chunk_size]
+            rows, slots = (positive_ids >= 0).nonzero(as_tuple=True)
+            for start in range(0, len(rows), chunk_size):
+                selected_rows = rows[start:start + chunk_size]
+                selected_slots = slots[start:start + chunk_size]
+                paired_motion = motions[mi + selected_rows]
+                paired_text = texts[positive_ids[selected_rows, selected_slots]]
+                cosine_sum += torch.nn.functional.cosine_similarity(
+                    paired_motion, paired_text, dim=1,
+                ).double().sum()
+                distance_sum += torch.linalg.vector_norm(
+                    paired_motion - paired_text, dim=1,
+                ).double().sum()
+                pair_count += len(selected_rows)
+    metrics["matched_cosine_similarity"] = float(cosine_sum / pair_count)
+    metrics["mm_dist"] = float(distance_sum / pair_count)
+    metrics["matched_pair_count"] = pair_count
     metrics["mean_r1"] = 0.5 * (metrics["t2m_r1"] + metrics["m2t_r1"])
     return metrics
 

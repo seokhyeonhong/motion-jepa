@@ -297,3 +297,14 @@ For the frozen comparison, use `--mode probe --feature-source jepa
 This keeps JEPA frozen and trains 12 motion Transformer layers plus the unchanged
 Base text encoder. Select each subset using `--train-fraction 1`, `0.1`, or `0.01`
 and give each run a distinct `--output-root`.
+
+### Matched feature metrics
+
+Evaluation reports R@1/2/3/5/10, `matched_cosine_similarity` (higher is better),
+`mm_dist` (mean Euclidean distance, lower is better), and `matched_pair_count`.
+Feature metrics average all annotated motion-caption pairs with equal weight per
+pair, including every valid caption for multi-caption motions. They use the
+model's retrieval embeddings: distance does not renormalize them, while cosine
+divides by their norms. These model-space distances are not directly comparable
+to published MM-Dist from a different fixed evaluator or between independently
+trained embedding spaces.
